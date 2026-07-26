@@ -61,7 +61,6 @@ The engine MUST:
 
 - Load an architecture independently from learned parameters.
 - Inspect checkpoint metadata without eagerly loading all tensor bytes.
-- Support pluggable checkpoint containers and conventions.
 - Preserve the original checkpoint file unchanged.
 - Bind architecture parameters to checkpoint entries with explicit validation.
 - Specialize model operations according to actual tensor encodings and layouts.
