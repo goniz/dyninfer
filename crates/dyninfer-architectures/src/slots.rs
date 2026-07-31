@@ -1,0 +1,41 @@
+//! Shared parameter-slot helpers for decoder architectures.
+
+use dyninfer_core::{
+    CanonicalParameterName, LogicalTensorConstraint, ParameterRole, ParameterSlot, ParameterSlotId,
+    ScalarType,
+};
+
+pub fn slot(name: &str, role: ParameterRole, rank: usize) -> ParameterSlot {
+    slot_opt(name, role, rank, false)
+}
+
+pub fn slot_opt(name: &str, role: ParameterRole, rank: usize, optional: bool) -> ParameterSlot {
+    ParameterSlot {
+        id: ParameterSlotId::new(name),
+        canonical_name: CanonicalParameterName::new(name),
+        role,
+        expected_type: LogicalTensorConstraint {
+            rank: Some(rank),
+            shape: None,
+            element_types: vec![ScalarType::Bf16, ScalarType::F16, ScalarType::F32],
+        },
+        supported_encodings: vec!["plain".into(), "gguf.q4_0".into()],
+        optional,
+        tied_group: None,
+    }
+}
+
+pub fn field(
+    name: &str,
+    ty: &str,
+    required: bool,
+    default: Option<serde_json::Value>,
+) -> dyninfer_architecture::ConfigField {
+    dyninfer_architecture::ConfigField {
+        name: name.into(),
+        ty: ty.into(),
+        required,
+        default,
+        description: None,
+    }
+}

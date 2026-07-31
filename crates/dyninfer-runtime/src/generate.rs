@@ -53,8 +53,10 @@ pub fn generate_greedy(
     config: &GenerateConfig,
     session_cfg: SessionConfig,
 ) -> Result<GenerateOutput> {
+    // ByteLevel (Qwen) tokenizers typically have no BOS; SentencePiece (Llama) does.
+    let add_special = !tokenizer.is_byte_level();
     let mut ids: Vec<TokenId> = tokenizer
-        .encode(prompt, true)?
+        .encode(prompt, add_special)?
         .into_iter()
         .map(|t| t as TokenId)
         .collect();
@@ -62,13 +64,15 @@ pub fn generate_greedy(
         return Err(DynInferError::io("prompt produced no tokens"));
     }
 
+    let eos = config.eos_token_id.or_else(|| tokenizer.eos_id());
+
     let mut session = model.create_session(session_cfg)?;
     let mut logits: Logits = session.prefill(&ids)?;
     let mut generated = Vec::new();
 
     for _ in 0..config.max_new_tokens {
         let next = argmax(&logits.values);
-        if config.eos_token_id == Some(next) {
+        if eos == Some(next) {
             break;
         }
         generated.push(next);

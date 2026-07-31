@@ -1,16 +1,18 @@
 //! Architecture registry, config resolution, and package model.
 //!
-//! MLIR emission is stubbed until the compiler FFI lands; architectures still
-//! expose parameter slots for binding.
+//! Concrete model graphs live in `dyninfer-architectures`. This crate owns the
+//! plugin trait and registry only.
 
 #![forbid(unsafe_code)]
 
 mod builder;
 mod config;
+mod emit;
 mod package;
 mod registry;
 
 pub use builder::{ArchitectureDefinition, ModelBuilder, ModelModule};
 pub use config::{ConfigField, ConfigSchema, ResolvedModelConfig};
+pub use emit::EmitOutput;
 pub use package::ArchitecturePackage;
-pub use registry::ArchitectureRegistry;
+pub use registry::{dedupe_parameters, ArchitectureRegistry};

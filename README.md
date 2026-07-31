@@ -33,7 +33,30 @@ Differential check: `bazel test //crates/dyninfer-runtime:dyninfer-runtime_tests
 Uses ungated [Maykeye/TinyLLama-v0](https://huggingface.co/Maykeye/TinyLLama-v0)
 (~9MB BF16 Llama). Prefer the local Hugging Face Hub cache
 (`HF_HUB_CACHE` / `~/.cache/huggingface/hub`); testdata is only a fallback.
-Meta Llama 3.2-1B is gated/heavier (GQA) and left for a later milestone.
+### Qwen3-0.6B (GQA + Q/K norm)
+
+Architectures live in [`crates/dyninfer-architectures`](crates/dyninfer-architectures)
+(`models/llama.rs`, `models/qwen3.rs`, …). CLI defaults to `--architecture auto`
+(from `config.json` `model_type`).
+
+Qwen3-0.6B ([Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B)): GQA 16/8,
+`head_dim=128`, Q/K norm, tied embeddings, ByteLevel BPE, window 32.
+
+```bash
+hf download Qwen/Qwen3-0.6B
+# or: mlx-community/Qwen3-0.6B-bf16
+
+bazel run //crates/dyninfer-cli:dyninfer -- generate \
+  --hf Qwen/Qwen3-0.6B \
+  --prompt "Hello" \
+  --max-new-tokens 16
+```
+
+### TinyStories Llama example
+
+Uses ungated [Maykeye/TinyLLama-v0](https://huggingface.co/Maykeye/TinyLLama-v0)
+(~9MB BF16 Llama). Prefer the local Hugging Face Hub cache
+(`HF_HUB_CACHE` / `~/.cache/huggingface/hub`); testdata is only a fallback.
 
 ```bash
 # one-time: populate the Hub cache
@@ -64,8 +87,11 @@ optionally run `./scripts/bootstrap_iree.sh` (venv fallback); prefer Bazel.
 
 ```bash
 dyninfer checkpoint inspect model.gguf --json
-dyninfer bind --architecture llama.decoder --checkpoint model.safetensors --output binding.json
-dyninfer compile --architecture llama.decoder --checkpoint model.safetensors --target cpu --output model.bundle
+dyninfer bind --checkpoint model.safetensors --output binding.json   # auto arch
+dyninfer compile --checkpoint model.safetensors --target auto --output model.bundle
+dyninfer smoke                        # --target auto probes IREE (cuda/hip ≻ vulkan ≻ cpu)
+dyninfer smoke --target rocm          # force HIP; chip from probe default gfx1151 / DYNINFER_ROCM_TARGET
+dyninfer generate --hf ORG/NAME --prompt "Hello"
 dyninfer run --bundle model.bundle --checkpoint model.safetensors --prompt "Hello"
 dyninfer cache list
 ```

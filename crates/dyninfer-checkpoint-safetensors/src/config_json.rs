@@ -74,14 +74,29 @@ pub fn load_hf_config_metadata(checkpoint: &Path) -> MetadataMap {
         out.insert("pad_token_id".into(), Value::from(v));
     }
 
-    // Derive head_dim when absent.
-    let hidden = out.get("hidden_size").and_then(|v| v.as_u64());
-    let heads = out.get("num_heads").and_then(|v| v.as_u64());
-    if let (Some(h), Some(n)) = (hidden, heads) {
-        if n > 0 && h % n == 0 {
-            let dim = h / n;
-            out.insert("head_dim".into(), Value::from(dim));
+    // Prefer explicit head_dim (Qwen3: 128 with hidden=1024, heads=16).
+    if let Some(v) = u("head_dim") {
+        out.insert("head_dim".into(), Value::from(v));
+    } else {
+        let hidden = out.get("hidden_size").and_then(|v| v.as_u64());
+        let heads = out.get("num_heads").and_then(|v| v.as_u64());
+        if let (Some(h), Some(n)) = (hidden, heads) {
+            if n > 0 && h % n == 0 {
+                out.insert("head_dim".into(), Value::from(h / n));
+            }
         }
+    }
+
+    if let Some(v) = obj.get("architectures").and_then(|v| v.as_array()) {
+        if let Some(Value::String(name)) = v.first() {
+            out.insert("hf_architecture".into(), Value::String(name.clone()));
+        }
+    }
+    if let Some(v) = obj.get("model_type").and_then(|v| v.as_str()) {
+        out.insert("model_type".into(), Value::from(v));
+    }
+    if let Some(v) = obj.get("tie_word_embeddings").and_then(|v| v.as_bool()) {
+        out.insert("tie_word_embeddings".into(), Value::from(v));
     }
 
     out

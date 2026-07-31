@@ -81,7 +81,10 @@ mod tests {
         assert_eq!(package.resolved_config.num_layers().unwrap(), 8);
         assert_eq!(package.resolved_config.get_u32("hidden_size").unwrap(), 64);
         assert_eq!(package.resolved_config.get_u32("vocab_size").unwrap(), 32000);
-        assert_eq!(plan.bindings.len(), package.parameter_slots.len());
+        assert_eq!(
+            plan.bindings.len() + plan.unresolved_optional_slots.len(),
+            package.parameter_slots.len()
+        );
         assert!(
             catalog
                 .parameters

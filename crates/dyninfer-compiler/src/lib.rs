@@ -1,15 +1,16 @@
 //! Safe Rust compiler wrapper — prefers in-process `libIREECompiler`, with
 //! `iree-compile` subprocess fallback.
+//!
+//! Architecture-specific MLIR is supplied by the caller (from
+//! `dyninfer-architectures`); this crate only drives IREE.
 
 #![forbid(unsafe_code)]
 
 mod iree_tools;
-mod llama_emit;
 mod mlir_emit;
 
 pub use iree_tools::IreeTools;
-pub use llama_emit::{LlamaEmitConfig, PREFILL_WINDOW, TINY_PREFILL_WINDOW};
-pub use mlir_emit::{emit_add_smoke_module, emit_bridge_module, emit_model_module};
+pub use mlir_emit::{emit_add_smoke_module, emit_bridge_module};
 
 use dyninfer_architecture::ArchitecturePackage;
 use dyninfer_checkpoint::CheckpointCatalog;
@@ -48,6 +49,9 @@ pub struct CompileRequest<'a> {
     pub target: &'a TargetProfile,
     pub shape_profile: &'a ShapeProfile,
     pub options: &'a CompileOptions,
+    /// Architecture-emitted MLIR (ignored when `smoke_only`).
+    pub mlir_text: &'a str,
+    pub prefill_window: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -85,25 +89,30 @@ impl LocalCompiler {
         self.tools.as_ref()
     }
 
-    /// Compile an arbitrary MLIR string to VMFB for the given target driver.
-    pub fn compile_mlir(&self, mlir: &str, driver: &str) -> Result<Vec<u8>> {
-        compile_mlir_prefer_inprocess(mlir, driver, self.force_subprocess, self.tools.as_ref())
+    /// Compile an arbitrary MLIR string to VMFB for the given target.
+    pub fn compile_mlir(&self, mlir: &str, target: &TargetProfile) -> Result<Vec<u8>> {
+        compile_mlir_prefer_inprocess(mlir, target, self.force_subprocess, self.tools.as_ref())
     }
+}
+
+fn compile_flags_for(target: &TargetProfile) -> Vec<String> {
+    iree_compiler_sys::flags_for_target(target.driver.as_str(), target.gpu_compile_arch())
 }
 
 fn compile_mlir_prefer_inprocess(
     mlir: &str,
-    driver: &str,
+    target: &TargetProfile,
     force_subprocess: bool,
     tools: Option<&IreeTools>,
 ) -> Result<Vec<u8>> {
+    let flags = compile_flags_for(target);
     if !force_subprocess {
-        let flags = iree_compiler_sys::flags_for_driver(driver);
         match iree_compiler_sys::compile_mlir_to_vmfb(mlir, &flags) {
             Ok(bytes) => {
                 info!(
                     bytes = bytes.len(),
                     rev = iree_compiler_sys::revision().unwrap_or_default(),
+                    driver = %target.driver,
                     "compiled via in-process libIREECompiler"
                 );
                 return Ok(bytes);
@@ -120,7 +129,7 @@ fn compile_mlir_prefer_inprocess(
             diagnostics: vec![],
         })
     })?;
-    tools.compile_mlir(mlir, driver)
+    tools.compile_mlir_with_flags(mlir, &flags)
 }
 
 impl ModelCompiler for LocalCompiler {
@@ -134,13 +143,15 @@ impl ModelCompiler for LocalCompiler {
 
         let mlir = if request.options.smoke_only {
             emit_add_smoke_module().to_string()
+        } else if request.mlir_text.is_empty() {
+            emit_bridge_module(request.architecture)
         } else {
-            emit_model_module(request.architecture, request.checkpoint)
+            request.mlir_text.to_string()
         };
 
         let _iree = info_span!("compile.iree").entered();
         let vmfb = self
-            .compile_mlir(&mlir, &request.target.driver)
+            .compile_mlir(&mlir, request.target)
             .map_err(|err| match err {
                 DynInferError::Compilation(mut c) => {
                     c.diagnostics.push(Diagnostic::error(
@@ -182,12 +193,13 @@ impl ModelCompiler for LocalCompiler {
             .resolved_config
             .num_layers()
             .unwrap_or(1);
-        let emit_cfg = LlamaEmitConfig::from_package(request.architecture, request.checkpoint);
-        let prefill_window = if emit_cfg.supports_dense_emit() {
-            emit_cfg.seq
+        let prefill_window = if request.options.smoke_only {
+            4
         } else {
-            TINY_PREFILL_WINDOW
+            request.prefill_window.max(1)
         };
+        let _ = request.binding;
+        let _ = request.checkpoint;
         let manifest = ExecutableManifest {
             format: "dyninfer.bundle".into(),
             version: 1,
@@ -240,9 +252,10 @@ impl ModelCompiler for LocalCompiler {
 }
 
 /// Compile the built-in add smoke module (no architecture required).
-pub fn compile_add_smoke(driver: &str) -> Result<Vec<u8>> {
-    compile_mlir_prefer_inprocess(emit_add_smoke_module(), driver, false, None).or_else(|_| {
+pub fn compile_add_smoke(target: &TargetProfile) -> Result<Vec<u8>> {
+    compile_mlir_prefer_inprocess(emit_add_smoke_module(), target, false, None).or_else(|_| {
         let tools = IreeTools::discover()?;
-        tools.compile_mlir(emit_add_smoke_module(), driver)
+        let flags = compile_flags_for(target);
+        tools.compile_mlir_with_flags(emit_add_smoke_module(), &flags)
     })
 }

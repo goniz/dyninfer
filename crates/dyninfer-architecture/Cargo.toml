@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+dyninfer-checkpoint = { workspace = true }
 dyninfer-core = { workspace = true }
 dyninfer-error = { workspace = true }
 serde = { workspace = true }

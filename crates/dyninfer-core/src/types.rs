@@ -254,6 +254,9 @@ pub struct TargetProfile {
 }
 
 impl TargetProfile {
+    /// Default AMDGPU arch when `--target rocm` / `hip` omits an explicit chip.
+    pub const DEFAULT_ROCM_TARGET: &'static str = "gfx1151";
+
     pub fn llvm_cpu_host() -> Self {
         let triple = Some(host_triple().to_string());
         let features: Vec<String> = Vec::new();
@@ -278,6 +281,64 @@ impl TargetProfile {
             features: vec!["spirv".into()],
             capability_fingerprint: Digest::from_bytes(b"vulkan|generic"),
         }
+    }
+
+    /// Default NVPTX arch when `--target cuda` omits an explicit SM.
+    pub const DEFAULT_CUDA_TARGET: &'static str = "sm_80";
+
+    /// HIP / ROCm target. `chip` is an LLVM AMDGPU target (e.g. `gfx1151`).
+    pub fn hip_rocm(chip: &str) -> Self {
+        let chip = if chip.is_empty() {
+            Self::DEFAULT_ROCM_TARGET
+        } else {
+            chip
+        };
+        Self {
+            driver: "hip".into(),
+            device_id: Some(0),
+            triple: Some(chip.to_string()),
+            features: vec![format!("rocm-target={chip}")],
+            capability_fingerprint: Digest::from_bytes(format!("hip|{chip}").as_bytes()),
+        }
+    }
+
+    /// CUDA target. `arch` is an NVPTX target (e.g. `sm_80`).
+    pub fn cuda(arch: &str) -> Self {
+        let arch = if arch.is_empty() {
+            Self::DEFAULT_CUDA_TARGET
+        } else {
+            arch
+        };
+        Self {
+            driver: "cuda".into(),
+            device_id: Some(0),
+            triple: Some(arch.to_string()),
+            features: vec![format!("cuda-target={arch}")],
+            capability_fingerprint: Digest::from_bytes(format!("cuda|{arch}").as_bytes()),
+        }
+    }
+
+    /// ROCm chip / SKU for `--iree-rocm-target`, if this is a HIP profile.
+    pub fn rocm_target(&self) -> Option<&str> {
+        if self.driver == "hip" || self.driver == "rocm" {
+            self.triple.as_deref().or(Some(Self::DEFAULT_ROCM_TARGET))
+        } else {
+            None
+        }
+    }
+
+    /// CUDA SM arch for `--iree-cuda-target`, if this is a CUDA profile.
+    pub fn cuda_target(&self) -> Option<&str> {
+        if self.driver == "cuda" {
+            self.triple.as_deref().or(Some(Self::DEFAULT_CUDA_TARGET))
+        } else {
+            None
+        }
+    }
+
+    /// GPU arch string passed to IREE compile (`gfx*` / `sm_*`), if any.
+    pub fn gpu_compile_arch(&self) -> Option<&str> {
+        self.rocm_target().or_else(|| self.cuda_target())
     }
 }
 

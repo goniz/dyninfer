@@ -1,4 +1,7 @@
 use crate::config::{ConfigSchema, ResolvedModelConfig};
+use crate::emit::EmitOutput;
+use crate::package::ArchitecturePackage;
+use dyninfer_checkpoint::{CheckpointCatalog, ParameterCatalog};
 use dyninfer_core::{ArchitectureId, ParameterSlot};
 use dyninfer_error::{DynInferError, Result};
 use serde::{Deserialize, Serialize};
@@ -65,13 +68,36 @@ impl ModelBuilder {
     }
 }
 
+/// Architecture plugin: slots, naming, and executable emission.
 pub trait ArchitectureDefinition: Send + Sync {
     fn id(&self) -> ArchitectureId;
     fn revision(&self) -> &str;
     fn config_schema(&self) -> &ConfigSchema;
+
+    /// HF `model_type` / architecture class stems this definition accepts.
+    fn model_types(&self) -> &[&str];
+
     fn build(
         &self,
         config: &ResolvedModelConfig,
         builder: &mut ModelBuilder,
     ) -> Result<ModelModule>;
+
+    /// Map a checkpoint tensor key to a canonical parameter name.
+    ///
+    /// Return `None` to skip the tensor (e.g. cached RoPE freqs).
+    /// Default keeps the key unchanged.
+    fn canonicalize_param(&self, key: &str) -> Option<String> {
+        Some(key.to_string())
+    }
+
+    /// Post-process the parameter catalog (tied embeddings, drop unused keys, …).
+    fn sanitize_catalog(&self, _catalog: &mut ParameterCatalog) {}
+
+    /// Emit the IREE-facing MLIR executable for this architecture.
+    fn emit_executable(
+        &self,
+        package: &ArchitecturePackage,
+        catalog: &CheckpointCatalog,
+    ) -> Result<EmitOutput>;
 }

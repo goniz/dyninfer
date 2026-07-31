@@ -1,5 +1,4 @@
 use dyninfer_architecture::ArchitectureRegistry;
-use dyninfer_architecture_llama::LlamaArchitecture;
 use dyninfer_checkpoint::BuiltinCheckpointSupport;
 
 pub fn default_checkpoint_support() -> BuiltinCheckpointSupport {
@@ -11,6 +10,6 @@ pub fn default_checkpoint_support() -> BuiltinCheckpointSupport {
 
 pub fn default_architecture_registry() -> ArchitectureRegistry {
     let mut reg = ArchitectureRegistry::new();
-    reg.register(LlamaArchitecture);
+    dyninfer_architectures::register_all(&mut reg);
     reg
 }

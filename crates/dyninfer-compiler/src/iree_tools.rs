@@ -89,6 +89,11 @@ impl IreeTools {
 
     /// Compile MLIR text to VMFB bytes for the given HAL driver profile.
     pub fn compile_mlir(&self, mlir: &str, driver: &str) -> Result<Vec<u8>> {
+        self.compile_mlir_with_flags(mlir, &iree_compiler_sys::flags_for_driver(driver))
+    }
+
+    /// Compile with explicit IREE flags (e.g. HIP + `--iree-rocm-target`).
+    pub fn compile_mlir_with_flags(&self, mlir: &str, flags: &[String]) -> Result<Vec<u8>> {
         let dir = tempfile::tempdir().map_err(|e| {
             DynInferError::Compilation(CompilationError {
                 message: format!("tempdir failed: {e}"),
@@ -102,16 +107,8 @@ impl IreeTools {
 
         let mut cmd = Command::new(&self.compile);
         cmd.arg(&mlir_path).arg("-o").arg(&vmfb_path);
-        match driver {
-            "vulkan" => {
-                cmd.arg("--iree-hal-target-device=vulkan");
-            }
-            _ => {
-                // local-task / llvm-cpu host
-                cmd.arg("--iree-hal-target-device=local")
-                    .arg("--iree-hal-local-target-device-backends=llvm-cpu")
-                    .arg("--iree-llvmcpu-target-cpu=generic");
-            }
+        for flag in flags {
+            cmd.arg(flag);
         }
 
         info!(?cmd, "invoking iree-compile");

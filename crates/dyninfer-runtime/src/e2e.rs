@@ -5,7 +5,7 @@ mod tests {
     use crate::{max_abs_err, tiny_llama_prefill_logits, CausalLanguageModel, ModelLoader};
     use dyninfer_checkpoint_safetensors::tiny_llama_dense_f32;
     use dyninfer_compiler::{compile_add_smoke, CompileOptions, IreeTools};
-    use dyninfer_core::{ArchitectureId, SessionConfig};
+    use dyninfer_core::{ArchitectureId, SessionConfig, TargetProfile};
     use iree_runtime::{Context, Instance, Module};
     use std::fs;
 
@@ -21,7 +21,8 @@ mod tests {
             eprintln!("skipping: IREE not available");
             return;
         }
-        let vmfb = compile_add_smoke("local-task").expect("iree compile");
+        let target = TargetProfile::llvm_cpu_host();
+        let vmfb = compile_add_smoke(&target).expect("iree compile");
         assert!(!vmfb.is_empty());
         assert!(!vmfb.starts_with(b"DYNINFER_VMFB_STUB"));
 
@@ -48,7 +49,10 @@ mod tests {
         let id = ArchitectureId::new("llama.decoder");
         let (package, _catalog, plan) = loader.bind(&id, &ckpt, &Default::default()).unwrap();
         assert_eq!(package.resolved_config.num_layers().unwrap(), 1);
-        assert_eq!(plan.bindings.len(), package.parameter_slots.len());
+        assert_eq!(
+            plan.bindings.len() + plan.unresolved_optional_slots.len(),
+            package.parameter_slots.len()
+        );
 
         let bundle = dir.path().join("model.bundle");
         let paths = loader

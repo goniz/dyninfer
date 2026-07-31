@@ -30,6 +30,9 @@ pub fn hf_to_canonical(key: &str) -> Option<String> {
         "self_attn.k_proj.weight" => "attn_k.weight",
         "self_attn.v_proj.weight" => "attn_v.weight",
         "self_attn.o_proj.weight" => "attn_output.weight",
+        // Qwen3 / Qwen2.5: per-head RMSNorm on Q/K (before RoPE).
+        "self_attn.q_norm.weight" => "attn_q_norm.weight",
+        "self_attn.k_norm.weight" => "attn_k_norm.weight",
         "mlp.gate_proj.weight" => "ffn_gate.weight",
         "mlp.up_proj.weight" => "ffn_up.weight",
         "mlp.down_proj.weight" => "ffn_down.weight",
@@ -62,5 +65,13 @@ mod tests {
             Some("output.weight")
         );
         assert!(hf_to_canonical("model.layers.0.self_attn.rotary_emb.inv_freq").is_none());
+        assert_eq!(
+            hf_to_canonical("model.layers.0.self_attn.q_norm.weight").as_deref(),
+            Some("blk.0.attn_q_norm.weight")
+        );
+        assert_eq!(
+            hf_to_canonical("model.layers.2.self_attn.k_norm.weight").as_deref(),
+            Some("blk.2.attn_k_norm.weight")
+        );
     }
 }

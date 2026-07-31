@@ -1,18 +1,21 @@
-//! Llama decoder architecture (Milestone 1 dense proof of concept).
+//! Llama decoder architecture (`llama.decoder`).
+//!
+//! Covers Meta Llama / OpenLLaMA / Mistral-layout checkpoints and the synthetic
+//! Milestone-1 fixture. Q/K norms are optional (absent for classic Llama).
 
-#![forbid(unsafe_code)]
-
+use crate::naming::canonicalize_hf_family;
+use crate::ops::{emit_dense_decoder_cfg, DenseDecoderConfig};
+use crate::slots::{field, slot, slot_opt};
 use dyninfer_architecture::{
-    ArchitectureDefinition, ConfigField, ConfigSchema, ModelBuilder, ModelModule, ResolvedModelConfig,
+    ArchitectureDefinition, ArchitecturePackage, ConfigSchema, EmitOutput, ModelBuilder,
+    ModelModule, ResolvedModelConfig,
 };
-use dyninfer_core::{
-    ArchitectureId, CanonicalParameterName, LogicalTensorConstraint, ParameterRole, ParameterSlot,
-    ParameterSlotId, ScalarType,
-};
-use dyninfer_error::Result;
+use dyninfer_checkpoint::{CheckpointCatalog, ParameterCatalog};
+use dyninfer_core::{ArchitectureId, ParameterRole};
+use dyninfer_error::{CompilationError, DynInferError, Result};
 use std::sync::LazyLock;
 
-static LLAMA_CONFIG_SCHEMA: LazyLock<ConfigSchema> = LazyLock::new(|| ConfigSchema {
+static CONFIG_SCHEMA: LazyLock<ConfigSchema> = LazyLock::new(|| ConfigSchema {
     fields: vec![
         field("num_layers", "u32", true, Some(serde_json::json!(2))),
         field("num_heads", "u32", true, Some(serde_json::json!(4))),
@@ -27,35 +30,6 @@ static LLAMA_CONFIG_SCHEMA: LazyLock<ConfigSchema> = LazyLock::new(|| ConfigSche
     ],
 });
 
-fn field(name: &str, ty: &str, required: bool, default: Option<serde_json::Value>) -> ConfigField {
-    ConfigField {
-        name: name.into(),
-        ty: ty.into(),
-        required,
-        default,
-        description: None,
-    }
-}
-
-fn slot(name: &str, role: ParameterRole, rank: usize) -> ParameterSlot {
-    ParameterSlot {
-        id: ParameterSlotId::new(name),
-        canonical_name: CanonicalParameterName::new(name),
-        role,
-        expected_type: LogicalTensorConstraint {
-            rank: Some(rank),
-            shape: None,
-            element_types: vec![ScalarType::Bf16, ScalarType::F16, ScalarType::F32],
-        },
-        supported_encodings: vec![
-            "plain".into(),
-            "gguf.q4_0".into(),
-        ],
-        optional: false,
-        tied_group: None,
-    }
-}
-
 #[derive(Debug, Default)]
 pub struct LlamaArchitecture;
 
@@ -65,11 +39,20 @@ impl ArchitectureDefinition for LlamaArchitecture {
     }
 
     fn revision(&self) -> &str {
-        "0.1.0"
+        "0.2.0"
     }
 
     fn config_schema(&self) -> &ConfigSchema {
-        &LLAMA_CONFIG_SCHEMA
+        &CONFIG_SCHEMA
+    }
+
+    fn model_types(&self) -> &[&str] {
+        &[
+            "llama",
+            "mistral",
+            "LlamaForCausalLM",
+            "MistralForCausalLM",
+        ]
     }
 
     fn build(
@@ -82,11 +65,7 @@ impl ArchitectureDefinition for LlamaArchitecture {
         let vocab = config.get_u32("vocab_size")?;
 
         m.note_op(format!("embedding vocab={vocab} hidden={hidden}"));
-        m.declare_parameter(slot(
-            "token_embd.weight",
-            ParameterRole::Embedding,
-            2,
-        ))?;
+        m.declare_parameter(slot("token_embd.weight", ParameterRole::Embedding, 2))?;
 
         for layer in 0..num_layers {
             let prefix = format!("blk.{layer}");
@@ -116,6 +95,18 @@ impl ArchitectureDefinition for LlamaArchitecture {
                 ParameterRole::AttentionO,
                 2,
             ))?;
+            m.declare_parameter(slot_opt(
+                &format!("{prefix}.attn_q_norm.weight"),
+                ParameterRole::Norm,
+                1,
+                true,
+            ))?;
+            m.declare_parameter(slot_opt(
+                &format!("{prefix}.attn_k_norm.weight"),
+                ParameterRole::Norm,
+                1,
+                true,
+            ))?;
             m.declare_parameter(slot(
                 &format!("{prefix}.ffn_norm.weight"),
                 ParameterRole::Norm,
@@ -143,9 +134,32 @@ impl ArchitectureDefinition for LlamaArchitecture {
         m.note_op("export prefill,decode");
         m.finish()
     }
-}
 
-/// Register the Llama architecture into a registry.
-pub fn register(registry: &mut dyninfer_architecture::ArchitectureRegistry) {
-    registry.register(LlamaArchitecture);
+    fn canonicalize_param(&self, key: &str) -> Option<String> {
+        canonicalize_hf_family(key)
+    }
+
+    fn sanitize_catalog(&self, catalog: &mut ParameterCatalog) {
+        crate::naming::tie_output_to_embed(catalog);
+    }
+
+    fn emit_executable(
+        &self,
+        package: &ArchitecturePackage,
+        catalog: &CheckpointCatalog,
+    ) -> Result<EmitOutput> {
+        let cfg = DenseDecoderConfig::from_package(package, catalog);
+        if !cfg.supports_dense_emit() {
+            return Err(DynInferError::Compilation(CompilationError {
+                message: format!("llama.decoder cannot emit dense executable for {cfg:?}"),
+                pass: Some("emit".into()),
+                diagnostics: vec![],
+            }));
+        }
+        let mlir_text = emit_dense_decoder_cfg(package.id.as_str(), &cfg);
+        Ok(EmitOutput {
+            prefill_window: cfg.seq,
+            mlir_text,
+        })
+    }
 }

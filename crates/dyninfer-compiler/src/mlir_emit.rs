@@ -1,21 +1,8 @@
-//! Emit IREE-legal MLIR for model executables.
+//! Generic IREE MLIR scaffolding (architecture-agnostic).
 
 use dyninfer_architecture::ArchitecturePackage;
-use dyninfer_checkpoint::CheckpointCatalog;
 
-use crate::llama_emit::{emit_dense_llama, LlamaEmitConfig};
-
-/// Emit the best available module for this architecture/checkpoint.
-pub fn emit_model_module(package: &ArchitecturePackage, catalog: &CheckpointCatalog) -> String {
-    let cfg = LlamaEmitConfig::from_package(package, catalog);
-    if cfg.supports_dense_emit() {
-        emit_dense_llama(package, catalog)
-    } else {
-        emit_bridge_module(package)
-    }
-}
-
-/// Constant-zero logits bridge (non-tiny shapes / smoke scaffolding).
+/// Constant-zero logits bridge when an architecture cannot emit a real module.
 pub fn emit_bridge_module(package: &ArchitecturePackage) -> String {
     let vocab = package
         .resolved_config
@@ -29,7 +16,7 @@ pub fn emit_bridge_module(package: &ArchitecturePackage) -> String {
 
     format!(
         r#"// dyninfer bridge module for {arch}
-func.func @prefill(%tokens: tensor<{window}xi64>) -> tensor<{vocab}xf32> {{
+func.func @prefill(%tokens: tensor<{window}xi64>, %last: tensor<i64>) -> tensor<{vocab}xf32> {{
   %c = arith.constant dense<[{zeros}]> : tensor<{vocab}xf32>
   return %c : tensor<{vocab}xf32>
 }}

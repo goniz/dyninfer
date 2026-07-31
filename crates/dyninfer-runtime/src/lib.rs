@@ -9,10 +9,12 @@ mod hf_hub;
 mod model;
 mod reference;
 mod session;
+mod qwen_e2e;
 mod stories_e2e;
 mod tokenizer_bpe;
 
 pub use builtins::{default_architecture_registry, default_checkpoint_support};
+pub use dyninfer_architectures::{LARGE_PREFILL_WINDOW, PREFILL_WINDOW, TINY_PREFILL_WINDOW};
 pub use generate::{argmax, generate_greedy, load_tokenizer, GenerateConfig, GenerateOutput};
 pub use hf_hub::{
     find_safetensors_checkpoint, hf_hub_cache_dir, hf_repo_folder_name, resolve_hf_snapshot,

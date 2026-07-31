@@ -82,13 +82,29 @@ impl ModelLoader {
         )
     }
 
+    /// Resolve architecture from override or checkpoint metadata.
+    pub fn resolve_architecture(
+        &self,
+        override_id: Option<&str>,
+        checkpoint: impl AsRef<Path>,
+    ) -> Result<ArchitectureId> {
+        let catalog = self.inspect(checkpoint)?;
+        dyninfer_architectures::resolve_architecture(
+            &self.architectures,
+            override_id,
+            &catalog.metadata,
+        )
+    }
+
     pub fn bind(
         &self,
         architecture_id: &ArchitectureId,
         checkpoint: impl AsRef<Path>,
         overrides: &dyninfer_core::MetadataMap,
     ) -> Result<(ArchitecturePackage, CheckpointCatalog, BindingPlan)> {
-        let catalog = self.inspect(checkpoint)?;
+        let mut catalog = self.inspect(checkpoint)?;
+        self.architectures
+            .apply_naming(architecture_id, &mut catalog)?;
         let package =
             self.architectures
                 .build_package(architecture_id, overrides, &catalog.metadata)?;
@@ -128,6 +144,10 @@ impl ModelLoader {
             self.bind(architecture_id, checkpoint.as_ref(), overrides)?;
         let shape = ShapeProfile::default();
 
+        let emit = self
+            .architectures
+            .emit_executable(architecture_id, &package, &catalog)?;
+
         if let Some(cache) = &self.cache {
             let key = make_cache_key(
                 package.id.as_str(),
@@ -150,6 +170,8 @@ impl ModelLoader {
             target: &target,
             shape_profile: &shape,
             options,
+            mlir_text: &emit.mlir_text,
+            prefill_window: emit.prefill_window,
         })?;
 
         if let Some(cache) = &self.cache {
@@ -185,7 +207,9 @@ impl ModelLoader {
         let manifest: ExecutableManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
         let binding: BindingPlan = serde_json::from_slice(&fs::read(&bindings_path)?)?;
         let checkpoint = checkpoint.as_ref();
-        let catalog = self.inspect(checkpoint)?;
+        let mut catalog = self.inspect(checkpoint)?;
+        self.architectures
+            .apply_naming(&manifest.architecture_id, &mut catalog)?;
         if catalog.schema_fingerprint.digest != manifest.checkpoint_schema.digest {
             return Err(DynInferError::Cache(CacheError {
                 message: "checkpoint schema does not match bundle".into(),
@@ -200,29 +224,35 @@ impl ModelLoader {
             dyninfer_checkpoint_safetensors::materialize_f32_safetensors(&catalog, &params_cache)?;
         let instance = Instance::new()?;
         let module = Module::from_path(&vmfb_path)?;
-        let context = Arc::new(Context::create(instance, module)?.with_parameters(params_path));
+        let context = Arc::new(
+            Context::create(instance, module)?
+                .with_parameters(params_path)
+                .with_device(manifest.target.driver.clone()),
+        );
 
         let metadata = ModelMetadata {
             architecture_id: manifest.architecture_id.clone(),
             architecture_revision: manifest.architecture_revision.clone(),
             vocabulary_size: catalog
                 .metadata
-                .get("llama.vocab_size")
-                .or_else(|| catalog.metadata.get("vocab_size"))
+                .get("vocab_size")
+                .or_else(|| catalog.metadata.get("llama.vocab_size"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(32000) as u32,
             context_length: manifest.kv_cache.max_sequence_length,
             num_layers: manifest.kv_cache.layer_count,
             num_heads: catalog
                 .metadata
-                .get("llama.attention.head_count")
+                .get("num_heads")
+                .or_else(|| catalog.metadata.get("llama.attention.head_count"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(manifest.kv_cache.kv_head_count as u64) as u32,
             num_kv_heads: manifest.kv_cache.kv_head_count,
             head_dim: manifest.kv_cache.head_dimension,
             hidden_size: catalog
                 .metadata
-                .get("llama.embedding_length")
+                .get("hidden_size")
+                .or_else(|| catalog.metadata.get("llama.embedding_length"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32,
             extra: catalog.metadata.clone(),

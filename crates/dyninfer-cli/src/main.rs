@@ -5,12 +5,13 @@
 use clap::{Parser, Subcommand};
 use dyninfer_cache::ArtifactCache;
 use dyninfer_compiler::{compile_add_smoke, CompileOptions};
-use iree_runtime::{Context, Instance, Module};
-use dyninfer_core::{ArchitectureId, SessionConfig};
+use dyninfer_core::SessionConfig;
 use dyninfer_runtime::{
     find_safetensors_checkpoint, generate_greedy, load_tokenizer, resolve_hf_snapshot,
     CausalLanguageModel, GenerateConfig, ModelLoader,
 };
+use dyninfer_target::TargetDiscovery;
+use iree_runtime::{Context, Instance, Module};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -29,7 +30,8 @@ enum Commands {
     },
     /// Bind an architecture to a checkpoint.
     Bind {
-        #[arg(long)]
+        /// Architecture id, or `auto` to detect from config.json.
+        #[arg(long, default_value = "auto")]
         architecture: String,
         #[arg(long)]
         checkpoint: PathBuf,
@@ -41,11 +43,13 @@ enum Commands {
     },
     /// Compile architecture + checkpoint into a bundle.
     Compile {
-        #[arg(long)]
+        /// Architecture id, or `auto` to detect from config.json.
+        #[arg(long, default_value = "auto")]
         architecture: String,
         #[arg(long)]
         checkpoint: PathBuf,
-        #[arg(long, default_value = "cpu")]
+        /// Execution target: `auto` (probe IREE HAL), `cpu`, `vulkan`, `rocm`/`hip`/`cuda`, or `rocm:gfxXXXX` / `cuda:sm_XX`.
+        #[arg(long, default_value = "auto")]
         target: String,
         #[arg(long, default_value = "local-jit")]
         mode: String,
@@ -72,7 +76,8 @@ enum Commands {
     },
     /// Compile + generate from a local HF snapshot or Hub cache entry.
     Generate {
-        #[arg(long, default_value = "llama.decoder")]
+        /// Architecture id, or `auto` to detect from config.json.
+        #[arg(long, default_value = "auto")]
         architecture: String,
         /// Local model directory (config.json + *.safetensors + tokenizer.json).
         #[arg(long, conflicts_with = "hf")]
@@ -84,7 +89,8 @@ enum Commands {
         /// Hub revision / branch / snapshot hash (default: main).
         #[arg(long, default_value = "main")]
         revision: String,
-        #[arg(long, default_value = "cpu")]
+        /// Execution target: `auto` (probe IREE HAL), `cpu`, `vulkan`, `rocm`/`hip`/`cuda`, or `rocm:gfxXXXX` / `cuda:sm_XX`.
+        #[arg(long, default_value = "auto")]
         target: String,
         #[arg(long, default_value = "Once upon a time")]
         prompt: String,
@@ -95,7 +101,8 @@ enum Commands {
     },
     /// Compile and run the trivial `@add` smoke module through real IREE.
     Smoke {
-        #[arg(long, default_value = "cpu")]
+        /// Execution target: `auto` (probe IREE HAL), `cpu`, `vulkan`, `rocm`/`hip`/`cuda`, or `rocm:gfxXXXX` / `cuda:sm_XX`.
+        #[arg(long, default_value = "auto")]
         target: String,
     },
     /// Install model into local cache (inspect+bind+compile+publish).
@@ -122,7 +129,8 @@ enum CheckpointCommands {
 #[derive(Subcommand, Debug)]
 enum ModelCommands {
     Install {
-        #[arg(long)]
+        /// Architecture id, or `auto` to detect from config.json.
+        #[arg(long, default_value = "auto")]
         architecture: String,
         #[arg(long)]
         checkpoint: PathBuf,
@@ -231,7 +239,8 @@ fn main() -> anyhow::Result<()> {
             set,
         } => {
             let loader = ModelLoader::default();
-            let id = ArchitectureId::new(architecture);
+            let id = loader.resolve_architecture(Some(&architecture), &checkpoint)?;
+            eprintln!("architecture {}", id);
             let overrides = parse_sets(&set)?;
             let (_pkg, _catalog, plan) = loader.bind(&id, &checkpoint, &overrides)?;
             if let Some(parent) = output.parent() {
@@ -253,7 +262,8 @@ fn main() -> anyhow::Result<()> {
             if let Some(dir) = cache_dir {
                 loader = loader.with_cache(ArtifactCache::open(dir)?);
             }
-            let id = ArchitectureId::new(architecture);
+            let id = loader.resolve_architecture(Some(&architecture), &checkpoint)?;
+            eprintln!("architecture {}", id);
             let options = CompileOptions {
                 mode,
                 ..Default::default()
@@ -331,7 +341,8 @@ fn main() -> anyhow::Result<()> {
             ));
             let bundle = output_bundle.unwrap_or(default_bundle);
             let loader = ModelLoader::default();
-            let id = ArchitectureId::new(architecture);
+            let id = loader.resolve_architecture(Some(&architecture), &ckpt)?;
+            eprintln!("architecture {}", id);
             let paths = loader.compile_to_bundle(
                 &id,
                 &ckpt,
@@ -363,16 +374,17 @@ fn main() -> anyhow::Result<()> {
             println!("{}", out.text);
         }
         Commands::Smoke { target } => {
-            let driver = if target == "cpu" || target == "auto" {
-                "local-task"
-            } else {
-                target.as_str()
-            };
-            let vmfb = compile_add_smoke(driver)?;
+            let profile = TargetDiscovery::resolve(&target)?;
+            eprintln!(
+                "target driver={} chip={:?}",
+                profile.driver,
+                profile.rocm_target()
+            );
+            let vmfb = compile_add_smoke(&profile)?;
             println!("compiled smoke VMFB ({} bytes)", vmfb.len());
             let instance = Instance::new()?;
             let module = Module::from_vmfb(vmfb)?;
-            let ctx = Context::create(instance, module)?;
+            let ctx = Context::create(instance, module)?.with_device(profile.driver.clone());
             let out = ctx.invoke_add(&[1.0, 2.0, 3.0, 4.0], &[10.0, 20.0, 30.0, 40.0])?;
             println!("add([1,2,3,4],[10,20,30,40]) = {out:?}");
             if out == [11.0, 22.0, 33.0, 44.0] {
@@ -391,7 +403,8 @@ fn main() -> anyhow::Result<()> {
             } => {
                 let cache = ArtifactCache::open(&cache_dir)?;
                 let loader = ModelLoader::default().with_cache(cache);
-                let id = ArchitectureId::new(architecture);
+                let id = loader.resolve_architecture(Some(&architecture), &checkpoint)?;
+                eprintln!("architecture {}", id);
                 let out = output.unwrap_or_else(|| cache_dir.join("bundles").join("model.bundle"));
                 let paths = loader.compile_to_bundle(
                     &id,

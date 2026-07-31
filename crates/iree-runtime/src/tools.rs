@@ -49,12 +49,38 @@ impl IreeRunTools {
         }))
     }
 
+    /// Enumerate HAL devices via `iree-run-module --dump_devices` (stdout text).
+    ///
+    /// Unavailable optional drivers (e.g. CUDA without libcuda) may print to
+    /// stderr; we still return stdout so other drivers remain usable.
+    pub fn dump_devices(&self) -> Result<String> {
+        let mut cmd = Command::new(&self.run_module);
+        cmd.arg("--dump_devices");
+        debug!(?cmd, "invoking iree-run-module --dump_devices");
+        let output = cmd.output().map_err(|e| {
+            DynInferError::IreeRuntime(IreeRuntimeError {
+                message: format!("failed to spawn iree-run-module: {e}"),
+                status_code: None,
+            })
+        })?;
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if stdout.trim().is_empty() && !output.status.success() {
+            return Err(DynInferError::IreeRuntime(IreeRuntimeError {
+                message: format!("iree-run-module --dump_devices failed: {stderr}"),
+                status_code: output.status.code(),
+            }));
+        }
+        Ok(stdout)
+    }
+
     pub fn run_add(
         &self,
         module: &Path,
         a: &[f32; 4],
         b: &[f32; 4],
         parameters: Option<&Path>,
+        device: Option<&str>,
     ) -> Result<Vec<f32>> {
         let input_a = format!(
             "4xf32={}",
@@ -70,7 +96,7 @@ impl IreeRunTools {
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        let stdout = self.invoke(module, "add", &[&input_a, &input_b], parameters)?;
+        let stdout = self.invoke(module, "add", &[&input_a, &input_b], parameters, device)?;
         parse_f32_buffer_view(&stdout)
     }
 
@@ -78,7 +104,9 @@ impl IreeRunTools {
         &self,
         module: &Path,
         tokens: &[i64],
+        last: i64,
         parameters: Option<&Path>,
+        device: Option<&str>,
     ) -> Result<Vec<f32>> {
         if tokens.is_empty() {
             return Err(DynInferError::IreeRuntime(IreeRuntimeError {
@@ -95,7 +123,14 @@ impl IreeRunTools {
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        let stdout = self.invoke(module, "prefill", &[&input], parameters)?;
+        let last_input = format!("i64={last}");
+        let stdout = self.invoke(
+            module,
+            "prefill",
+            &[&input, &last_input],
+            parameters,
+            device,
+        )?;
         parse_f32_buffer_view(&stdout)
     }
 
@@ -104,9 +139,10 @@ impl IreeRunTools {
         module: &Path,
         token: i64,
         parameters: Option<&Path>,
+        device: Option<&str>,
     ) -> Result<Vec<f32>> {
         let input = format!("i64={token}");
-        let stdout = self.invoke(module, "decode", &[&input], parameters)?;
+        let stdout = self.invoke(module, "decode", &[&input], parameters, device)?;
         parse_f32_buffer_view(&stdout)
     }
 
@@ -116,12 +152,16 @@ impl IreeRunTools {
         function: &str,
         inputs: &[&str],
         parameters: Option<&Path>,
+        device: Option<&str>,
     ) -> Result<String> {
         let mut cmd = Command::new(&self.run_module);
         cmd.arg(format!("--module={}", module.display()))
             .arg(format!("--function={function}"))
             // Default (1024) elides large logits with `...`; we need full buffers.
             .arg("--output_max_element_count=1048576");
+        if let Some(device) = device {
+            cmd.arg(format!("--device={device}"));
+        }
         if let Some(params) = parameters {
             cmd.arg(format!("--parameters=weights={}", params.display()));
         }

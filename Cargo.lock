@@ -219,6 +219,7 @@ dependencies = [
 name = "dyninfer-architecture"
 version = "0.1.0"
 dependencies = [
+ "dyninfer-checkpoint",
  "dyninfer-core",
  "dyninfer-error",
  "serde",
@@ -227,10 +228,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "dyninfer-architecture-llama"
+name = "dyninfer-architectures"
 version = "0.1.0"
 dependencies = [
  "dyninfer-architecture",
+ "dyninfer-checkpoint",
  "dyninfer-core",
  "dyninfer-error",
  "serde_json",
@@ -387,7 +389,7 @@ name = "dyninfer-runtime"
 version = "0.1.0"
 dependencies = [
  "dyninfer-architecture",
- "dyninfer-architecture-llama",
+ "dyninfer-architectures",
  "dyninfer-binding",
  "dyninfer-cache",
  "dyninfer-checkpoint",
@@ -410,6 +412,7 @@ version = "0.1.0"
 dependencies = [
  "dyninfer-core",
  "dyninfer-error",
+ "iree-runtime",
  "serde",
  "tracing",
 ]

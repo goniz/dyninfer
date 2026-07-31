@@ -12,14 +12,16 @@ pub struct Logits {
 
 /// Session that invokes real IREE `@prefill` / `@decode` with a static window.
 ///
-/// Prefill left-pads/truncates to `prefill_window`. Decode appends into a rolling
-/// static window (host-managed history) and reuses `@prefill` so KV stays
-/// consistent with the compiled static shapes without a separate cache ABI yet.
+/// Prefill right-pads/truncates to `prefill_window` and passes the index of the
+/// newest real token. Decode appends into a rolling static window (host-managed
+/// history) and reuses `@prefill` so KV stays consistent with the compiled
+/// static shapes without a separate cache ABI yet.
 pub struct IreeSession {
     metadata: ModelMetadata,
     config: SessionConfig,
     kv: KvCacheDescriptor,
     prefill_window: usize,
+    pad_token_id: TokenId,
     position: u64,
     history: Vec<TokenId>,
     context: Arc<Context>,
@@ -33,28 +35,38 @@ impl IreeSession {
         prefill_window: u32,
         context: Arc<Context>,
     ) -> Self {
+        let pad_token_id = metadata
+            .extra
+            .get("pad_token_id")
+            .or_else(|| metadata.extra.get("bos_token_id"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as TokenId)
+            .unwrap_or(0);
         Self {
             metadata,
             config,
             kv,
             prefill_window: prefill_window.max(1) as usize,
+            pad_token_id,
             position: 0,
             history: Vec::new(),
             context,
         }
     }
 
-    /// Left-pad so the newest token is always at the last window index.
-    fn window_from_history(&self) -> Vec<i64> {
+    /// Left-align tokens (right-pad). Returns `(window, last_real_index)`.
+    fn window_from_history(&self) -> (Vec<i64>, i64) {
         let w = self.prefill_window;
-        let mut window = vec![0i64; w];
+        let mut window = vec![i64::from(self.pad_token_id); w];
         let n = self.history.len().min(w);
-        let hist_start = self.history.len() - n;
-        let win_start = w - n;
-        for i in 0..n {
-            window[win_start + i] = i64::from(self.history[hist_start + i]);
+        if n == 0 {
+            return (window, 0);
         }
-        window
+        let hist_start = self.history.len() - n;
+        for i in 0..n {
+            window[i] = i64::from(self.history[hist_start + i]);
+        }
+        (window, (n as i64) - 1)
     }
 }
 
@@ -63,8 +75,8 @@ impl ModelSession for IreeSession {
         let _span = info_span!("runtime.prefill", tokens = tokens.len()).entered();
         self.history.clear();
         self.history.extend_from_slice(tokens);
-        let window = self.window_from_history();
-        let values = self.context.invoke_prefill(&window)?;
+        let (window, last) = self.window_from_history();
+        let values = self.context.invoke_prefill(&window, last)?;
         if values.len() != self.metadata.vocabulary_size as usize {
             return Err(DynInferError::IreeRuntime(IreeRuntimeError {
                 message: format!(
@@ -83,8 +95,8 @@ impl ModelSession for IreeSession {
     fn decode(&mut self, token: TokenId) -> Result<Logits> {
         let _span = info_span!("runtime.decode", token, position = self.position).entered();
         self.history.push(token);
-        let window = self.window_from_history();
-        let values = self.context.invoke_prefill(&window)?;
+        let (window, last) = self.window_from_history();
+        let values = self.context.invoke_prefill(&window, last)?;
         if values.len() != self.metadata.vocabulary_size as usize {
             return Err(DynInferError::IreeRuntime(IreeRuntimeError {
                 message: format!(

@@ -8,6 +8,10 @@ pub fn infer_role(name: &str) -> ParameterRole {
     if n.contains("embed") || n.contains("token_embd") || n.contains("tok_embeddings") {
         return ParameterRole::Embedding;
     }
+    // Qwen3 q_norm/k_norm contain "attn_q"/"attn_k" substrings — check before Q/K.
+    if n.contains("q_norm") || n.contains("k_norm") {
+        return ParameterRole::Norm;
+    }
     if n.contains("attn_q") || n.contains("attention.wq") || n.contains("q_proj") || n.ends_with(".q.weight")
     {
         return ParameterRole::AttentionQ;

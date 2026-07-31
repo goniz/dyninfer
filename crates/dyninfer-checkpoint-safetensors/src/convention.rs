@@ -1,7 +1,9 @@
-//! Dense SafeTensors convention decoder.
+//! Dense SafeTensors convention decoder (architecture-agnostic).
+//!
+//! Indexes scalar tensors under their **raw** checkpoint keys. Architecture
+//! packages apply HF→canonical remapping at bind time.
 
 use crate::config_json::load_hf_config_metadata;
-use crate::hf_names::{hf_to_canonical, looks_like_hf_llama};
 use dyninfer_checkpoint::{
     infer_role, CheckpointConventionDecoder, DecodeContext, LogicalParameter, MatchScore,
     ParameterCatalog, RawCheckpointIndex,
@@ -37,7 +39,12 @@ impl CheckpointConventionDecoder for DenseSafetensorsConvention {
             return Ok(MatchScore::NONE);
         }
         let mut score = 50 + dense_count.min(40) as u32;
-        if index.entries.iter().any(|e| looks_like_hf_llama(&e.key)) {
+        // Prefer HF-style layouts slightly for ranking among conventions.
+        if index
+            .entries
+            .iter()
+            .any(|e| e.key.starts_with("model.") || e.key == "lm_head.weight")
+        {
             score += 20;
         }
         Ok(MatchScore { score })
@@ -61,7 +68,6 @@ impl CheckpointConventionDecoder for DenseSafetensorsConvention {
                     actual: Some(entry.storage_type.to_string()),
                 }));
             };
-            // Version 1 prefers BF16; F16/F32 are accepted for inspection/binding.
             if !matches!(ty, ScalarType::Bf16 | ScalarType::F16 | ScalarType::F32) {
                 return Err(DynInferError::UnsupportedEncoding(UnsupportedEncodingError {
                     message: format!("dense SafeTensors dtype {ty} not in version-1 path"),
@@ -73,21 +79,15 @@ impl CheckpointConventionDecoder for DenseSafetensorsConvention {
                 }));
             }
 
-            // Skip HF RoPE cache tensors; remap HF names when present.
-            let canonical = if looks_like_hf_llama(&entry.key) || entry.key.contains("rotary_emb")
-            {
-                match hf_to_canonical(&entry.key) {
-                    Some(name) => name,
-                    None => continue,
-                }
-            } else {
-                entry.key.clone()
-            };
+            // Skip obvious non-weight caches; arch remappers also filter these.
+            if entry.key.contains("rotary_emb") || entry.key.ends_with(".inv_freq") {
+                continue;
+            }
 
             let shape = Shape::new(entry.shape.clone());
             parameters.push(LogicalParameter {
-                canonical_name: CanonicalParameterName::new(canonical.clone()),
-                role: infer_role(&canonical),
+                canonical_name: CanonicalParameterName::new(entry.key.clone()),
+                role: infer_role(&entry.key),
                 logical_type: LogicalTensorType {
                     shape: shape.clone(),
                     element_type: *ty,
@@ -102,7 +102,7 @@ impl CheckpointConventionDecoder for DenseSafetensorsConvention {
                     alignment: entry.alignment,
                     endianness: Endianness::Little,
                 }],
-                aliases: vec![entry.key.clone(), canonical],
+                aliases: vec![entry.key.clone()],
             });
         }
 

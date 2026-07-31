@@ -82,23 +82,145 @@ pub fn revision() -> Result<String, ApiError> {
     Ok(unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
 }
 
+/// Default AMDGPU chip when compiling for HIP/ROCm without an explicit target.
+pub const DEFAULT_ROCM_TARGET: &str = "gfx1151";
+/// Default NVPTX arch when compiling for CUDA without an explicit target.
+pub const DEFAULT_CUDA_TARGET: &str = "sm_80";
+
 /// HAL/device flags for the dyninfer target driver name.
-pub fn flags_for_driver(driver: &str) -> Vec<&'static str> {
+///
+/// `gpu_arch` is `--iree-rocm-target` / `--iree-cuda-target` (e.g. `gfx1151`,
+/// `sm_80`). Defaults apply when omitted for HIP/CUDA.
+///
+/// For HIP, also sets `--iree-rocm-bc-dir` when platform bitcode can be found
+/// (required for in-process `libIREECompiler`; `iree-compile` finds it via
+/// `$ORIGIN`).
+pub fn flags_for_target(driver: &str, gpu_arch: Option<&str>) -> Vec<String> {
     match driver {
-        "vulkan" => vec!["--iree-hal-target-device=vulkan"],
+        "vulkan" => vec!["--iree-hal-target-device=vulkan".into()],
+        "hip" | "rocm" => {
+            let chip = gpu_arch
+                .filter(|s| !s.is_empty())
+                .unwrap_or(DEFAULT_ROCM_TARGET);
+            let mut flags = vec![
+                "--iree-hal-target-device=hip".into(),
+                format!("--iree-rocm-target={chip}"),
+            ];
+            if let Some(bc) = discover_rocm_bc_dir() {
+                debug!(path = %bc.display(), "using ROCm bitcode dir");
+                flags.push(format!("--iree-rocm-bc-dir={}", bc.display()));
+            }
+            flags
+        }
+        "cuda" => {
+            let arch = gpu_arch
+                .filter(|s| !s.is_empty())
+                .unwrap_or(DEFAULT_CUDA_TARGET);
+            vec![
+                "--iree-hal-target-device=cuda".into(),
+                format!("--iree-cuda-target={arch}"),
+            ]
+        }
         _ => vec![
-            "--iree-hal-target-device=local",
-            "--iree-hal-local-target-device-backends=llvm-cpu",
-            "--iree-llvmcpu-target-cpu=generic",
+            "--iree-hal-target-device=local".into(),
+            "--iree-hal-local-target-device-backends=llvm-cpu".into(),
+            "--iree-llvmcpu-target-cpu=generic".into(),
         ],
     }
 }
 
+/// Directory containing `ocml.bc` / `ockl.bc` for `--iree-rocm-bc-dir`.
+///
+/// Resolution order:
+/// 1. `DYNINFER_IREE_ROCM_BC_DIR`
+/// 2. Bazel runfiles under the IREE compiler external repo
+/// 3. `iree_platform_libs/rocm` next to the loaded `libIREECompiler.so`
+pub fn discover_rocm_bc_dir() -> Option<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+
+    fn is_rocm_bc(dir: &Path) -> bool {
+        dir.join("ocml.bc").is_file() && dir.join("ockl.bc").is_file()
+    }
+
+    if let Ok(p) = std::env::var("DYNINFER_IREE_ROCM_BC_DIR") {
+        let p = PathBuf::from(p);
+        if is_rocm_bc(&p) {
+            return Some(p);
+        }
+    }
+
+    for root in runfiles_roots() {
+        for arch in ["x86_64", "aarch64"] {
+            let repo = format!("iree_compiler_linux_{arch}");
+            let inner = "iree/compiler/_mlir_libs/iree_platform_libs/rocm";
+            for prefix in [repo.clone(), format!("+http_archive+{repo}")] {
+                let candidate = root.join(&prefix).join(inner);
+                if is_rocm_bc(&candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    // Ensure the dylib is mapped before scanning /proc/self/maps.
+    let _ = unsafe { ireeCompilerGetAPIVersion() };
+    if let Some(lib_dir) = libiree_compiler_dir() {
+        let candidate = lib_dir.join("iree_platform_libs").join("rocm");
+        if is_rocm_bc(&candidate) {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+fn libiree_compiler_dir() -> Option<std::path::PathBuf> {
+    // Linux: path of the mapped shared object.
+    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+    for line in maps.lines() {
+        if !line.contains("libIREECompiler.so") {
+            continue;
+        }
+        let path = line.split_whitespace().last()?;
+        if path.starts_with('/') {
+            return std::path::Path::new(path).parent().map(|p| p.to_path_buf());
+        }
+    }
+    None
+}
+
+fn runfiles_roots() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let mut roots = Vec::new();
+    for key in ["RUNFILES_DIR", "TEST_SRCDIR"] {
+        if let Ok(dir) = std::env::var(key) {
+            let p = PathBuf::from(dir);
+            if p.is_dir() {
+                roots.push(p);
+            }
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let sibling = PathBuf::from(format!("{}.runfiles", exe.display()));
+        if sibling.is_dir() {
+            roots.push(sibling);
+        }
+    }
+    roots
+}
+
+/// Convenience wrapper: HIP/CUDA use their default GPU arches.
+pub fn flags_for_driver(driver: &str) -> Vec<String> {
+    flags_for_target(driver, None)
+}
+
 /// Compile MLIR text to VMFB bytes using session flags (IREE CLI flag subset).
-pub fn compile_mlir_to_vmfb(mlir: &str, flags: &[&str]) -> Result<Vec<u8>, ApiError> {
+pub fn compile_mlir_to_vmfb(mlir: &str, flags: &[impl AsRef<str>]) -> Result<Vec<u8>, ApiError> {
     let _guard = COMPILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     ensure_initialized()?;
-    unsafe { compile_inner(mlir, flags) }
+    let owned: Vec<String> = flags.iter().map(|f| f.as_ref().to_string()).collect();
+    let refs: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+    unsafe { compile_inner(mlir, &refs) }
 }
 
 unsafe fn compile_inner(mlir: &str, flags: &[&str]) -> Result<Vec<u8>, ApiError> {
@@ -271,5 +393,25 @@ module {
                 eprintln!("skipping in-process smoke: {e}");
             }
         }
+    }
+
+    #[test]
+    fn hip_inprocess_compiles_with_rocm_bc_dir() {
+        let mlir = r#"
+module {
+  func.func @add(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> tensor<4xf32> {
+    %0 = arith.addf %arg0, %arg1 : tensor<4xf32>
+    return %0 : tensor<4xf32>
+  }
+}
+"#;
+        let flags = flags_for_target("hip", Some("gfx1151"));
+        if !flags.iter().any(|f| f.starts_with("--iree-rocm-bc-dir=")) {
+            eprintln!("skipping: ROCm bitcode not found in runfiles");
+            return;
+        }
+        let vmfb = compile_mlir_to_vmfb(mlir, &flags).expect("in-process HIP compile");
+        assert!(!vmfb.is_empty());
+        assert!(!vmfb.starts_with(b"DYNINFER_VMFB_STUB"));
     }
 }

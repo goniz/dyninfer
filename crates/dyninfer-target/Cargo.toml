@@ -9,5 +9,6 @@ license.workspace = true
 [dependencies]
 dyninfer-core = { workspace = true }
 dyninfer-error = { workspace = true }
+iree-runtime = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }

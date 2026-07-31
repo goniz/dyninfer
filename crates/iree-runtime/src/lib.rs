@@ -89,6 +89,8 @@ pub struct Context {
     instance: Instance,
     module: Module,
     parameters: Option<PathBuf>,
+    /// IREE HAL device URI (`hip`, `vulkan`, …). Empty → tool default (local).
+    device: Option<String>,
 }
 
 impl Context {
@@ -97,11 +99,30 @@ impl Context {
             instance,
             module,
             parameters: None,
+            device: None,
         })
     }
 
     pub fn with_parameters(mut self, path: impl AsRef<Path>) -> Self {
         self.parameters = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Set `--device=` for `iree-run-module` (e.g. `hip`, `vulkan`).
+    pub fn with_device(mut self, device: impl Into<String>) -> Self {
+        let d = device.into();
+        self.device = if d.is_empty()
+            || d == "local-task"
+            || d == "local-sync"
+            || d == "local"
+            || d == "cpu"
+        {
+            None
+        } else if d == "rocm" {
+            Some("hip".into())
+        } else {
+            Some(d)
+        };
         self
     }
 
@@ -120,22 +141,33 @@ impl Context {
 
     pub fn invoke_add(&self, a: &[f32; 4], b: &[f32; 4]) -> Result<Vec<f32>> {
         let path = self.module_path()?;
-        self.instance
-            .tools
-            .run_add(path, a, b, self.parameters.as_deref())
+        self.instance.tools.run_add(
+            path,
+            a,
+            b,
+            self.parameters.as_deref(),
+            self.device.as_deref(),
+        )
     }
 
-    pub fn invoke_prefill(&self, tokens: &[i64]) -> Result<Vec<f32>> {
+    pub fn invoke_prefill(&self, tokens: &[i64], last: i64) -> Result<Vec<f32>> {
         let path = self.module_path()?;
-        self.instance
-            .tools
-            .run_prefill(path, tokens, self.parameters.as_deref())
+        self.instance.tools.run_prefill(
+            path,
+            tokens,
+            last,
+            self.parameters.as_deref(),
+            self.device.as_deref(),
+        )
     }
 
     pub fn invoke_decode(&self, token: i64) -> Result<Vec<f32>> {
         let path = self.module_path()?;
-        self.instance
-            .tools
-            .run_decode(path, token, self.parameters.as_deref())
+        self.instance.tools.run_decode(
+            path,
+            token,
+            self.parameters.as_deref(),
+            self.device.as_deref(),
+        )
     }
 }
