@@ -5,10 +5,12 @@ use dyninfer_core::{
     ScalarType,
 };
 
+#[allow(dead_code)] // kept for architecture plugins that declare slots explicitly
 pub fn slot(name: &str, role: ParameterRole, rank: usize) -> ParameterSlot {
     slot_opt(name, role, rank, false)
 }
 
+#[allow(dead_code)]
 pub fn slot_opt(name: &str, role: ParameterRole, rank: usize, optional: bool) -> ParameterSlot {
     ParameterSlot {
         id: ParameterSlotId::new(name),

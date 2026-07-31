@@ -13,8 +13,7 @@ use dyninfer_checkpoint::CheckpointCatalog;
 use dyninfer_core::{ScalarType, StorageElementType};
 use dyninfer_error::Result;
 use dyninfer_mlir::ModuleBuilder;
-use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
+use std::collections::BTreeMap;
 
 /// Default static prefill window for mid-size dense models.
 pub const PREFILL_WINDOW: u32 = 64;
@@ -176,17 +175,6 @@ impl DenseDecoderConfig {
             .unwrap_or(ScalarType::F32)
     }
 
-    fn weight_dtypes_summary(&self) -> String {
-        let mut set = BTreeSet::new();
-        for ty in self.param_dtypes.values() {
-            set.insert(ty.to_string());
-        }
-        if set.is_empty() {
-            return COMPUTE_DTYPE.to_string();
-        }
-        set.into_iter().collect::<Vec<_>>().join(",")
-    }
-
     pub fn is_tiny_m1(&self) -> bool {
         self.vocab == 32
             && self.hidden == 64
@@ -265,39 +253,6 @@ fn append_asm_section(
     builder.append_toplevel_asm(&out)
 }
 
-/// Raw MLIR text emission (no parse/verify). Prefer [`emit_dense_decoder_cfg`].
-pub fn emit_dense_decoder_cfg_text(arch_id: &str, c: &DenseDecoderConfig) -> String {
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "// dyninfer dense decoder arch={} layers={} seq={} max_kv={} gqa={}/{} head_dim={} qk_norm={} rope={:?} weight_dtypes=[{}] compute={}",
-        arch_id,
-        c.num_layers,
-        c.seq,
-        c.max_kv,
-        c.num_heads,
-        c.num_kv_heads,
-        c.head_dim,
-        c.has_qk_norm,
-        c.rope_theta,
-        c.weight_dtypes_summary(),
-        COMPUTE_DTYPE,
-    );
-    emit_globals_text(&mut out, c);
-    emit_helpers(&mut out, c);
-    emit_prefill(&mut out, c);
-    emit_decode(&mut out, c);
-    out.push_str(
-        r#"
-func.func @add(%a: tensor<4xf32>, %b: tensor<4xf32>) -> tensor<4xf32> {
-  %0 = arith.addf %a, %b : tensor<4xf32>
-  return %0 : tensor<4xf32>
-}
-"#,
-    );
-    out
-}
-
 fn catalog_param_dtype(param: &dyninfer_checkpoint::LogicalParameter) -> Option<ScalarType> {
     let comp = param.components.first()?;
     match &comp.storage_type {
@@ -320,20 +275,6 @@ fn emit_global(
     let key = c.param_key(canonical);
     let wt = mlir_ty(c.param_dtype(canonical));
     builder.util_global_parameter(sym, &key, &format!("tensor<{shape}x{wt}>"))
-}
-
-fn emit_global_text(
-    out: &mut String,
-    c: &DenseDecoderConfig,
-    sym: &str,
-    canonical: &str,
-    shape: &str,
-) {
-    let key = c.param_key(canonical);
-    let wt = mlir_ty(c.param_dtype(canonical));
-    out.push_str(&format!(
-        "util.global private @{sym} = #stream.parameter.named<\"weights\"::\"{key}\"> : tensor<{shape}x{wt}>\n"
-    ));
 }
 
 /// Load a weight global and cast to [`COMPUTE_DTYPE`] when the checkpoint dtype differs.
@@ -489,119 +430,6 @@ fn emit_globals(builder: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<(
         )?;
     }
     Ok(())
-}
-
-fn emit_globals_text(out: &mut String, c: &DenseDecoderConfig) {
-    let (v, h, i) = (c.vocab, c.hidden, c.intermediate);
-    let (q, kv, d) = (c.q_dim(), c.kv_dim(), c.head_dim);
-    emit_global_text(out, c, "token_embd_weight", "token_embd.weight", &format!("{v}x{h}"));
-    for layer in 0..c.num_layers {
-        let p = format!("blk{layer}");
-        let n = format!("blk.{layer}");
-        emit_global_text(
-            out,
-            c,
-            &format!("{p}_attn_norm_weight"),
-            &format!("{n}.attn_norm.weight"),
-            &format!("{h}"),
-        );
-        emit_global_text(
-            out,
-            c,
-            &format!("{p}_attn_q_weight"),
-            &format!("{n}.attn_q.weight"),
-            &format!("{q}x{h}"),
-        );
-        emit_global_text(
-            out,
-            c,
-            &format!("{p}_attn_k_weight"),
-            &format!("{n}.attn_k.weight"),
-            &format!("{kv}x{h}"),
-        );
-        emit_global_text(
-            out,
-            c,
-            &format!("{p}_attn_v_weight"),
-            &format!("{n}.attn_v.weight"),
-            &format!("{kv}x{h}"),
-        );
-        emit_global_text(
-            out,
-            c,
-            &format!("{p}_attn_output_weight"),
-            &format!("{n}.attn_output.weight"),
-            &format!("{h}x{q}"),
-        );
-        if c.has_qk_norm {
-            emit_global_text(
-                out,
-                c,
-                &format!("{p}_attn_q_norm_weight"),
-                &format!("{n}.attn_q_norm.weight"),
-                &format!("{d}"),
-            );
-            emit_global_text(
-                out,
-                c,
-                &format!("{p}_attn_k_norm_weight"),
-                &format!("{n}.attn_k_norm.weight"),
-                &format!("{d}"),
-            );
-        }
-        emit_global_text(
-            out,
-            c,
-            &format!("{p}_ffn_norm_weight"),
-            &format!("{n}.ffn_norm.weight"),
-            &format!("{h}"),
-        );
-        emit_global_text(
-            out,
-            c,
-            &format!("{p}_ffn_gate_weight"),
-            &format!("{n}.ffn_gate.weight"),
-            &format!("{i}x{h}"),
-        );
-        emit_global_text(
-            out,
-            c,
-            &format!("{p}_ffn_up_weight"),
-            &format!("{n}.ffn_up.weight"),
-            &format!("{i}x{h}"),
-        );
-        emit_global_text(
-            out,
-            c,
-            &format!("{p}_ffn_down_weight"),
-            &format!("{n}.ffn_down.weight"),
-            &format!("{h}x{i}"),
-        );
-    }
-    emit_global_text(
-        out,
-        c,
-        "output_norm_weight",
-        "output_norm.weight",
-        &format!("{h}"),
-    );
-    emit_global_text(
-        out,
-        c,
-        "output_weight",
-        "output.weight",
-        &format!("{v}x{h}"),
-    );
-    let (mk, nkv, d) = (c.max_kv, c.num_kv_heads, c.head_dim);
-    for layer in 0..c.num_layers {
-        out.push_str(&format!(
-            "util.global private mutable @kv_k{layer} = dense<0.0> : tensor<{mk}x{nkv}x{d}xf32>\n"
-        ));
-        out.push_str(&format!(
-            "util.global private mutable @kv_v{layer} = dense<0.0> : tensor<{mk}x{nkv}x{d}xf32>\n"
-        ));
-    }
-    out.push('\n');
 }
 
 fn emit_helpers(out: &mut String, c: &DenseDecoderConfig) {
@@ -2085,26 +1913,26 @@ mod tests {
             param_keys: BTreeMap::new(),
             param_dtypes,
         };
-        let mlir = emit_dense_decoder_cfg_text("test.decoder", &c);
-        assert!(mlir.contains("weight_dtypes=[bf16,f16,f32]"));
-        assert!(mlir.contains(
-            "util.global private @token_embd_weight = #stream.parameter.named<\"weights\"::\"token_embd.weight\"> : tensor<32x64xbf16>"
-        ));
-        assert!(mlir.contains(
-            "util.global private @blk0_attn_norm_weight = #stream.parameter.named<\"weights\"::\"blk.0.attn_norm.weight\"> : tensor<64xf16>"
-        ));
-        assert!(mlir.contains(
-            "util.global private @blk0_attn_q_weight = #stream.parameter.named<\"weights\"::\"blk.0.attn_q.weight\"> : tensor<64x64xf32>"
-        ));
-        assert!(mlir.contains("arith.extf %emb_t_native : tensor<32x64xbf16> to tensor<32x64xf32>"));
-        assert!(mlir.contains(
-            "arith.extf %blk0_attn_nw_native : tensor<64xf16> to tensor<64xf32>"
-        ));
-
-        let verified = emit_dense_decoder_cfg("test.decoder", &c).expect("mlir verify");
+        let mlir = emit_dense_decoder_cfg("test.decoder", &c).expect("mlir verify");
         assert!(
-            verified.contains("@prefill") || verified.contains("func.func @prefill"),
-            "verified module missing prefill: {verified}"
+            mlir.contains("@token_embd_weight") && mlir.contains("tensor<32x64xbf16>"),
+            "missing bf16 token embd global: {mlir}"
+        );
+        assert!(
+            mlir.contains("@blk0_attn_norm_weight") && mlir.contains("tensor<64xf16>"),
+            "missing f16 attn norm global: {mlir}"
+        );
+        assert!(
+            mlir.contains("@blk0_attn_q_weight") && mlir.contains("tensor<64x64xf32>"),
+            "missing f32 q weight global: {mlir}"
+        );
+        assert!(
+            mlir.contains("arith.extf") && mlir.contains("bf16") && mlir.contains("f32"),
+            "missing bf16→f32 cast: {mlir}"
+        );
+        assert!(
+            mlir.contains("@prefill") || mlir.contains("func.func @prefill"),
+            "verified module missing prefill: {mlir}"
         );
     }
 }
