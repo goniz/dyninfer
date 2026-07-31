@@ -151,7 +151,7 @@ impl ArchitectureRegistry {
         let config = def
             .config_schema()
             .resolve(overrides, checkpoint_meta, &defaults)?;
-        let mut builder = ModelBuilder::new();
+        let mut builder = ModelBuilder::new()?;
         builder.set_architecture_id(def.id());
         let module = def.build(&config, &mut builder)?;
         Ok(ArchitecturePackage::from_module(
@@ -173,7 +173,7 @@ impl ArchitectureRegistry {
                 detail: None,
             })
         })?;
-        let mut builder = ModelBuilder::new();
+        let mut builder = ModelBuilder::new()?;
         builder.set_architecture_id(def.id());
         let module = def.build(config, &mut builder)?;
         Ok(ArchitecturePackage::from_module(

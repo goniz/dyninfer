@@ -4,13 +4,13 @@
 
 use crate::naming::{canonicalize_hf_family, tie_output_to_embed};
 use crate::ops::{emit_dense_decoder_cfg, DenseDecoderConfig};
-use crate::slots::{field, slot};
+use crate::slots::field;
 use dyninfer_architecture::{
     ArchitectureDefinition, ArchitecturePackage, ConfigSchema, EmitOutput, ModelBuilder,
     ModelModule, ResolvedModelConfig,
 };
 use dyninfer_checkpoint::{CheckpointCatalog, ParameterCatalog};
-use dyninfer_core::{ArchitectureId, ParameterRole};
+use dyninfer_core::ArchitectureId;
 use dyninfer_error::{CompilationError, DynInferError, Result};
 use std::sync::LazyLock;
 
@@ -55,75 +55,17 @@ impl ArchitectureDefinition for Qwen3Architecture {
         m: &mut ModelBuilder,
     ) -> Result<ModelModule> {
         let num_layers = config.num_layers()?;
-        let hidden = config.get_u32("hidden_size")?;
-        let vocab = config.get_u32("vocab_size")?;
+        let _hidden = config.get_u32("hidden_size")?;
+        let _vocab = config.get_u32("vocab_size")?;
 
-        m.note_op(format!("embedding vocab={vocab} hidden={hidden}"));
-        m.declare_parameter(slot("token_embd.weight", ParameterRole::Embedding, 2))?;
-
+        let tokens = m.input_tokens("tokens")?;
+        let mut x = m.embedding(tokens, "token_embd.weight")?;
         for layer in 0..num_layers {
-            let prefix = format!("blk.{layer}");
-            m.note_op(format!("qwen3_block {layer}"));
-            m.declare_parameter(slot(
-                &format!("{prefix}.attn_norm.weight"),
-                ParameterRole::Norm,
-                1,
-            ))?;
-            m.declare_parameter(slot(
-                &format!("{prefix}.attn_q.weight"),
-                ParameterRole::AttentionQ,
-                2,
-            ))?;
-            m.declare_parameter(slot(
-                &format!("{prefix}.attn_k.weight"),
-                ParameterRole::AttentionK,
-                2,
-            ))?;
-            m.declare_parameter(slot(
-                &format!("{prefix}.attn_v.weight"),
-                ParameterRole::AttentionV,
-                2,
-            ))?;
-            m.declare_parameter(slot(
-                &format!("{prefix}.attn_output.weight"),
-                ParameterRole::AttentionO,
-                2,
-            ))?;
-            m.declare_parameter(slot(
-                &format!("{prefix}.attn_q_norm.weight"),
-                ParameterRole::Norm,
-                1,
-            ))?;
-            m.declare_parameter(slot(
-                &format!("{prefix}.attn_k_norm.weight"),
-                ParameterRole::Norm,
-                1,
-            ))?;
-            m.declare_parameter(slot(
-                &format!("{prefix}.ffn_norm.weight"),
-                ParameterRole::Norm,
-                1,
-            ))?;
-            m.declare_parameter(slot(
-                &format!("{prefix}.ffn_gate.weight"),
-                ParameterRole::FfnGate,
-                2,
-            ))?;
-            m.declare_parameter(slot(
-                &format!("{prefix}.ffn_up.weight"),
-                ParameterRole::FfnUp,
-                2,
-            ))?;
-            m.declare_parameter(slot(
-                &format!("{prefix}.ffn_down.weight"),
-                ParameterRole::FfnDown,
-                2,
-            ))?;
+            x = m.dense_block(x, layer, /*has_qk_norm=*/ true)?;
         }
-
-        m.declare_parameter(slot("output_norm.weight", ParameterRole::Norm, 1))?;
-        m.declare_parameter(slot("output.weight", ParameterRole::Output, 2))?;
-        m.note_op("export prefill,decode");
+        x = m.rms_norm(x, "output_norm.weight")?;
+        let logits = m.linear(x, "output.weight")?;
+        m.export_prefill_and_decode(logits)?;
         m.finish()
     }
 
