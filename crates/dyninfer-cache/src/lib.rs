@@ -257,6 +257,7 @@ mod tests {
             },
             parameter_scope: "weights".into(),
             vmfb_path: "model.vmfb".into(),
+            prefill_window: 4,
             diagnostics: vec![],
         };
         cache.publish(&key, b"VMFBSTUB", &manifest).unwrap();

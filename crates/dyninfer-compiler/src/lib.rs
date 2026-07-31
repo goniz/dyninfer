@@ -4,10 +4,12 @@
 #![forbid(unsafe_code)]
 
 mod iree_tools;
+mod llama_emit;
 mod mlir_emit;
 
 pub use iree_tools::IreeTools;
-pub use mlir_emit::{emit_add_smoke_module, emit_bridge_module};
+pub use llama_emit::{LlamaEmitConfig, PREFILL_WINDOW, TINY_PREFILL_WINDOW};
+pub use mlir_emit::{emit_add_smoke_module, emit_bridge_module, emit_model_module};
 
 use dyninfer_architecture::ArchitecturePackage;
 use dyninfer_checkpoint::CheckpointCatalog;
@@ -133,7 +135,7 @@ impl ModelCompiler for LocalCompiler {
         let mlir = if request.options.smoke_only {
             emit_add_smoke_module().to_string()
         } else {
-            emit_bridge_module(request.architecture)
+            emit_model_module(request.architecture, request.checkpoint)
         };
 
         let _iree = info_span!("compile.iree").entered();
@@ -180,6 +182,12 @@ impl ModelCompiler for LocalCompiler {
             .resolved_config
             .num_layers()
             .unwrap_or(1);
+        let emit_cfg = LlamaEmitConfig::from_package(request.architecture, request.checkpoint);
+        let prefill_window = if emit_cfg.supports_dense_emit() {
+            emit_cfg.seq
+        } else {
+            TINY_PREFILL_WINDOW
+        };
         let manifest = ExecutableManifest {
             format: "dyninfer.bundle".into(),
             version: 1,
@@ -218,6 +226,7 @@ impl ModelCompiler for LocalCompiler {
             },
             parameter_scope: "weights".into(),
             vmfb_path: "executables/model.vmfb".into(),
+            prefill_window,
             diagnostics: diagnostics.iter().map(|d| d.to_string()).collect(),
         };
 

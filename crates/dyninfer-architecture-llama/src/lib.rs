@@ -23,6 +23,7 @@ static LLAMA_CONFIG_SCHEMA: LazyLock<ConfigSchema> = LazyLock::new(|| ConfigSche
         field("vocab_size", "u32", true, Some(serde_json::json!(32000))),
         field("context_length", "u32", true, Some(serde_json::json!(2048))),
         field("rms_norm_eps", "f64", false, Some(serde_json::json!(1e-5))),
+        field("rope_theta", "f64", false, None),
     ],
 });
 

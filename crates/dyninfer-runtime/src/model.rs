@@ -46,6 +46,7 @@ impl CausalLanguageModel for LoadedModel {
             self.metadata.clone(),
             config,
             self.manifest.kv_cache.clone(),
+            self.manifest.prefill_window,
             Arc::clone(&self.context),
         )))
     }
@@ -183,6 +184,7 @@ impl ModelLoader {
         let vmfb_path = bundle.join("executables").join("model.vmfb");
         let manifest: ExecutableManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
         let binding: BindingPlan = serde_json::from_slice(&fs::read(&bindings_path)?)?;
+        let checkpoint = checkpoint.as_ref();
         let catalog = self.inspect(checkpoint)?;
         if catalog.schema_fingerprint.digest != manifest.checkpoint_schema.digest {
             return Err(DynInferError::Cache(CacheError {
@@ -193,9 +195,12 @@ impl ModelLoader {
         }
 
         let _span = info_span!("parameters.open").entered();
+        let params_cache = bundle.join("parameters-cache");
+        let params_path =
+            dyninfer_checkpoint_safetensors::materialize_f32_safetensors(&catalog, &params_cache)?;
         let instance = Instance::new()?;
         let module = Module::from_path(&vmfb_path)?;
-        let context = Arc::new(Context::create(instance, module)?);
+        let context = Arc::new(Context::create(instance, module)?.with_parameters(params_path));
 
         let metadata = ModelMetadata {
             architecture_id: manifest.architecture_id.clone(),

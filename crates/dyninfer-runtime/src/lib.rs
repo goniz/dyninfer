@@ -4,12 +4,24 @@
 
 mod builtins;
 mod e2e;
+mod generate;
+mod hf_hub;
 mod model;
+mod reference;
 mod session;
+mod stories_e2e;
+mod tokenizer_bpe;
 
 pub use builtins::{default_architecture_registry, default_checkpoint_support};
+pub use generate::{argmax, generate_greedy, load_tokenizer, GenerateConfig, GenerateOutput};
+pub use hf_hub::{
+    find_safetensors_checkpoint, hf_hub_cache_dir, hf_repo_folder_name, resolve_hf_snapshot,
+    DEFAULT_HF_REVISION,
+};
 pub use model::{LoadedModel, ModelLoader};
+pub use reference::{max_abs_err, tiny_llama_prefill_logits};
 pub use session::{IreeSession, Logits};
+pub use tokenizer_bpe::BpeTokenizer;
 
 use dyninfer_core::{ModelMetadata, SessionConfig, TokenId};
 use dyninfer_error::Result;

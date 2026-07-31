@@ -16,6 +16,12 @@ rust_library(
 rust_test(
     name = "dyninfer-runtime_tests",
     crate = ":dyninfer-runtime",
-    data = ["//bazel/iree:tools"],
+    data = [
+        "//bazel/iree:tools",
+        "//architectures/testdata:maykeye_tinyllama_v0",
+    ],
+    compile_data = [
+        "//architectures/testdata:maykeye_tinyllama_v0",
+    ],
     deps = all_crate_deps(normal_dev = True),
 )

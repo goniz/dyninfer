@@ -1,9 +1,8 @@
 //! Safe wrappers over IREE runtime execution.
 //!
-//! Milestone 0 drives the pinned `iree-run-module` tool so we execute real
-//! VMFBs without linking the full C runtime yet. The public API still never
-//! exposes raw IREE handles. A later revision swaps the tool backend for
-//! in-process C API bindings (`iree-runtime-sys`).
+//! Milestone 1 drives pinned `iree-run-module` with SafeTensors external
+//! parameters (`--parameters=weights=...`). The public API never exposes raw
+//! IREE handles.
 
 #![forbid(unsafe_code)]
 
@@ -37,7 +36,6 @@ impl Instance {
 pub struct Module {
     pub bytes: Vec<u8>,
     path: Option<PathBuf>,
-    /// Keeps the temporary VMFB file alive for tool invocation.
     _temp_dir: Option<tempfile::TempDir>,
 }
 
@@ -86,15 +84,25 @@ impl Module {
     }
 }
 
-/// Execution context bound to a module.
+/// Execution context bound to a module (+ optional external parameter file).
 pub struct Context {
     instance: Instance,
     module: Module,
+    parameters: Option<PathBuf>,
 }
 
 impl Context {
     pub fn create(instance: Instance, module: Module) -> Result<Self> {
-        Ok(Self { instance, module })
+        Ok(Self {
+            instance,
+            module,
+            parameters: None,
+        })
+    }
+
+    pub fn with_parameters(mut self, path: impl AsRef<Path>) -> Self {
+        self.parameters = Some(path.as_ref().to_path_buf());
+        self
     }
 
     pub fn module_bytes(&self) -> &[u8] {
@@ -110,21 +118,24 @@ impl Context {
         })
     }
 
-    /// Invoke `@add` on two f32[4] vectors (smoke entrypoint).
     pub fn invoke_add(&self, a: &[f32; 4], b: &[f32; 4]) -> Result<Vec<f32>> {
         let path = self.module_path()?;
-        self.instance.tools.run_add(path, a, b)
+        self.instance
+            .tools
+            .run_add(path, a, b, self.parameters.as_deref())
     }
 
-    /// Invoke `@prefill` with a fixed 4-token window, returning logits.
-    pub fn invoke_prefill(&self, tokens: &[i64; 4]) -> Result<Vec<f32>> {
+    pub fn invoke_prefill(&self, tokens: &[i64]) -> Result<Vec<f32>> {
         let path = self.module_path()?;
-        self.instance.tools.run_prefill(path, tokens)
+        self.instance
+            .tools
+            .run_prefill(path, tokens, self.parameters.as_deref())
     }
 
-    /// Invoke `@decode` with a scalar token id, returning logits.
     pub fn invoke_decode(&self, token: i64) -> Result<Vec<f32>> {
         let path = self.module_path()?;
-        self.instance.tools.run_decode(path, token)
+        self.instance
+            .tools
+            .run_decode(path, token, self.parameters.as_deref())
     }
 }

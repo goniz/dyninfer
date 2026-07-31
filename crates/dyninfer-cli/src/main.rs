@@ -6,8 +6,11 @@ use clap::{Parser, Subcommand};
 use dyninfer_cache::ArtifactCache;
 use dyninfer_compiler::{compile_add_smoke, CompileOptions};
 use iree_runtime::{Context, Instance, Module};
-use dyninfer_core::{ArchitectureId, SessionConfig, TokenId};
-use dyninfer_runtime::{CausalLanguageModel, ModelLoader};
+use dyninfer_core::{ArchitectureId, SessionConfig};
+use dyninfer_runtime::{
+    find_safetensors_checkpoint, generate_greedy, load_tokenizer, resolve_hf_snapshot,
+    CausalLanguageModel, GenerateConfig, ModelLoader,
+};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -54,14 +57,41 @@ enum Commands {
         #[arg(long = "set", value_name = "KEY=VALUE")]
         set: Vec<String>,
     },
-    /// Run inference against a compiled bundle (real IREE `@prefill`/`@decode`).
+    /// Run greedy generation against a compiled bundle (tokenizer + IREE).
     Run {
         #[arg(long)]
         bundle: PathBuf,
         #[arg(long)]
         checkpoint: PathBuf,
-        #[arg(long, default_value = "Hello")]
+        #[arg(long)]
+        tokenizer: Option<PathBuf>,
+        #[arg(long, default_value = "Once upon a time")]
         prompt: String,
+        #[arg(long, default_value_t = 48)]
+        max_new_tokens: usize,
+    },
+    /// Compile + generate from a local HF snapshot or Hub cache entry.
+    Generate {
+        #[arg(long, default_value = "llama.decoder")]
+        architecture: String,
+        /// Local model directory (config.json + *.safetensors + tokenizer.json).
+        #[arg(long, conflicts_with = "hf")]
+        model_dir: Option<PathBuf>,
+        /// Hugging Face repo id resolved against the local Hub cache
+        /// (`HF_HUB_CACHE` / `~/.cache/huggingface/hub`). Does not download.
+        #[arg(long, value_name = "ORG/NAME")]
+        hf: Option<String>,
+        /// Hub revision / branch / snapshot hash (default: main).
+        #[arg(long, default_value = "main")]
+        revision: String,
+        #[arg(long, default_value = "cpu")]
+        target: String,
+        #[arg(long, default_value = "Once upon a time")]
+        prompt: String,
+        #[arg(long, default_value_t = 48)]
+        max_new_tokens: usize,
+        #[arg(long)]
+        output_bundle: Option<PathBuf>,
     },
     /// Compile and run the trivial `@add` smoke module through real IREE.
     Smoke {
@@ -243,23 +273,94 @@ fn main() -> anyhow::Result<()> {
         Commands::Run {
             bundle,
             checkpoint,
+            tokenizer,
             prompt,
+            max_new_tokens,
         } => {
             let loader = ModelLoader::default();
             let model = loader.load_bundle(&bundle, &checkpoint)?;
-            let mut session = model.create_session(SessionConfig::default())?;
-            // Tokenizer is deferred; treat prompt bytes as fake token ids.
-            let tokens: Vec<TokenId> = prompt.bytes().map(|b| b as TokenId).collect();
-            let logits = session.prefill(&tokens)?;
-            let next = argmax(&logits.values);
-            println!("iree prefill complete; position={}", session.position());
-            println!("argmax token={next} (vocab={})", logits.values.len());
-            let logits = session.decode(next)?;
-            println!(
-                "iree decode complete; position={} argmax={}",
-                session.position(),
-                argmax(&logits.values)
-            );
+            let tok_path = tokenizer.unwrap_or_else(|| {
+                checkpoint
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("."))
+            });
+            let tokenizer = load_tokenizer(&tok_path)?;
+            let eos = model
+                .metadata()
+                .extra
+                .get("eos_token_id")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            let out = generate_greedy(
+                &model,
+                &tokenizer,
+                &prompt,
+                &GenerateConfig {
+                    max_new_tokens,
+                    eos_token_id: eos.or(Some(2)),
+                },
+                SessionConfig::default(),
+            )?;
+            println!("{}", out.text);
+        }
+        Commands::Generate {
+            architecture,
+            model_dir,
+            hf,
+            revision,
+            target,
+            prompt,
+            max_new_tokens,
+            output_bundle,
+        } => {
+            let model_dir = match (hf, model_dir) {
+                (Some(repo), None) => {
+                    let snap = resolve_hf_snapshot(&repo, Some(&revision))?;
+                    eprintln!("using HF cache snapshot {}", snap.display());
+                    snap
+                }
+                (None, Some(dir)) => dir,
+                (None, None) => anyhow::bail!("provide --hf ORG/NAME or --model-dir PATH"),
+                (Some(_), Some(_)) => unreachable!("clap conflicts_with"),
+            };
+            let ckpt = find_safetensors_checkpoint(&model_dir)?;
+            let default_bundle = std::env::temp_dir().join(format!(
+                "dyninfer-generate-{}/model.bundle",
+                std::process::id()
+            ));
+            let bundle = output_bundle.unwrap_or(default_bundle);
+            let loader = ModelLoader::default();
+            let id = ArchitectureId::new(architecture);
+            let paths = loader.compile_to_bundle(
+                &id,
+                &ckpt,
+                &target,
+                &bundle,
+                &CompileOptions {
+                    mode: "local-jit".into(),
+                    ..Default::default()
+                },
+            )?;
+            let model = loader.load_bundle(&paths.root, &ckpt)?;
+            let tokenizer = load_tokenizer(&model_dir)?;
+            let eos = model
+                .metadata()
+                .extra
+                .get("eos_token_id")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            let out = generate_greedy(
+                &model,
+                &tokenizer,
+                &prompt,
+                &GenerateConfig {
+                    max_new_tokens,
+                    eos_token_id: eos.or(Some(2)),
+                },
+                SessionConfig::default(),
+            )?;
+            println!("{}", out.text);
         }
         Commands::Smoke { target } => {
             let driver = if target == "cpu" || target == "auto" {
@@ -350,11 +451,3 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn argmax(values: &[f32]) -> TokenId {
-    values
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, _)| i as TokenId)
-        .unwrap_or(0)
-}

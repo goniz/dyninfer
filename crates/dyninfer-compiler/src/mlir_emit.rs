@@ -1,12 +1,21 @@
-//! Emit IREE-legal MLIR for Milestone 0/1 bridge executables.
-//!
-//! Full dyninfer dialects land later; until then we emit a real llvm-cpu /
-//! vulkan-capable module that exports `prefill` and `decode` with fixed
-//! shape buckets so the compile→run path exercises IREE end-to-end.
+//! Emit IREE-legal MLIR for model executables.
 
 use dyninfer_architecture::ArchitecturePackage;
+use dyninfer_checkpoint::CheckpointCatalog;
 
-/// Emit a bridge module: constant-zero logits of size `vocab`.
+use crate::llama_emit::{emit_dense_llama, LlamaEmitConfig};
+
+/// Emit the best available module for this architecture/checkpoint.
+pub fn emit_model_module(package: &ArchitecturePackage, catalog: &CheckpointCatalog) -> String {
+    let cfg = LlamaEmitConfig::from_package(package, catalog);
+    if cfg.supports_dense_emit() {
+        emit_dense_llama(package, catalog)
+    } else {
+        emit_bridge_module(package)
+    }
+}
+
+/// Constant-zero logits bridge (non-tiny shapes / smoke scaffolding).
 pub fn emit_bridge_module(package: &ArchitecturePackage) -> String {
     let vocab = package
         .resolved_config

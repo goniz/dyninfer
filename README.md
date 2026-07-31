@@ -16,14 +16,34 @@ Architecture IR
 
 ## Status
 
-Implementation is tracking [`spec.md`](spec.md). Milestone 0/1 skeleton is in place:
+Implementation is tracking [`spec.md`](spec.md). **Milestone 1 (dense Llama PoC) is in:**
 
 - Full Cargo workspace (`dyninfer` CLI + 18 crates)
 - SafeTensors + GGUF metadata indexing and convention decoding
 - Llama architecture slots, binder, target discovery, artifact cache
+- Real tiny-Llama MLIR (external IREE params from SafeTensors) + Rust reference e2e
 - In-process IREE compile via bindgen + `libIREECompiler` (`//crates/iree-compiler-sys`)
 - Tool-backed run via Bazel-fetched `iree-run-module` (`//bazel/iree:tools`)
 - CLI: `smoke`, `checkpoint inspect`, `bind`, `compile`, `run`, `model install`, `cache`
+
+Differential check: `bazel test //crates/dyninfer-runtime:dyninfer-runtime_tests`
+
+### Real TinyStories Llama example
+
+Uses ungated [Maykeye/TinyLLama-v0](https://huggingface.co/Maykeye/TinyLLama-v0)
+(~9MB BF16 Llama). Prefer the local Hugging Face Hub cache
+(`HF_HUB_CACHE` / `~/.cache/huggingface/hub`); testdata is only a fallback.
+Meta Llama 3.2-1B is gated/heavier (GQA) and left for a later milestone.
+
+```bash
+# one-time: populate the Hub cache
+hf download Maykeye/TinyLLama-v0
+
+bazel run //crates/dyninfer-cli:dyninfer -- generate \
+  --hf Maykeye/TinyLLama-v0 \
+  --prompt "Once upon a time" \
+  --max-new-tokens 48
+```
 
 ## Build
 

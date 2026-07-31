@@ -35,7 +35,21 @@ pub fn write_safetensors(tensors: &BTreeMap<String, (Vec<u64>, Vec<f32>)>, metad
     out
 }
 
-/// Minimal Llama-shaped dense checkpoint (1 layer, tiny dims).
+/// Deterministic pseudo-random fills used by the M1 reference + IREE path.
+pub fn fill_f32(n: usize, seed: u32) -> Vec<f32> {
+    let mut out = Vec::with_capacity(n);
+    let mut x = seed;
+    for i in 0..n {
+        x = x
+            .wrapping_mul(1664525)
+            .wrapping_add(1013904223)
+            .wrapping_add(i as u32);
+        out.push(((x % 1000) as f32) / 1000.0 - 0.5);
+    }
+    out
+}
+
+/// Minimal Llama-shaped dense checkpoint (1 layer, tiny dims, varied weights).
 pub fn tiny_llama_dense_f32() -> Vec<u8> {
     let vocab = 32u64;
     let hidden = 64u64;
@@ -56,12 +70,13 @@ pub fn tiny_llama_dense_f32() -> Vec<u8> {
         "llama.embedding_length": hidden,
         "llama.attention.head_count": 4,
         "llama.block_count": 1,
+        "rms_norm_eps": 1e-5,
     });
 
     let mut tensors = BTreeMap::new();
     tensors.insert(
         "token_embd.weight".into(),
-        (vec![vocab, hidden], vec![0.01f32; (vocab * hidden) as usize]),
+        (vec![vocab, hidden], fill_f32((vocab * hidden) as usize, 1)),
     );
     tensors.insert(
         "blk.0.attn_norm.weight".into(),
@@ -69,19 +84,19 @@ pub fn tiny_llama_dense_f32() -> Vec<u8> {
     );
     tensors.insert(
         "blk.0.attn_q.weight".into(),
-        (vec![hidden, hidden], vec![0.02f32; (hidden * hidden) as usize]),
+        (vec![hidden, hidden], fill_f32((hidden * hidden) as usize, 2)),
     );
     tensors.insert(
         "blk.0.attn_k.weight".into(),
-        (vec![hidden, hidden], vec![0.02f32; (hidden * hidden) as usize]),
+        (vec![hidden, hidden], fill_f32((hidden * hidden) as usize, 3)),
     );
     tensors.insert(
         "blk.0.attn_v.weight".into(),
-        (vec![hidden, hidden], vec![0.02f32; (hidden * hidden) as usize]),
+        (vec![hidden, hidden], fill_f32((hidden * hidden) as usize, 4)),
     );
     tensors.insert(
         "blk.0.attn_output.weight".into(),
-        (vec![hidden, hidden], vec![0.02f32; (hidden * hidden) as usize]),
+        (vec![hidden, hidden], fill_f32((hidden * hidden) as usize, 5)),
     );
     tensors.insert(
         "blk.0.ffn_norm.weight".into(),
@@ -91,21 +106,21 @@ pub fn tiny_llama_dense_f32() -> Vec<u8> {
         "blk.0.ffn_gate.weight".into(),
         (
             vec![intermediate, hidden],
-            vec![0.03f32; (intermediate * hidden) as usize],
+            fill_f32((intermediate * hidden) as usize, 6),
         ),
     );
     tensors.insert(
         "blk.0.ffn_up.weight".into(),
         (
             vec![intermediate, hidden],
-            vec![0.03f32; (intermediate * hidden) as usize],
+            fill_f32((intermediate * hidden) as usize, 7),
         ),
     );
     tensors.insert(
         "blk.0.ffn_down.weight".into(),
         (
             vec![hidden, intermediate],
-            vec![0.03f32; (hidden * intermediate) as usize],
+            fill_f32((hidden * intermediate) as usize, 8),
         ),
     );
     tensors.insert(
@@ -114,7 +129,7 @@ pub fn tiny_llama_dense_f32() -> Vec<u8> {
     );
     tensors.insert(
         "output.weight".into(),
-        (vec![vocab, hidden], vec![0.01f32; (vocab * hidden) as usize]),
+        (vec![vocab, hidden], fill_f32((vocab * hidden) as usize, 9)),
     );
 
     write_safetensors(&tensors, meta)

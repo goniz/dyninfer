@@ -365,8 +365,15 @@ pub struct ExecutableManifest {
     pub kv_cache: KvCacheDescriptor,
     pub parameter_scope: String,
     pub vmfb_path: String,
+    /// Static `@prefill` token window compiled into the VMFB.
+    #[serde(default = "default_prefill_window")]
+    pub prefill_window: u32,
     #[serde(default)]
     pub diagnostics: Vec<String>,
+}
+
+fn default_prefill_window() -> u32 {
+    4
 }
 
 #[cfg(test)]

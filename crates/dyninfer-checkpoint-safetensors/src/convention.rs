@@ -1,5 +1,7 @@
 //! Dense SafeTensors convention decoder.
 
+use crate::config_json::load_hf_config_metadata;
+use crate::hf_names::{hf_to_canonical, looks_like_hf_llama};
 use dyninfer_checkpoint::{
     infer_role, CheckpointConventionDecoder, DecodeContext, LogicalParameter, MatchScore,
     ParameterCatalog, RawCheckpointIndex,
@@ -34,9 +36,11 @@ impl CheckpointConventionDecoder for DenseSafetensorsConvention {
         if dense_count == 0 {
             return Ok(MatchScore::NONE);
         }
-        Ok(MatchScore {
-            score: 50 + dense_count.min(40) as u32,
-        })
+        let mut score = 50 + dense_count.min(40) as u32;
+        if index.entries.iter().any(|e| looks_like_hf_llama(&e.key)) {
+            score += 20;
+        }
+        Ok(MatchScore { score })
     }
 
     fn decode(
@@ -69,10 +73,21 @@ impl CheckpointConventionDecoder for DenseSafetensorsConvention {
                 }));
             }
 
+            // Skip HF RoPE cache tensors; remap HF names when present.
+            let canonical = if looks_like_hf_llama(&entry.key) || entry.key.contains("rotary_emb")
+            {
+                match hf_to_canonical(&entry.key) {
+                    Some(name) => name,
+                    None => continue,
+                }
+            } else {
+                entry.key.clone()
+            };
+
             let shape = Shape::new(entry.shape.clone());
             parameters.push(LogicalParameter {
-                canonical_name: CanonicalParameterName::new(entry.key.clone()),
-                role: infer_role(&entry.key),
+                canonical_name: CanonicalParameterName::new(canonical.clone()),
+                role: infer_role(&canonical),
                 logical_type: LogicalTensorType {
                     shape: shape.clone(),
                     element_type: *ty,
@@ -87,14 +102,21 @@ impl CheckpointConventionDecoder for DenseSafetensorsConvention {
                     alignment: entry.alignment,
                     endianness: Endianness::Little,
                 }],
-                aliases: vec![entry.key.clone()],
+                aliases: vec![entry.key.clone(), canonical],
             });
+        }
+
+        let mut metadata = index.metadata.clone();
+        if let Some(src) = index.source_files.first() {
+            for (k, v) in load_hf_config_metadata(&src.path) {
+                metadata.entry(k).or_insert(v);
+            }
         }
 
         Ok(ParameterCatalog {
             convention_id: self.convention_id(),
             parameters,
-            metadata: index.metadata.clone(),
+            metadata,
         })
     }
 }

@@ -1,8 +1,8 @@
-//! End-to-end bootstrap path tests (inspect → bind → compile → run via IREE).
+//! End-to-end Milestone 1 path (inspect → bind → compile → run vs reference).
 
 #[cfg(test)]
 mod tests {
-    use crate::{CausalLanguageModel, ModelLoader};
+    use crate::{max_abs_err, tiny_llama_prefill_logits, CausalLanguageModel, ModelLoader};
     use dyninfer_checkpoint_safetensors::tiny_llama_dense_f32;
     use dyninfer_compiler::{compile_add_smoke, CompileOptions, IreeTools};
     use dyninfer_core::{ArchitectureId, SessionConfig};
@@ -11,15 +11,17 @@ mod tests {
 
     fn iree_available() -> bool {
         IreeTools::discover().is_ok()
+            || std::env::var_os("RUNFILES_DIR").is_some()
+            || std::env::var_os("TEST_SRCDIR").is_some()
     }
 
     #[test]
     fn iree_add_smoke_compiles_and_runs() {
         if !iree_available() {
-            eprintln!("skipping: IREE tools not found (need //bazel/iree:tools runfiles)");
+            eprintln!("skipping: IREE not available");
             return;
         }
-        let vmfb = compile_add_smoke("local-task").expect("iree-compile available");
+        let vmfb = compile_add_smoke("local-task").expect("iree compile");
         assert!(!vmfb.is_empty());
         assert!(!vmfb.starts_with(b"DYNINFER_VMFB_STUB"));
 
@@ -33,9 +35,9 @@ mod tests {
     }
 
     #[test]
-    fn inspect_bind_compile_run_tiny_llama() {
+    fn tiny_llama_matches_reference_logits() {
         if !iree_available() {
-            eprintln!("skipping: IREE tools not found (need //bazel/iree:tools runfiles)");
+            eprintln!("skipping: IREE not available");
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -43,10 +45,6 @@ mod tests {
         fs::write(&ckpt, tiny_llama_dense_f32()).unwrap();
 
         let loader = ModelLoader::default();
-        let catalog = loader.inspect(&ckpt).unwrap();
-        assert_eq!(catalog.container.format_id.as_str(), "safetensors");
-        assert!(catalog.parameters.len() >= 12);
-
         let id = ArchitectureId::new("llama.decoder");
         let (package, _catalog, plan) = loader.bind(&id, &ckpt, &Default::default()).unwrap();
         assert_eq!(package.resolved_config.num_layers().unwrap(), 1);
@@ -67,17 +65,29 @@ mod tests {
             .unwrap();
         let vmfb = fs::read(&paths.vmfb).unwrap();
         assert!(!vmfb.starts_with(b"DYNINFER_VMFB_STUB"));
-        assert!(vmfb.len() > 64);
+        assert!(vmfb.len() > 1024, "expected a real specialized VMFB");
 
         let model = loader.load_bundle(&bundle, &ckpt).unwrap();
         assert_eq!(model.metadata().vocabulary_size, 32);
         let mut session = model.create_session(SessionConfig::default()).unwrap();
-        let logits = session.prefill(&[1, 2, 3]).unwrap();
-        assert_eq!(logits.values.len(), 32);
-        assert_eq!(session.position(), 3);
-        let logits = session.decode(1).unwrap();
+
+        let tokens = [1u32, 2, 3, 0];
+        let logits = session.prefill(&tokens).unwrap();
         assert_eq!(logits.values.len(), 32);
         assert_eq!(session.position(), 4);
+
+        let reference = tiny_llama_prefill_logits(&tokens).unwrap();
+        let err = max_abs_err(&logits.values, &reference).unwrap();
+        assert!(
+            err < 1e-3,
+            "logits diverged from reference: max_abs_err={err}\ngot={:?}\nref={:?}",
+            &logits.values[..8],
+            &reference[..8]
+        );
+
+        let decode_logits = session.decode(1).unwrap();
+        assert_eq!(decode_logits.values.len(), 32);
+        assert_eq!(session.position(), 5);
 
         let sum = model
             .context

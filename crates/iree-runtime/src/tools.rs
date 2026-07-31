@@ -49,7 +49,13 @@ impl IreeRunTools {
         }))
     }
 
-    pub fn run_add(&self, module: &Path, a: &[f32; 4], b: &[f32; 4]) -> Result<Vec<f32>> {
+    pub fn run_add(
+        &self,
+        module: &Path,
+        a: &[f32; 4],
+        b: &[f32; 4],
+        parameters: Option<&Path>,
+    ) -> Result<Vec<f32>> {
         let input_a = format!(
             "4xf32={}",
             a.iter()
@@ -64,33 +70,61 @@ impl IreeRunTools {
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        let stdout = self.invoke(module, "add", &[&input_a, &input_b])?;
+        let stdout = self.invoke(module, "add", &[&input_a, &input_b], parameters)?;
         parse_f32_buffer_view(&stdout)
     }
 
-    pub fn run_prefill(&self, module: &Path, tokens: &[i64; 4]) -> Result<Vec<f32>> {
+    pub fn run_prefill(
+        &self,
+        module: &Path,
+        tokens: &[i64],
+        parameters: Option<&Path>,
+    ) -> Result<Vec<f32>> {
+        if tokens.is_empty() {
+            return Err(DynInferError::IreeRuntime(IreeRuntimeError {
+                message: "prefill requires a non-empty token window".into(),
+                status_code: None,
+            }));
+        }
         let input = format!(
-            "4xi64={}",
+            "{}xi64={}",
+            tokens.len(),
             tokens
                 .iter()
                 .map(|v| v.to_string())
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        let stdout = self.invoke(module, "prefill", &[&input])?;
+        let stdout = self.invoke(module, "prefill", &[&input], parameters)?;
         parse_f32_buffer_view(&stdout)
     }
 
-    pub fn run_decode(&self, module: &Path, token: i64) -> Result<Vec<f32>> {
+    pub fn run_decode(
+        &self,
+        module: &Path,
+        token: i64,
+        parameters: Option<&Path>,
+    ) -> Result<Vec<f32>> {
         let input = format!("i64={token}");
-        let stdout = self.invoke(module, "decode", &[&input])?;
+        let stdout = self.invoke(module, "decode", &[&input], parameters)?;
         parse_f32_buffer_view(&stdout)
     }
 
-    fn invoke(&self, module: &Path, function: &str, inputs: &[&str]) -> Result<String> {
+    fn invoke(
+        &self,
+        module: &Path,
+        function: &str,
+        inputs: &[&str],
+        parameters: Option<&Path>,
+    ) -> Result<String> {
         let mut cmd = Command::new(&self.run_module);
         cmd.arg(format!("--module={}", module.display()))
-            .arg(format!("--function={function}"));
+            .arg(format!("--function={function}"))
+            // Default (1024) elides large logits with `...`; we need full buffers.
+            .arg("--output_max_element_count=1048576");
+        if let Some(params) = parameters {
+            cmd.arg(format!("--parameters=weights={}", params.display()));
+        }
         for input in inputs {
             cmd.arg(format!("--input={input}"));
         }
@@ -177,12 +211,14 @@ fn manifest_rlocation(rel: &str) -> Option<PathBuf> {
 }
 
 fn parse_f32_buffer_view(stdout: &str) -> Result<Vec<f32>> {
-    // Typical line: `4xf32=11 22 33 44` or `32xf32=0 0 ...`
-    for line in stdout.lines().rev() {
+    // Prefer the first result buffer (logits); ignore later KV dumps if present.
+    for line in stdout.lines() {
         let line = line.trim();
         if let Some(idx) = line.find("xf32=") {
             let values = &line[idx + "xf32=".len()..];
             let nums: Result<Vec<f32>, _> = values
+                .replace('[', " ")
+                .replace(']', " ")
                 .split_whitespace()
                 .map(|s| {
                     s.parse::<f32>().map_err(|e| {

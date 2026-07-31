@@ -33,8 +33,24 @@ bazel run //crates/dyninfer-cli:dyninfer -- smoke
 3. **Override:** `CompileOptions.force_subprocess` or cargo-only venv via
    `scripts/bootstrap_iree.sh`.
 
+## Parameters (Milestone 1)
+
+Dense Llama VMFBs load weights via `#stream.parameter.named<"weights"::"...">`.
+At invoke time the runtime passes:
+
+```text
+--parameters=weights=<checkpoint.safetensors>
+```
+
+Any exported function on a parameterized module (including `@add` smoke) needs
+that flag when creating the VM context.
+
+Dense MHA Llama shapes (including Maykeye TinyLLama-v0: `vocab=32000`,
+`hidden=64`, 8 layers, seq=64 + RoPE) are emitted programmatically. GQA /
+Meta-1B-scale models still fall back to the constant-logits bridge.
+
 ## Next steps
 
 1. Opt-in `@iree_core` source build (see `SOURCE.md`).
 2. In-process runtime C API (`iree-runtime-sys`) replacing `iree-run-module`.
-3. Real Llama lowering into IREE input dialects.
+3. Explicit KV-cache ABI (M1 uses host history + static-window `@prefill`).
