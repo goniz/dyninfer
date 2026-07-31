@@ -222,6 +222,7 @@ dependencies = [
  "dyninfer-checkpoint",
  "dyninfer-core",
  "dyninfer-error",
+ "dyninfer-mlir",
  "serde",
  "serde_json",
  "tracing",
@@ -235,6 +236,7 @@ dependencies = [
  "dyninfer-checkpoint",
  "dyninfer-core",
  "dyninfer-error",
+ "dyninfer-mlir",
  "serde_json",
 ]
 
@@ -385,6 +387,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "dyninfer-mlir"
+version = "0.1.0"
+dependencies = [
+ "dyninfer-error",
+ "dyninfer-mlir-sys",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "dyninfer-mlir-sys"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+ "iree-compiler-sys",
+]
+
+[[package]]
 name = "dyninfer-runtime"
 version = "0.1.0"
 dependencies = [
@@ -502,6 +522,7 @@ name = "iree-runtime"
 version = "0.1.0"
 dependencies = [
  "dyninfer-error",
+ "iree-runtime-sys",
  "tempfile",
  "tracing",
 ]

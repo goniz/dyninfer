@@ -4,9 +4,10 @@ use crate::package::ArchitecturePackage;
 use dyninfer_checkpoint::{CheckpointCatalog, ParameterCatalog};
 use dyninfer_core::{ArchitectureId, ParameterSlot};
 use dyninfer_error::{DynInferError, Result};
+use dyninfer_mlir::{ModuleBuilder, VerifiedModule};
 use serde::{Deserialize, Serialize};
 
-/// Placeholder for an in-memory MLIR module until melior/FFI is wired.
+/// In-memory MLIR module produced by an architecture builder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelModule {
     pub architecture_id: ArchitectureId,
@@ -15,11 +16,14 @@ pub struct ModelModule {
 }
 
 /// Narrow builder API used by architecture definitions.
+///
+/// Backed by [`dyninfer_mlir::ModuleBuilder`] (MLIR C API / melior-style).
 #[derive(Debug, Default)]
 pub struct ModelBuilder {
     architecture_id: Option<ArchitectureId>,
     slots: Vec<ParameterSlot>,
-    ops: Vec<String>,
+    /// Accumulated MLIR source fragments (joined before verify).
+    mlir_parts: Vec<String>,
 }
 
 impl ModelBuilder {
@@ -36,8 +40,15 @@ impl ModelBuilder {
         Ok(())
     }
 
+    /// Append a chunk of MLIR text (ops, globals, functions).
+    pub fn append_mlir(&mut self, text: impl Into<String>) {
+        self.mlir_parts.push(text.into());
+    }
+
+    /// Note a high-level op name for debugging (does not emit IR).
     pub fn note_op(&mut self, op: impl Into<String>) {
-        self.ops.push(op.into());
+        self.mlir_parts
+            .push(format!("// op {}\n", op.into()));
     }
 
     pub fn finish(&mut self) -> Result<ModelModule> {
@@ -45,27 +56,54 @@ impl ModelBuilder {
             DynInferError::internal("ModelBuilder missing architecture_id")
         })?;
         let slots = std::mem::take(&mut self.slots);
-        let ops = std::mem::take(&mut self.ops);
-        let mut mlir = format!(
-            "module attributes {{dyninfer.architecture_id = \"{architecture_id}\"}} {{\n"
+        let parts = std::mem::take(&mut self.mlir_parts);
+
+        let mut source = format!(
+            "// dyninfer architecture={architecture_id}\n"
         );
         for slot in &slots {
-            mlir.push_str(&format!(
-                "  // parameter {} role={}\n",
+            source.push_str(&format!(
+                "// parameter {} role={}\n",
                 slot.canonical_name,
                 slot.role.as_str()
             ));
         }
-        for op in &ops {
-            mlir.push_str(&format!("  // op {op}\n"));
+        for part in parts {
+            source.push_str(&part);
+            if !part.ends_with('\n') {
+                source.push('\n');
+            }
         }
-        mlir.push_str("}\n");
+
+        // Empty / comment-only builders still produce a trivial verified module.
+        let body = source
+            .lines()
+            .any(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.starts_with("//")
+            });
+        let to_verify = if body {
+            source
+        } else {
+            format!(
+                "module attributes {{dyninfer.architecture_id = \"{architecture_id}\"}} {{\n}}\n"
+            )
+        };
+
+        let verified = verify_mlir(&to_verify)?;
         Ok(ModelModule {
             architecture_id,
-            mlir_text: mlir,
+            mlir_text: verified.mlir_text,
             parameter_slots: slots,
         })
     }
+}
+
+/// Parse + verify MLIR text through the melior-style builder.
+pub fn verify_mlir(source: &str) -> Result<VerifiedModule> {
+    let mut builder = ModuleBuilder::new()?;
+    builder.parse_source(source)?;
+    builder.finish()
 }
 
 /// Architecture plugin: slots, naming, and executable emission.

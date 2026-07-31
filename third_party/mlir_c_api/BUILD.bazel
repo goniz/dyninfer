@@ -1,0 +1,17 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "wrapper.h",
+])
+
+cc_library(
+    name = "headers",
+    hdrs = glob(["include/mlir-c/**/*.h"]) + ["wrapper.h"],
+    includes = [
+        "include",
+        ".",
+    ],
+    deps = ["//third_party/iree_compiler_c_api:headers"],
+)

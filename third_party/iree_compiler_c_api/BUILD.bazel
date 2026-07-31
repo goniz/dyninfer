@@ -7,6 +7,7 @@ exports_files([
     "include/iree/compiler/embedding_api.h",
     "include/iree/compiler/api_support.h",
     "include/iree/compiler/loader.h",
+    "include/iree/compiler/mlir_interop.h",
 ])
 
 cc_library(
@@ -16,6 +17,7 @@ cc_library(
         "include/iree/compiler/embedding_api.h",
         "include/iree/compiler/api_support.h",
         "include/iree/compiler/loader.h",
+        "include/iree/compiler/mlir_interop.h",
     ],
     includes = ["include", "."],
 )

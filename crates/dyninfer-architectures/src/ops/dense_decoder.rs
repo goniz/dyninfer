@@ -8,9 +8,10 @@
 //! Activations / logits use [`COMPUTE_DTYPE`] (currently f32); narrower float
 //! weights are cast after load.
 
-use dyninfer_architecture::ArchitecturePackage;
+use dyninfer_architecture::{verify_mlir, ArchitecturePackage};
 use dyninfer_checkpoint::CheckpointCatalog;
 use dyninfer_core::{ScalarType, StorageElementType};
+use dyninfer_error::Result;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
@@ -219,11 +220,21 @@ impl DenseDecoderConfig {
 }
 
 /// Emit using an explicit config (architecture files may override flags).
-pub fn emit_dense_decoder_cfg(arch_id: &str, c: &DenseDecoderConfig) -> String {
+///
+/// Text is assembled then parsed/verified through [`dyninfer_mlir::ModuleBuilder`]
+/// before returning (spec §8.3.1).
+pub fn emit_dense_decoder_cfg(arch_id: &str, c: &DenseDecoderConfig) -> Result<String> {
     assert!(
         c.supports_dense_emit(),
         "unsupported dense decoder emit config: {c:?}"
     );
+    let text = emit_dense_decoder_cfg_text(arch_id, c);
+    let verified = verify_mlir(&text)?;
+    Ok(verified.mlir_text)
+}
+
+/// Raw MLIR text emission (no parse/verify). Prefer [`emit_dense_decoder_cfg`].
+pub fn emit_dense_decoder_cfg_text(arch_id: &str, c: &DenseDecoderConfig) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
@@ -1903,7 +1914,7 @@ mod tests {
             param_keys: BTreeMap::new(),
             param_dtypes,
         };
-        let mlir = emit_dense_decoder_cfg("test.decoder", &c);
+        let mlir = emit_dense_decoder_cfg_text("test.decoder", &c);
         assert!(mlir.contains("weight_dtypes=[bf16,f16,f32]"));
         assert!(mlir.contains(
             "util.global private @token_embd_weight = #stream.parameter.named<\"weights\"::\"token_embd.weight\"> : tensor<32x64xbf16>"
@@ -1918,5 +1929,11 @@ mod tests {
         assert!(mlir.contains(
             "arith.extf %blk0_attn_nw_native : tensor<64xf16> to tensor<64xf32>"
         ));
+
+        let verified = emit_dense_decoder_cfg("test.decoder", &c).expect("mlir verify");
+        assert!(
+            verified.contains("@prefill") || verified.contains("func.func @prefill"),
+            "verified module missing prefill: {verified}"
+        );
     }
 }

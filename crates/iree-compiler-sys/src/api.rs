@@ -34,7 +34,10 @@ impl std::error::Error for ApiError {}
 
 static INIT: Once = Once::new();
 
-fn ensure_initialized() -> Result<(), ApiError> {
+/// Initialize process-global IREE compiler state (idempotent).
+///
+/// Required before any MLIR C API use through `libIREECompiler.so`.
+pub fn ensure_initialized() -> Result<(), ApiError> {
     let mut init_err: Option<String> = None;
     INIT.call_once(|| {
         unsafe {

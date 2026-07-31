@@ -11,7 +11,7 @@ mod emit;
 mod package;
 mod registry;
 
-pub use builder::{ArchitectureDefinition, ModelBuilder, ModelModule};
+pub use builder::{verify_mlir, ArchitectureDefinition, ModelBuilder, ModelModule};
 pub use config::{ConfigField, ConfigSchema, ResolvedModelConfig};
 pub use emit::EmitOutput;
 pub use package::ArchitecturePackage;

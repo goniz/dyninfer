@@ -15,6 +15,8 @@ members = [
   "crates/dyninfer-cache",
   "crates/dyninfer-compiler-sys",
   "crates/dyninfer-compiler",
+  "crates/dyninfer-mlir-sys",
+  "crates/dyninfer-mlir",
   "crates/iree-compiler-sys",
   "crates/iree-runtime-sys",
   "crates/iree-runtime",
@@ -64,6 +66,8 @@ dyninfer-target = { path = "crates/dyninfer-target" }
 dyninfer-cache = { path = "crates/dyninfer-cache" }
 dyninfer-compiler-sys = { path = "crates/dyninfer-compiler-sys" }
 dyninfer-compiler = { path = "crates/dyninfer-compiler" }
+dyninfer-mlir-sys = { path = "crates/dyninfer-mlir-sys" }
+dyninfer-mlir = { path = "crates/dyninfer-mlir" }
 iree-compiler-sys = { path = "crates/iree-compiler-sys" }
 iree-runtime-sys = { path = "crates/iree-runtime-sys" }
 iree-runtime = { path = "crates/iree-runtime" }
