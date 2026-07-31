@@ -8,10 +8,11 @@
 //! Activations / logits use [`COMPUTE_DTYPE`] (currently f32); narrower float
 //! weights are cast after load.
 
-use dyninfer_architecture::{verify_mlir, ArchitecturePackage};
+use dyninfer_architecture::ArchitecturePackage;
 use dyninfer_checkpoint::CheckpointCatalog;
 use dyninfer_core::{ScalarType, StorageElementType};
 use dyninfer_error::Result;
+use dyninfer_mlir::ModuleBuilder;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
@@ -221,16 +222,47 @@ impl DenseDecoderConfig {
 
 /// Emit using an explicit config (architecture files may override flags).
 ///
-/// Text is assembled then parsed/verified through [`dyninfer_mlir::ModuleBuilder`]
-/// before returning (spec §8.3.1).
+/// Builds an in-memory MLIR module via [`ModuleBuilder`], verifies, then prints
+/// for the IREE compile boundary (spec §8.3.1).
 pub fn emit_dense_decoder_cfg(arch_id: &str, c: &DenseDecoderConfig) -> Result<String> {
     assert!(
         c.supports_dense_emit(),
         "unsupported dense decoder emit config: {c:?}"
     );
-    let text = emit_dense_decoder_cfg_text(arch_id, c);
-    let verified = verify_mlir(&text)?;
-    Ok(verified.mlir_text)
+    let mut builder = ModuleBuilder::new()?;
+    build_dense_decoder(&mut builder, arch_id, c)?;
+    Ok(builder.finish()?.mlir_text)
+}
+
+/// Build the dense decoder into an existing [`ModuleBuilder`].
+pub fn build_dense_decoder(
+    builder: &mut ModuleBuilder,
+    arch_id: &str,
+    c: &DenseDecoderConfig,
+) -> Result<()> {
+    let _ = arch_id; // retained for call-site tracing / future module attrs
+    emit_globals(builder, c)?;
+    append_asm_section(builder, |out| emit_helpers(out, c))?;
+    append_asm_section(builder, |out| emit_prefill(out, c))?;
+    append_asm_section(builder, |out| emit_decode(out, c))?;
+    builder.func_asm(
+        r#"
+func.func @add(%a: tensor<4xf32>, %b: tensor<4xf32>) -> tensor<4xf32> {
+  %0 = arith.addf %a, %b : tensor<4xf32>
+  return %0 : tensor<4xf32>
+}
+"#,
+    )?;
+    Ok(())
+}
+
+fn append_asm_section(
+    builder: &mut ModuleBuilder,
+    emit: impl FnOnce(&mut String),
+) -> Result<()> {
+    let mut out = String::new();
+    emit(&mut out);
+    builder.append_toplevel_asm(&out)
 }
 
 /// Raw MLIR text emission (no parse/verify). Prefer [`emit_dense_decoder_cfg`].
@@ -251,7 +283,7 @@ pub fn emit_dense_decoder_cfg_text(arch_id: &str, c: &DenseDecoderConfig) -> Str
         c.weight_dtypes_summary(),
         COMPUTE_DTYPE,
     );
-    emit_globals(&mut out, c);
+    emit_globals_text(&mut out, c);
     emit_helpers(&mut out, c);
     emit_prefill(&mut out, c);
     emit_decode(&mut out, c);
@@ -278,7 +310,25 @@ fn mlir_ty(ty: ScalarType) -> String {
     ty.to_string()
 }
 
-fn emit_global(out: &mut String, c: &DenseDecoderConfig, sym: &str, canonical: &str, shape: &str) {
+fn emit_global(
+    builder: &mut ModuleBuilder,
+    c: &DenseDecoderConfig,
+    sym: &str,
+    canonical: &str,
+    shape: &str,
+) -> Result<()> {
+    let key = c.param_key(canonical);
+    let wt = mlir_ty(c.param_dtype(canonical));
+    builder.util_global_parameter(sym, &key, &format!("tensor<{shape}x{wt}>"))
+}
+
+fn emit_global_text(
+    out: &mut String,
+    c: &DenseDecoderConfig,
+    sym: &str,
+    canonical: &str,
+    shape: &str,
+) {
     let key = c.param_key(canonical);
     let wt = mlir_ty(c.param_dtype(canonical));
     out.push_str(&format!(
@@ -319,42 +369,164 @@ fn emit_load_compute(
     }
 }
 
-fn emit_globals(out: &mut String, c: &DenseDecoderConfig) {
+fn emit_globals(builder: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()> {
     let (v, h, i) = (c.vocab, c.hidden, c.intermediate);
     let (q, kv, d) = (c.q_dim(), c.kv_dim(), c.head_dim);
-    emit_global(out, c, "token_embd_weight", "token_embd.weight", &format!("{v}x{h}"));
+    emit_global(
+        builder,
+        c,
+        "token_embd_weight",
+        "token_embd.weight",
+        &format!("{v}x{h}"),
+    )?;
     for layer in 0..c.num_layers {
         let p = format!("blk{layer}");
         let n = format!("blk.{layer}");
         emit_global(
+            builder,
+            c,
+            &format!("{p}_attn_norm_weight"),
+            &format!("{n}.attn_norm.weight"),
+            &format!("{h}"),
+        )?;
+        emit_global(
+            builder,
+            c,
+            &format!("{p}_attn_q_weight"),
+            &format!("{n}.attn_q.weight"),
+            &format!("{q}x{h}"),
+        )?;
+        emit_global(
+            builder,
+            c,
+            &format!("{p}_attn_k_weight"),
+            &format!("{n}.attn_k.weight"),
+            &format!("{kv}x{h}"),
+        )?;
+        emit_global(
+            builder,
+            c,
+            &format!("{p}_attn_v_weight"),
+            &format!("{n}.attn_v.weight"),
+            &format!("{kv}x{h}"),
+        )?;
+        emit_global(
+            builder,
+            c,
+            &format!("{p}_attn_output_weight"),
+            &format!("{n}.attn_output.weight"),
+            &format!("{h}x{q}"),
+        )?;
+        if c.has_qk_norm {
+            emit_global(
+                builder,
+                c,
+                &format!("{p}_attn_q_norm_weight"),
+                &format!("{n}.attn_q_norm.weight"),
+                &format!("{d}"),
+            )?;
+            emit_global(
+                builder,
+                c,
+                &format!("{p}_attn_k_norm_weight"),
+                &format!("{n}.attn_k_norm.weight"),
+                &format!("{d}"),
+            )?;
+        }
+        emit_global(
+            builder,
+            c,
+            &format!("{p}_ffn_norm_weight"),
+            &format!("{n}.ffn_norm.weight"),
+            &format!("{h}"),
+        )?;
+        emit_global(
+            builder,
+            c,
+            &format!("{p}_ffn_gate_weight"),
+            &format!("{n}.ffn_gate.weight"),
+            &format!("{i}x{h}"),
+        )?;
+        emit_global(
+            builder,
+            c,
+            &format!("{p}_ffn_up_weight"),
+            &format!("{n}.ffn_up.weight"),
+            &format!("{i}x{h}"),
+        )?;
+        emit_global(
+            builder,
+            c,
+            &format!("{p}_ffn_down_weight"),
+            &format!("{n}.ffn_down.weight"),
+            &format!("{h}x{i}"),
+        )?;
+    }
+    emit_global(
+        builder,
+        c,
+        "output_norm_weight",
+        "output_norm.weight",
+        &format!("{h}"),
+    )?;
+    emit_global(
+        builder,
+        c,
+        "output_weight",
+        "output.weight",
+        &format!("{v}x{h}"),
+    )?;
+    // Mutable KV cache (f32 compute). Prefill seeds [0, seq); decode grows to max_kv.
+    let (mk, nkv, d) = (c.max_kv, c.num_kv_heads, c.head_dim);
+    for layer in 0..c.num_layers {
+        builder.util_global_mutable_zero(
+            &format!("kv_k{layer}"),
+            &format!("tensor<{mk}x{nkv}x{d}xf32>"),
+        )?;
+        builder.util_global_mutable_zero(
+            &format!("kv_v{layer}"),
+            &format!("tensor<{mk}x{nkv}x{d}xf32>"),
+        )?;
+    }
+    Ok(())
+}
+
+fn emit_globals_text(out: &mut String, c: &DenseDecoderConfig) {
+    let (v, h, i) = (c.vocab, c.hidden, c.intermediate);
+    let (q, kv, d) = (c.q_dim(), c.kv_dim(), c.head_dim);
+    emit_global_text(out, c, "token_embd_weight", "token_embd.weight", &format!("{v}x{h}"));
+    for layer in 0..c.num_layers {
+        let p = format!("blk{layer}");
+        let n = format!("blk.{layer}");
+        emit_global_text(
             out,
             c,
             &format!("{p}_attn_norm_weight"),
             &format!("{n}.attn_norm.weight"),
             &format!("{h}"),
         );
-        emit_global(
+        emit_global_text(
             out,
             c,
             &format!("{p}_attn_q_weight"),
             &format!("{n}.attn_q.weight"),
             &format!("{q}x{h}"),
         );
-        emit_global(
+        emit_global_text(
             out,
             c,
             &format!("{p}_attn_k_weight"),
             &format!("{n}.attn_k.weight"),
             &format!("{kv}x{h}"),
         );
-        emit_global(
+        emit_global_text(
             out,
             c,
             &format!("{p}_attn_v_weight"),
             &format!("{n}.attn_v.weight"),
             &format!("{kv}x{h}"),
         );
-        emit_global(
+        emit_global_text(
             out,
             c,
             &format!("{p}_attn_output_weight"),
@@ -362,14 +534,14 @@ fn emit_globals(out: &mut String, c: &DenseDecoderConfig) {
             &format!("{h}x{q}"),
         );
         if c.has_qk_norm {
-            emit_global(
+            emit_global_text(
                 out,
                 c,
                 &format!("{p}_attn_q_norm_weight"),
                 &format!("{n}.attn_q_norm.weight"),
                 &format!("{d}"),
             );
-            emit_global(
+            emit_global_text(
                 out,
                 c,
                 &format!("{p}_attn_k_norm_weight"),
@@ -377,28 +549,28 @@ fn emit_globals(out: &mut String, c: &DenseDecoderConfig) {
                 &format!("{d}"),
             );
         }
-        emit_global(
+        emit_global_text(
             out,
             c,
             &format!("{p}_ffn_norm_weight"),
             &format!("{n}.ffn_norm.weight"),
             &format!("{h}"),
         );
-        emit_global(
+        emit_global_text(
             out,
             c,
             &format!("{p}_ffn_gate_weight"),
             &format!("{n}.ffn_gate.weight"),
             &format!("{i}x{h}"),
         );
-        emit_global(
+        emit_global_text(
             out,
             c,
             &format!("{p}_ffn_up_weight"),
             &format!("{n}.ffn_up.weight"),
             &format!("{i}x{h}"),
         );
-        emit_global(
+        emit_global_text(
             out,
             c,
             &format!("{p}_ffn_down_weight"),
@@ -406,21 +578,20 @@ fn emit_globals(out: &mut String, c: &DenseDecoderConfig) {
             &format!("{h}x{i}"),
         );
     }
-    emit_global(
+    emit_global_text(
         out,
         c,
         "output_norm_weight",
         "output_norm.weight",
         &format!("{h}"),
     );
-    emit_global(
+    emit_global_text(
         out,
         c,
         "output_weight",
         "output.weight",
         &format!("{v}x{h}"),
     );
-    // Mutable KV cache (f32 compute). Prefill seeds [0, seq); decode grows to max_kv.
     let (mk, nkv, d) = (c.max_kv, c.num_kv_heads, c.head_dim);
     for layer in 0..c.num_layers {
         out.push_str(&format!(

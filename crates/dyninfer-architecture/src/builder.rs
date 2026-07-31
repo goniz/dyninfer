@@ -76,18 +76,20 @@ impl ModelBuilder {
         }
 
         // Empty / comment-only builders still produce a trivial verified module.
-        let body = source
-            .lines()
-            .any(|l| {
-                let t = l.trim();
-                !t.is_empty() && !t.starts_with("//")
-            });
+        // Keep architecture_id on the Rust ModelModule only — do not emit a
+        // custom `dyninfer.*` dialect attribute (not registered with IREE).
+        let body = source.lines().any(|l| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with("//")
+        });
         let to_verify = if body {
-            source
+            if source.contains("module ") {
+                source
+            } else {
+                format!("module {{\n{source}}}\n")
+            }
         } else {
-            format!(
-                "module attributes {{dyninfer.architecture_id = \"{architecture_id}\"}} {{\n}}\n"
-            )
+            "module {\n}\n".to_string()
         };
 
         let verified = verify_mlir(&to_verify)?;

@@ -72,11 +72,13 @@ impl ModuleBuilder {
         if trimmed.is_empty() {
             return Ok(());
         }
-        // Parse-check by materializing into a temporary module.
-        let mut tmp = Module::empty(&self.ctx)?;
-        tmp.append_asm_ops(&self.ctx, trimmed)?;
-        drop(tmp);
+        // Parse-check against the full module so far (symbols may reference
+        // earlier globals / funcs).
         self.toplevel.push(trimmed.to_string());
+        if let Err(err) = self.materialize() {
+            self.toplevel.pop();
+            return Err(err);
+        }
         self.verified_text = None;
         Ok(())
     }
