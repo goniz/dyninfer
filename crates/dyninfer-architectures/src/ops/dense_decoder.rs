@@ -2,10 +2,17 @@
 //!
 //! Architecture files (`models/*`) configure [`DenseDecoderConfig`] and call
 //! [`emit_dense_decoder`]. Supports MHA/GQA, independent `head_dim`, optional
-//! Q/K RMSNorm, and NeoX-style RoPE.
+//! Q/K RMSNorm, and HuggingFace Llama/Qwen-style (`rotate_half`) RoPE.
+//!
+//! Weight globals always use the per-tensor dtype from the checkpoint catalog.
+//! Activations / logits use [`COMPUTE_DTYPE`] (currently f32); narrower float
+//! weights are cast after load.
 
 use dyninfer_architecture::ArchitecturePackage;
 use dyninfer_checkpoint::CheckpointCatalog;
+use dyninfer_core::{ScalarType, StorageElementType};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 /// Default static prefill window for mid-size dense models.
 pub const PREFILL_WINDOW: u32 = 64;
@@ -13,6 +20,9 @@ pub const PREFILL_WINDOW: u32 = 64;
 pub const LARGE_PREFILL_WINDOW: u32 = 32;
 /// Window used by the synthetic Milestone-1 fixture (fast differential tests).
 pub const TINY_PREFILL_WINDOW: u32 = 4;
+
+/// Activation / logits compute type. Independent of on-disk weight dtypes.
+pub const COMPUTE_DTYPE: ScalarType = ScalarType::F32;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DenseDecoderConfig {
@@ -28,6 +38,10 @@ pub struct DenseDecoderConfig {
     pub rope_theta: Option<f32>,
     /// Qwen3-style RMSNorm on Q/K heads before RoPE.
     pub has_qk_norm: bool,
+    /// Canonical slot name → tensor key in the parameter file (often HF names).
+    pub param_keys: BTreeMap<String, String>,
+    /// Canonical slot name → on-disk scalar dtype from the checkpoint catalog.
+    pub param_dtypes: BTreeMap<String, ScalarType>,
 }
 
 impl DenseDecoderConfig {
@@ -99,6 +113,19 @@ impl DenseDecoderConfig {
                 .as_str()
                 .contains("attn_q_norm.weight")
         });
+        let mut param_keys = BTreeMap::new();
+        let mut param_dtypes = BTreeMap::new();
+        for p in &catalog.parameters {
+            let key = p
+                .components
+                .first()
+                .map(|c| c.key.clone())
+                .unwrap_or_else(|| p.canonical_name.to_string());
+            param_keys.insert(p.canonical_name.to_string(), key);
+            if let Some(ty) = catalog_param_dtype(p) {
+                param_dtypes.insert(p.canonical_name.to_string(), ty);
+            }
+        }
         Self {
             vocab,
             hidden,
@@ -115,7 +142,36 @@ impl DenseDecoderConfig {
                 rope_theta.or(Some(10000.0))
             },
             has_qk_norm,
+            param_keys,
+            param_dtypes,
         }
+    }
+
+    fn param_key(&self, canonical: &str) -> String {
+        self.param_keys
+            .get(canonical)
+            .cloned()
+            .unwrap_or_else(|| canonical.to_string())
+    }
+
+    /// On-disk dtype for a parameter. Always sourced from the checkpoint catalog
+    /// when present; synthetic fixtures without catalog entries default to f32.
+    fn param_dtype(&self, canonical: &str) -> ScalarType {
+        self.param_dtypes
+            .get(canonical)
+            .copied()
+            .unwrap_or(ScalarType::F32)
+    }
+
+    fn weight_dtypes_summary(&self) -> String {
+        let mut set = BTreeSet::new();
+        for ty in self.param_dtypes.values() {
+            set.insert(ty.to_string());
+        }
+        if set.is_empty() {
+            return COMPUTE_DTYPE.to_string();
+        }
+        set.into_iter().collect::<Vec<_>>().join(",")
     }
 
     pub fn is_tiny_m1(&self) -> bool {
@@ -156,8 +212,9 @@ pub fn emit_dense_decoder_cfg(arch_id: &str, c: &DenseDecoderConfig) -> String {
         "unsupported dense decoder emit config: {c:?}"
     );
     let mut out = String::new();
-    out.push_str(&format!(
-        "// dyninfer dense decoder arch={} layers={} seq={} gqa={}/{} head_dim={} qk_norm={} rope={:?}\n",
+    let _ = writeln!(
+        out,
+        "// dyninfer dense decoder arch={} layers={} seq={} gqa={}/{} head_dim={} qk_norm={} rope={:?} weight_dtypes=[{}] compute={}",
         arch_id,
         c.num_layers,
         c.seq,
@@ -165,8 +222,10 @@ pub fn emit_dense_decoder_cfg(arch_id: &str, c: &DenseDecoderConfig) -> String {
         c.num_kv_heads,
         c.head_dim,
         c.has_qk_norm,
-        c.rope_theta
-    ));
+        c.rope_theta,
+        c.weight_dtypes_summary(),
+        COMPUTE_DTYPE,
+    );
     emit_globals(&mut out, c);
     emit_helpers(&mut out, c);
     emit_prefill(&mut out, c);
@@ -182,57 +241,161 @@ func.func @add(%a: tensor<4xf32>, %b: tensor<4xf32>) -> tensor<4xf32> {
     out
 }
 
+fn catalog_param_dtype(param: &dyninfer_checkpoint::LogicalParameter) -> Option<ScalarType> {
+    let comp = param.components.first()?;
+    match &comp.storage_type {
+        StorageElementType::Scalar { ty } => Some(*ty),
+        _ => None,
+    }
+}
+
+fn mlir_ty(ty: ScalarType) -> String {
+    ty.to_string()
+}
+
+fn emit_global(out: &mut String, c: &DenseDecoderConfig, sym: &str, canonical: &str, shape: &str) {
+    let key = c.param_key(canonical);
+    let wt = mlir_ty(c.param_dtype(canonical));
+    out.push_str(&format!(
+        "util.global private @{sym} = #stream.parameter.named<\"weights\"::\"{key}\"> : tensor<{shape}x{wt}>\n"
+    ));
+}
+
+/// Load a weight global and cast to [`COMPUTE_DTYPE`] when the checkpoint dtype differs.
+fn emit_load_compute(
+    out: &mut String,
+    c: &DenseDecoderConfig,
+    ssa: &str,
+    sym: &str,
+    canonical: &str,
+    shape: &str,
+) {
+    let storage = c.param_dtype(canonical);
+    let wt = mlir_ty(storage);
+    let ct = mlir_ty(COMPUTE_DTYPE);
+    if storage == COMPUTE_DTYPE {
+        out.push_str(&format!(
+            "  %{ssa} = util.global.load @{sym} : tensor<{shape}x{ct}>\n"
+        ));
+        return;
+    }
+    match storage {
+        ScalarType::F16 | ScalarType::Bf16 if COMPUTE_DTYPE == ScalarType::F32 => {
+            out.push_str(&format!(
+                "  %{ssa}_native = util.global.load @{sym} : tensor<{shape}x{wt}>\n"
+            ));
+            out.push_str(&format!(
+                "  %{ssa} = arith.extf %{ssa}_native : tensor<{shape}x{wt}> to tensor<{shape}x{ct}>\n"
+            ));
+        }
+        other => panic!(
+            "dense decoder: cannot cast checkpoint dtype {other} → compute {COMPUTE_DTYPE} for {canonical}"
+        ),
+    }
+}
+
 fn emit_globals(out: &mut String, c: &DenseDecoderConfig) {
     let (v, h, i) = (c.vocab, c.hidden, c.intermediate);
     let (q, kv, d) = (c.q_dim(), c.kv_dim(), c.head_dim);
-    out.push_str(&format!(
-        "util.global private @token_embd_weight = #stream.parameter.named<\"weights\"::\"token_embd.weight\"> : tensor<{v}x{h}xf32>\n"
-    ));
+    emit_global(out, c, "token_embd_weight", "token_embd.weight", &format!("{v}x{h}"));
     for layer in 0..c.num_layers {
         let p = format!("blk{layer}");
         let n = format!("blk.{layer}");
-        out.push_str(&format!(
-            "util.global private @{p}_attn_norm_weight = #stream.parameter.named<\"weights\"::\"{n}.attn_norm.weight\"> : tensor<{h}xf32>\n"
-        ));
-        out.push_str(&format!(
-            "util.global private @{p}_attn_q_weight = #stream.parameter.named<\"weights\"::\"{n}.attn_q.weight\"> : tensor<{q}x{h}xf32>\n"
-        ));
-        out.push_str(&format!(
-            "util.global private @{p}_attn_k_weight = #stream.parameter.named<\"weights\"::\"{n}.attn_k.weight\"> : tensor<{kv}x{h}xf32>\n"
-        ));
-        out.push_str(&format!(
-            "util.global private @{p}_attn_v_weight = #stream.parameter.named<\"weights\"::\"{n}.attn_v.weight\"> : tensor<{kv}x{h}xf32>\n"
-        ));
-        out.push_str(&format!(
-            "util.global private @{p}_attn_output_weight = #stream.parameter.named<\"weights\"::\"{n}.attn_output.weight\"> : tensor<{h}x{q}xf32>\n"
-        ));
+        emit_global(
+            out,
+            c,
+            &format!("{p}_attn_norm_weight"),
+            &format!("{n}.attn_norm.weight"),
+            &format!("{h}"),
+        );
+        emit_global(
+            out,
+            c,
+            &format!("{p}_attn_q_weight"),
+            &format!("{n}.attn_q.weight"),
+            &format!("{q}x{h}"),
+        );
+        emit_global(
+            out,
+            c,
+            &format!("{p}_attn_k_weight"),
+            &format!("{n}.attn_k.weight"),
+            &format!("{kv}x{h}"),
+        );
+        emit_global(
+            out,
+            c,
+            &format!("{p}_attn_v_weight"),
+            &format!("{n}.attn_v.weight"),
+            &format!("{kv}x{h}"),
+        );
+        emit_global(
+            out,
+            c,
+            &format!("{p}_attn_output_weight"),
+            &format!("{n}.attn_output.weight"),
+            &format!("{h}x{q}"),
+        );
         if c.has_qk_norm {
-            out.push_str(&format!(
-                "util.global private @{p}_attn_q_norm_weight = #stream.parameter.named<\"weights\"::\"{n}.attn_q_norm.weight\"> : tensor<{d}xf32>\n"
-            ));
-            out.push_str(&format!(
-                "util.global private @{p}_attn_k_norm_weight = #stream.parameter.named<\"weights\"::\"{n}.attn_k_norm.weight\"> : tensor<{d}xf32>\n"
-            ));
+            emit_global(
+                out,
+                c,
+                &format!("{p}_attn_q_norm_weight"),
+                &format!("{n}.attn_q_norm.weight"),
+                &format!("{d}"),
+            );
+            emit_global(
+                out,
+                c,
+                &format!("{p}_attn_k_norm_weight"),
+                &format!("{n}.attn_k_norm.weight"),
+                &format!("{d}"),
+            );
         }
-        out.push_str(&format!(
-            "util.global private @{p}_ffn_norm_weight = #stream.parameter.named<\"weights\"::\"{n}.ffn_norm.weight\"> : tensor<{h}xf32>\n"
-        ));
-        out.push_str(&format!(
-            "util.global private @{p}_ffn_gate_weight = #stream.parameter.named<\"weights\"::\"{n}.ffn_gate.weight\"> : tensor<{i}x{h}xf32>\n"
-        ));
-        out.push_str(&format!(
-            "util.global private @{p}_ffn_up_weight = #stream.parameter.named<\"weights\"::\"{n}.ffn_up.weight\"> : tensor<{i}x{h}xf32>\n"
-        ));
-        out.push_str(&format!(
-            "util.global private @{p}_ffn_down_weight = #stream.parameter.named<\"weights\"::\"{n}.ffn_down.weight\"> : tensor<{h}x{i}xf32>\n"
-        ));
+        emit_global(
+            out,
+            c,
+            &format!("{p}_ffn_norm_weight"),
+            &format!("{n}.ffn_norm.weight"),
+            &format!("{h}"),
+        );
+        emit_global(
+            out,
+            c,
+            &format!("{p}_ffn_gate_weight"),
+            &format!("{n}.ffn_gate.weight"),
+            &format!("{i}x{h}"),
+        );
+        emit_global(
+            out,
+            c,
+            &format!("{p}_ffn_up_weight"),
+            &format!("{n}.ffn_up.weight"),
+            &format!("{i}x{h}"),
+        );
+        emit_global(
+            out,
+            c,
+            &format!("{p}_ffn_down_weight"),
+            &format!("{n}.ffn_down.weight"),
+            &format!("{h}x{i}"),
+        );
     }
-    out.push_str(&format!(
-        "util.global private @output_norm_weight = #stream.parameter.named<\"weights\"::\"output_norm.weight\"> : tensor<{h}xf32>\n"
-    ));
-    out.push_str(&format!(
-        "util.global private @output_weight = #stream.parameter.named<\"weights\"::\"output.weight\"> : tensor<{v}x{h}xf32>\n\n"
-    ));
+    emit_global(
+        out,
+        c,
+        "output_norm_weight",
+        "output_norm.weight",
+        &format!("{h}"),
+    );
+    emit_global(
+        out,
+        c,
+        "output_weight",
+        "output.weight",
+        &format!("{v}x{h}"),
+    );
+    out.push('\n');
 }
 
 fn emit_helpers(out: &mut String, c: &DenseDecoderConfig) {
@@ -619,7 +782,10 @@ fn emit_rms_norm_heads(
 }
 
 fn emit_rope_helper(out: &mut String, s: u32, nh: u32, d: u32, theta: f32, name: &str) {
-    // Precompute cos/sin tables as nested dense constants: [S, D/2]
+    // HuggingFace Llama/Qwen RoPE: rotate_half.
+    //   x1, x2 = x[..., :D/2], x[..., D/2:]
+    //   out = cat(x1*cos - x2*sin, x1*sin + x2*cos)
+    // Cos/sin tables are [S, D/2] with freq_i = theta^(-2i/D).
     let half = (d / 2) as usize;
     let mut cos_rows = Vec::with_capacity(s as usize);
     let mut sin_rows = Vec::with_capacity(s as usize);
@@ -653,25 +819,21 @@ fn emit_rope_helper(out: &mut String, s: u32, nh: u32, d: u32, theta: f32, name:
       %p = linalg.index 0 : index
       %hh = linalg.index 1 : index
       %dim = linalg.index 2 : index
-      %c2 = arith.constant 2 : index
-      %c0 = arith.constant 0 : index
-      %c1 = arith.constant 1 : index
-      %pair = arith.divui %dim, %c2 : index
-      %parity = arith.remui %dim, %c2 : index
-      %is_even = arith.cmpi eq, %parity, %c0 : index
-      %dim0 = arith.muli %pair, %c2 : index
-      %dim1 = arith.addi %dim0, %c1 : index
-      %x0 = tensor.extract %x[%p, %hh, %dim0] : tensor<{s}x{nh}x{d}xf32>
-      %x1 = tensor.extract %x[%p, %hh, %dim1] : tensor<{s}x{nh}x{d}xf32>
-      %cv = tensor.extract %cos[%p, %pair] : tensor<{s}x{half}xf32>
-      %sv = tensor.extract %sin[%p, %pair] : tensor<{s}x{half}xf32>
-      %x0c = arith.mulf %x0, %cv : f32
-      %x1s = arith.mulf %x1, %sv : f32
-      %x0s = arith.mulf %x0, %sv : f32
+      %half_i = arith.constant {half} : index
+      %in_first = arith.cmpi ult, %dim, %half_i : index
+      %pair_lo = arith.remui %dim, %half_i : index
+      %dim_hi = arith.addi %pair_lo, %half_i : index
+      %x1 = tensor.extract %x[%p, %hh, %pair_lo] : tensor<{s}x{nh}x{d}xf32>
+      %x2 = tensor.extract %x[%p, %hh, %dim_hi] : tensor<{s}x{nh}x{d}xf32>
+      %cv = tensor.extract %cos[%p, %pair_lo] : tensor<{s}x{half}xf32>
+      %sv = tensor.extract %sin[%p, %pair_lo] : tensor<{s}x{half}xf32>
       %x1c = arith.mulf %x1, %cv : f32
-      %even = arith.subf %x0c, %x1s : f32
-      %odd = arith.addf %x0s, %x1c : f32
-      %r = arith.select %is_even, %even, %odd : f32
+      %x2s = arith.mulf %x2, %sv : f32
+      %x1s = arith.mulf %x1, %sv : f32
+      %x2c = arith.mulf %x2, %cv : f32
+      %lo = arith.subf %x1c, %x2s : f32
+      %hi = arith.addf %x1s, %x2c : f32
+      %r = arith.select %in_first, %lo, %hi : f32
       linalg.yield %r : f32
   }} -> tensor<{s}x{nh}x{d}xf32>
   return %y : tensor<{s}x{nh}x{d}xf32>
@@ -697,9 +859,14 @@ fn emit_prefill(out: &mut String, c: &DenseDecoderConfig) {
     out.push_str(&format!(
         "func.func @prefill(%tokens: tensor<{s}xi64>, %last: tensor<i64>) -> tensor<{v}xf32> {{\n"
     ));
-    out.push_str(&format!(
-        "  %emb_t = util.global.load @token_embd_weight : tensor<{v}x{h}xf32>\n"
-    ));
+    emit_load_compute(
+        out,
+        c,
+        "emb_t",
+        "token_embd_weight",
+        "token_embd.weight",
+        &format!("{v}x{h}"),
+    );
 
     // Embedding gather (unrolled).
     out.push_str(&format!(
@@ -730,44 +897,97 @@ fn emit_prefill(out: &mut String, c: &DenseDecoderConfig) {
 
     for layer in 0..c.num_layers {
         let p = format!("blk{layer}");
-        out.push_str(&format!(
-            "  %{p}_attn_nw = util.global.load @{p}_attn_norm_weight : tensor<{h}xf32>\n"
-        ));
-        out.push_str(&format!(
-            "  %{p}_wq = util.global.load @{p}_attn_q_weight : tensor<{q}x{h}xf32>\n"
-        ));
-        out.push_str(&format!(
-            "  %{p}_wk = util.global.load @{p}_attn_k_weight : tensor<{kv}x{h}xf32>\n"
-        ));
-        out.push_str(&format!(
-            "  %{p}_wv = util.global.load @{p}_attn_v_weight : tensor<{kv}x{h}xf32>\n"
-        ));
-        out.push_str(&format!(
-            "  %{p}_wo = util.global.load @{p}_attn_output_weight : tensor<{h}x{q}xf32>\n"
-        ));
+        let n = format!("blk.{layer}");
+        emit_load_compute(
+            out,
+            c,
+            &format!("{p}_attn_nw"),
+            &format!("{p}_attn_norm_weight"),
+            &format!("{n}.attn_norm.weight"),
+            &format!("{h}"),
+        );
+        emit_load_compute(
+            out,
+            c,
+            &format!("{p}_wq"),
+            &format!("{p}_attn_q_weight"),
+            &format!("{n}.attn_q.weight"),
+            &format!("{q}x{h}"),
+        );
+        emit_load_compute(
+            out,
+            c,
+            &format!("{p}_wk"),
+            &format!("{p}_attn_k_weight"),
+            &format!("{n}.attn_k.weight"),
+            &format!("{kv}x{h}"),
+        );
+        emit_load_compute(
+            out,
+            c,
+            &format!("{p}_wv"),
+            &format!("{p}_attn_v_weight"),
+            &format!("{n}.attn_v.weight"),
+            &format!("{kv}x{h}"),
+        );
+        emit_load_compute(
+            out,
+            c,
+            &format!("{p}_wo"),
+            &format!("{p}_attn_output_weight"),
+            &format!("{n}.attn_output.weight"),
+            &format!("{h}x{q}"),
+        );
         if c.has_qk_norm {
-            out.push_str(&format!(
-                "  %{p}_qnw = util.global.load @{p}_attn_q_norm_weight : tensor<{d}xf32>\n"
-            ));
-            out.push_str(&format!(
-                "  %{p}_knw = util.global.load @{p}_attn_k_norm_weight : tensor<{d}xf32>\n"
-            ));
+            emit_load_compute(
+                out,
+                c,
+                &format!("{p}_qnw"),
+                &format!("{p}_attn_q_norm_weight"),
+                &format!("{n}.attn_q_norm.weight"),
+                &format!("{d}"),
+            );
+            emit_load_compute(
+                out,
+                c,
+                &format!("{p}_knw"),
+                &format!("{p}_attn_k_norm_weight"),
+                &format!("{n}.attn_k_norm.weight"),
+                &format!("{d}"),
+            );
         }
-        out.push_str(&format!(
-            "  %{p}_ffn_nw = util.global.load @{p}_ffn_norm_weight : tensor<{h}xf32>\n"
-        ));
-        out.push_str(&format!(
-            "  %{p}_wgate = util.global.load @{p}_ffn_gate_weight : tensor<{}x{h}xf32>\n",
-            c.intermediate
-        ));
-        out.push_str(&format!(
-            "  %{p}_wup = util.global.load @{p}_ffn_up_weight : tensor<{}x{h}xf32>\n",
-            c.intermediate
-        ));
-        out.push_str(&format!(
-            "  %{p}_wdown = util.global.load @{p}_ffn_down_weight : tensor<{h}x{}xf32>\n",
-            c.intermediate
-        ));
+        emit_load_compute(
+            out,
+            c,
+            &format!("{p}_ffn_nw"),
+            &format!("{p}_ffn_norm_weight"),
+            &format!("{n}.ffn_norm.weight"),
+            &format!("{h}"),
+        );
+        emit_load_compute(
+            out,
+            c,
+            &format!("{p}_wgate"),
+            &format!("{p}_ffn_gate_weight"),
+            &format!("{n}.ffn_gate.weight"),
+            &format!("{}x{h}", c.intermediate),
+        );
+        emit_load_compute(
+            out,
+            c,
+            &format!("{p}_wup"),
+            &format!("{p}_ffn_up_weight"),
+            &format!("{n}.ffn_up.weight"),
+            &format!("{}x{h}", c.intermediate),
+        );
+        emit_load_compute(
+            out,
+            c,
+            &format!("{p}_wdown"),
+            &format!("{p}_ffn_down_weight"),
+            &format!("{n}.ffn_down.weight"),
+            &format!("{h}x{}", c.intermediate),
+        );
 
         let xin = h_name.clone();
         out.push_str(&format!(
@@ -838,12 +1058,22 @@ fn emit_prefill(out: &mut String, c: &DenseDecoderConfig) {
         h_name = format!("{p}_hout");
     }
 
-    out.push_str(&format!(
-        "  %out_nw = util.global.load @output_norm_weight : tensor<{h}xf32>\n"
-    ));
-    out.push_str(&format!(
-        "  %wout = util.global.load @output_weight : tensor<{v}x{h}xf32>\n"
-    ));
+    emit_load_compute(
+        out,
+        c,
+        "out_nw",
+        "output_norm_weight",
+        "output_norm.weight",
+        &format!("{h}"),
+    );
+    emit_load_compute(
+        out,
+        c,
+        "wout",
+        "output_weight",
+        "output.weight",
+        &format!("{v}x{h}"),
+    );
     out.push_str("  %last_i64 = tensor.extract %last[] : tensor<i64>\n");
     out.push_str("  %li = arith.index_cast %last_i64 : i64 to index\n");
     out.push_str(&format!(
@@ -920,11 +1150,18 @@ mod tests {
             rms_norm_eps: 1e-6,
             rope_theta: Some(1_000_000.0),
             has_qk_norm: true,
+            param_keys: BTreeMap::new(),
+            param_dtypes: BTreeMap::from([(
+                "token_embd.weight".into(),
+                ScalarType::Bf16,
+            )]),
         };
         assert!(c.supports_dense_emit());
         assert_eq!(c.q_dim(), 2048);
         assert_eq!(c.kv_dim(), 1024);
         assert_eq!(c.gqa_group(), 2);
+        assert_eq!(c.param_dtype("token_embd.weight"), ScalarType::Bf16);
+        assert_eq!(c.param_dtype("missing.weight"), ScalarType::F32);
     }
 
     #[test]
@@ -941,8 +1178,57 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: None,
             has_qk_norm: false,
+            param_keys: BTreeMap::new(),
+            param_dtypes: BTreeMap::new(),
         };
         assert!(c.supports_dense_emit());
         assert!(c.is_tiny_m1());
+    }
+
+    #[test]
+    fn emit_uses_per_tensor_checkpoint_dtypes() {
+        let mut param_dtypes = BTreeMap::new();
+        param_dtypes.insert("token_embd.weight".into(), ScalarType::Bf16);
+        param_dtypes.insert("blk.0.attn_norm.weight".into(), ScalarType::F16);
+        param_dtypes.insert("blk.0.attn_q.weight".into(), ScalarType::F32);
+        param_dtypes.insert("blk.0.attn_k.weight".into(), ScalarType::F32);
+        param_dtypes.insert("blk.0.attn_v.weight".into(), ScalarType::F32);
+        param_dtypes.insert("blk.0.attn_output.weight".into(), ScalarType::F32);
+        param_dtypes.insert("blk.0.ffn_norm.weight".into(), ScalarType::F32);
+        param_dtypes.insert("blk.0.ffn_gate.weight".into(), ScalarType::F32);
+        param_dtypes.insert("blk.0.ffn_up.weight".into(), ScalarType::F32);
+        param_dtypes.insert("blk.0.ffn_down.weight".into(), ScalarType::F32);
+        param_dtypes.insert("output_norm.weight".into(), ScalarType::F32);
+        param_dtypes.insert("output.weight".into(), ScalarType::Bf16);
+        let c = DenseDecoderConfig {
+            vocab: 32,
+            hidden: 64,
+            intermediate: 128,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 16,
+            num_layers: 1,
+            seq: TINY_PREFILL_WINDOW,
+            rms_norm_eps: 1e-5,
+            rope_theta: None,
+            has_qk_norm: false,
+            param_keys: BTreeMap::new(),
+            param_dtypes,
+        };
+        let mlir = emit_dense_decoder_cfg("test.decoder", &c);
+        assert!(mlir.contains("weight_dtypes=[bf16,f16,f32]"));
+        assert!(mlir.contains(
+            "util.global private @token_embd_weight = #stream.parameter.named<\"weights\"::\"token_embd.weight\"> : tensor<32x64xbf16>"
+        ));
+        assert!(mlir.contains(
+            "util.global private @blk0_attn_norm_weight = #stream.parameter.named<\"weights\"::\"blk.0.attn_norm.weight\"> : tensor<64xf16>"
+        ));
+        assert!(mlir.contains(
+            "util.global private @blk0_attn_q_weight = #stream.parameter.named<\"weights\"::\"blk.0.attn_q.weight\"> : tensor<64x64xf32>"
+        ));
+        assert!(mlir.contains("arith.extf %emb_t_native : tensor<32x64xbf16> to tensor<32x64xf32>"));
+        assert!(mlir.contains(
+            "arith.extf %blk0_attn_nw_native : tensor<64xf16> to tensor<64xf32>"
+        ));
     }
 }

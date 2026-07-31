@@ -1,0 +1,4 @@
+exports_files([
+    "iree_downstream_extension.patch",
+    "iree_flatcc_downstream.patch",
+])

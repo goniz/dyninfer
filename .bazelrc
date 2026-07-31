@@ -3,6 +3,19 @@ common --announce_rc
 common --incompatible_strict_action_env
 common --experimental_convenience_symlinks=ignore
 
+# IREE @ e4a3b040 still uses native.cc_* / un-loaded cc_* in overlays; Bazel 9
+# requires autoload. Empty globs appear when the CUDA SDK is absent.
+common --incompatible_autoload_externally=+@rules_cc
+common --noincompatible_disallow_empty_glob
+
+# IREE packages enable layering_check; with @llvm toolchains under Bazel 9 the
+# generated module maps disagree with IREE's public/private header layout.
+build --features=-layering_check
+
+# Skip AMDGPU device-bitcode / CUDA host drivers for the in-process runtime
+# (HIP + CPU + Vulkan are enough for dyninfer). Override on the CLI if needed.
+build --@iree_core//runtime/src/iree/hal/drivers:enabled_drivers=hip,local-sync,local-task,null,vulkan
+
 build --keep_going
 build --show_timestamps
 build --verbose_failures

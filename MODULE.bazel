@@ -55,9 +55,43 @@ crate.from_cargo(
 use_repo(crate, "crates")
 
 # ---------------------------------------------------------------------------
-# IREE (pinned prebuilt tools — fetched hermetically via Bazel, not an
-# external venv). Official manylinux wheels ship the native `iree-compile` /
-# `iree-run-module` binaries plus `libIREECompiler.so`. See bazel/iree/.
+# IREE source module (`iree_core`) — runtime (and optionally compiler) built
+# from the pinned git commit via bzlmod. Submodules are fetched recursively.
+# A small patch remaps third_party paths so they resolve inside @iree_core
+# when dyninfer is the root module (upstream assumes IREE is root).
+# See bazel/iree/SOURCE.md.
+# ---------------------------------------------------------------------------
+bazel_dep(name = "iree_core", version = "0.0.1")
+
+git_override(
+    module_name = "iree_core",
+    remote = "https://github.com/iree-org/iree.git",
+    commit = "e4a3b0405d7d23554da26403658d0e8c3c5ecf25",
+    recursive_init_submodules = True,
+    patches = [
+        "//bazel/iree/patches:iree_downstream_extension.patch",
+        "//bazel/iree/patches:iree_flatcc_downstream.patch",
+    ],
+    patch_strip = 1,
+)
+
+# LLVM overlay must be supplied by the root (IREE's own local_path_override is
+# ignored when iree_core is not the root module). Pin matches IREE's
+# third_party/llvm-project submodule at e4a3b040.
+bazel_dep(name = "llvm-project-overlay", version = "main")
+
+archive_override(
+    module_name = "llvm-project-overlay",
+    urls = [
+        "https://github.com/iree-org/llvm-project/archive/66395ad94c3283d938a2957e7c7b439711764680.tar.gz",
+    ],
+    integrity = "sha256-zfmjPfi9F/jEiqG1RfsY9CE1mY8+dwGixN34bsA8W+0=",
+    strip_prefix = "llvm-project-66395ad94c3283d938a2957e7c7b439711764680/utils/bazel",
+)
+
+# ---------------------------------------------------------------------------
+# IREE prebuilt wheels — `iree-compile` / `iree-run-module` / libIREECompiler
+# for the existing tool-backed path while the source runtime is wired up.
 # ---------------------------------------------------------------------------
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 

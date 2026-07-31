@@ -15,7 +15,7 @@ mod slots;
 
 pub use models::{LlamaArchitecture, Qwen3Architecture};
 pub use ops::{
-    DenseDecoderConfig, LARGE_PREFILL_WINDOW, PREFILL_WINDOW, TINY_PREFILL_WINDOW,
+    DenseDecoderConfig, COMPUTE_DTYPE, LARGE_PREFILL_WINDOW, PREFILL_WINDOW, TINY_PREFILL_WINDOW,
 };
 pub use remapping::{remap_model_type, MODEL_REMAPPING};
 

@@ -219,9 +219,8 @@ impl ModelLoader {
         }
 
         let _span = info_span!("parameters.open").entered();
-        let params_cache = bundle.join("parameters-cache");
         let params_path =
-            dyninfer_checkpoint_safetensors::materialize_f32_safetensors(&catalog, &params_cache)?;
+            dyninfer_checkpoint_safetensors::resolve_runtime_parameters(&catalog)?;
         let instance = Instance::new()?;
         let module = Module::from_path(&vmfb_path)?;
         let context = Arc::new(

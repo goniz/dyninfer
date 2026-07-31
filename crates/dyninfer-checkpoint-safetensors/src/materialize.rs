@@ -1,4 +1,4 @@
-//! Materialize a dense F32 SafeTensors file with canonical parameter names.
+//! Materialize / resolve runtime SafeTensors for IREE `--parameters=`.
 
 use crate::fixture::write_safetensors;
 use dyninfer_checkpoint::{CheckpointCatalog, FileSource, RandomAccessSource};
@@ -11,10 +11,36 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::info;
 
+/// Prefer the original checkpoint file so IREE loads weights in their on-disk
+/// dtypes (whatever the catalog reports) without a host-side expansion.
+///
+/// Requires the compiled module's `#stream.parameter.named` keys and element
+/// types to match the checkpoint (`StorageComponent.key` / scalar dtype).
+pub fn resolve_runtime_parameters(catalog: &CheckpointCatalog) -> Result<PathBuf> {
+    let path = catalog
+        .source_files
+        .first()
+        .map(|f| f.path.clone())
+        .ok_or_else(|| DynInferError::io("checkpoint has no source file for parameters"))?;
+    if !path.is_file() {
+        return Err(DynInferError::io_path(
+            path.display().to_string(),
+            "parameter file missing",
+        ));
+    }
+    info!(
+        path = %path.display(),
+        "using native checkpoint parameters (checkpoint dtypes, no host materialize)"
+    );
+    Ok(path)
+}
+
 /// Convert catalog parameters to an F32 SafeTensors file keyed by canonical names.
 ///
 /// Output is written under `cache_dir` (created if needed) with a content hash
 /// so repeated loads reuse the same file.
+///
+/// Prefer [`resolve_runtime_parameters`] when the VMFB binds native dtypes/keys.
 pub fn materialize_f32_safetensors(
     catalog: &CheckpointCatalog,
     cache_dir: impl AsRef<Path>,

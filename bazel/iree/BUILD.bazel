@@ -1,15 +1,27 @@
-"""Pinned IREE prebuilt tools fetched via Bazel module http_archive repos.
+"""IREE integration: source module (`@iree_core`) + pinned prebuilt wheels.
 
-Linux hosts use the official IREE 3.11.0 manylinux wheels (cp312-abi3). The
-native `iree-compile` / `iree-run-module` binaries and sibling shared libraries
-are exposed as first-class targets for Rust `data` deps and future `cc_import`
-FFI wiring.
+- Source: `bazel_dep` + `git_override` on `iree_core` (see MODULE.bazel).
+- Wheels: manylinux `iree-compile` / `iree-run-module` / `libIREECompiler.so`
+  for the existing tool-backed compile/run path.
 """
 
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
 package(default_visibility = ["//visibility:public"])
+
+# In-process C runtime API built from @iree_core (git_override).
+alias(
+    name = "runtime_cc",
+    actual = "@iree_core//runtime/src/iree/runtime:runtime",
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+alias(
+    name = "hal_drivers",
+    actual = "@iree_core//runtime/src/iree/hal/drivers",
+    target_compatible_with = ["@platforms//os:linux"],
+)
 
 alias(
     name = "compiler_libs",

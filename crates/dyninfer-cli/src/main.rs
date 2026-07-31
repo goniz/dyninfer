@@ -8,7 +8,7 @@ use dyninfer_compiler::{compile_add_smoke, CompileOptions};
 use dyninfer_core::SessionConfig;
 use dyninfer_runtime::{
     find_safetensors_checkpoint, generate_greedy, load_tokenizer, resolve_hf_snapshot,
-    CausalLanguageModel, GenerateConfig, ModelLoader,
+    CausalLanguageModel, GenerateConfig, GenerateOutput, ModelLoader,
 };
 use dyninfer_target::TargetDiscovery;
 use iree_runtime::{Context, Instance, Module};
@@ -312,7 +312,7 @@ fn main() -> anyhow::Result<()> {
                 },
                 SessionConfig::default(),
             )?;
-            println!("{}", out.text);
+            print_generate_result(&out);
         }
         Commands::Generate {
             architecture,
@@ -371,7 +371,7 @@ fn main() -> anyhow::Result<()> {
                 },
                 SessionConfig::default(),
             )?;
-            println!("{}", out.text);
+            print_generate_result(&out);
         }
         Commands::Smoke { target } => {
             let profile = TargetDiscovery::resolve(&target)?;
@@ -462,5 +462,19 @@ fn main() -> anyhow::Result<()> {
         },
     }
     Ok(())
+}
+
+fn print_generate_result(out: &GenerateOutput) {
+    println!("{}", out.text);
+    let s = &out.stats;
+    eprintln!(
+        "prefill: {} tok in {:.3}s ({:.1} tok/s)  decode: {} tok in {:.3}s ({:.1} tok/s)",
+        s.prompt_tokens,
+        s.prefill_secs,
+        s.prefill_tps(),
+        s.generated_tokens,
+        s.decode_secs,
+        s.decode_tps(),
+    );
 }
 

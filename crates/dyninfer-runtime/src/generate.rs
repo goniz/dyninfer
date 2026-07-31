@@ -5,6 +5,7 @@ use crate::{CausalLanguageModel, Logits};
 use dyninfer_core::{SessionConfig, TokenId};
 use dyninfer_error::{DynInferError, Result};
 use std::path::Path;
+use std::time::Instant;
 
 /// Load a HuggingFace `tokenizer.json` (or directory containing one).
 pub fn load_tokenizer(path: impl AsRef<Path>) -> Result<BpeTokenizer> {
@@ -39,10 +40,37 @@ impl Default for GenerateConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct GenerateStats {
+    pub prompt_tokens: usize,
+    pub generated_tokens: usize,
+    pub prefill_secs: f64,
+    pub decode_secs: f64,
+}
+
+impl GenerateStats {
+    pub fn prefill_tps(&self) -> f64 {
+        if self.prefill_secs > 0.0 {
+            self.prompt_tokens as f64 / self.prefill_secs
+        } else {
+            0.0
+        }
+    }
+
+    pub fn decode_tps(&self) -> f64 {
+        if self.decode_secs > 0.0 {
+            self.generated_tokens as f64 / self.decode_secs
+        } else {
+            0.0
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct GenerateOutput {
     pub prompt: String,
     pub text: String,
     pub token_ids: Vec<TokenId>,
+    pub stats: GenerateStats,
 }
 
 /// Encode `prompt`, run greedy decode, return decoded text (prompt + continuation).
@@ -65,11 +93,15 @@ pub fn generate_greedy(
     }
 
     let eos = config.eos_token_id.or_else(|| tokenizer.eos_id());
+    let prompt_tokens = ids.len();
 
     let mut session = model.create_session(session_cfg)?;
+    let t0 = Instant::now();
     let mut logits: Logits = session.prefill(&ids)?;
+    let prefill_secs = t0.elapsed().as_secs_f64();
     let mut generated = Vec::new();
 
+    let t1 = Instant::now();
     for _ in 0..config.max_new_tokens {
         let next = argmax(&logits.values);
         if eos == Some(next) {
@@ -79,6 +111,7 @@ pub fn generate_greedy(
         ids.push(next);
         logits = session.decode(next)?;
     }
+    let decode_secs = t1.elapsed().as_secs_f64();
 
     let all_ids: Vec<u32> = ids.iter().map(|&t| t as u32).collect();
     let text = tokenizer.decode(&all_ids, true)?;
@@ -87,5 +120,11 @@ pub fn generate_greedy(
         prompt: prompt.to_string(),
         text,
         token_ids: ids,
+        stats: GenerateStats {
+            prompt_tokens,
+            generated_tokens: generated.len(),
+            prefill_secs,
+            decode_secs,
+        },
     })
 }

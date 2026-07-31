@@ -1,0 +1,8 @@
+--- a/build_tools/bazel/iree_flatcc.bzl
++++ b/build_tools/bazel/iree_flatcc.bzl
+@@ -18,4 +18,4 @@
+     flags = [
+         "-o$(RULEDIR)",
+-        "-I runtime/src",
++        "-I$$(dirname $$(dirname $$(dirname $(location %s))))" % (srcs[0],),
+     ] + flatcc_args

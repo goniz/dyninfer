@@ -3,6 +3,6 @@
 mod dense_decoder;
 
 pub use dense_decoder::{
-    emit_dense_decoder_cfg, DenseDecoderConfig, LARGE_PREFILL_WINDOW, PREFILL_WINDOW,
-    TINY_PREFILL_WINDOW,
+    emit_dense_decoder_cfg, DenseDecoderConfig, COMPUTE_DTYPE, LARGE_PREFILL_WINDOW,
+    PREFILL_WINDOW, TINY_PREFILL_WINDOW,
 };

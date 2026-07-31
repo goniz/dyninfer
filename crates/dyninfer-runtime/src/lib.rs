@@ -15,7 +15,9 @@ mod tokenizer_bpe;
 
 pub use builtins::{default_architecture_registry, default_checkpoint_support};
 pub use dyninfer_architectures::{LARGE_PREFILL_WINDOW, PREFILL_WINDOW, TINY_PREFILL_WINDOW};
-pub use generate::{argmax, generate_greedy, load_tokenizer, GenerateConfig, GenerateOutput};
+pub use generate::{
+    argmax, generate_greedy, load_tokenizer, GenerateConfig, GenerateOutput, GenerateStats,
+};
 pub use hf_hub::{
     find_safetensors_checkpoint, hf_hub_cache_dir, hf_repo_folder_name, resolve_hf_snapshot,
     DEFAULT_HF_REVISION,
