@@ -10,12 +10,8 @@ pub struct Logits {
     pub values: Vec<f32>,
 }
 
-/// Session backed by a persistent in-process IREE context.
-///
-/// Prefill seeds the compiled static window. Decode currently reuses `@prefill`
-/// on a host-managed rolling window (correct logits). Mutable KV globals are
-/// emitted for `@decode(token,pos)` but are not yet used here — cross-invoke
-/// KV persistence still needs validation against the prefill differential.
+/// Session that prefills once, then decodes with `@decode(token, pos)` against
+/// mutable KV globals held in the persistent in-process IREE context.
 pub struct IreeSession {
     metadata: ModelMetadata,
     config: SessionConfig,
@@ -55,16 +51,15 @@ impl IreeSession {
     }
 
     /// Left-align tokens (right-pad). Returns `(window, last_real_index)`.
-    fn window_from_history(&self) -> (Vec<i64>, i64) {
+    fn window_from_tokens(&self, tokens: &[TokenId]) -> (Vec<i64>, i64) {
         let w = self.prefill_window;
         let mut window = vec![i64::from(self.pad_token_id); w];
-        let n = self.history.len().min(w);
+        let n = tokens.len().min(w);
         if n == 0 {
             return (window, 0);
         }
-        let hist_start = self.history.len() - n;
         for i in 0..n {
-            window[i] = i64::from(self.history[hist_start + i]);
+            window[i] = i64::from(tokens[i]);
         }
         (window, (n as i64) - 1)
     }
@@ -73,9 +68,36 @@ impl IreeSession {
 impl ModelSession for IreeSession {
     fn prefill(&mut self, tokens: &[TokenId]) -> Result<Logits> {
         let _span = info_span!("runtime.prefill", tokens = tokens.len()).entered();
+        if tokens.is_empty() {
+            return Err(DynInferError::IreeRuntime(IreeRuntimeError {
+                message: "prefill requires a non-empty token list".into(),
+                status_code: None,
+            }));
+        }
+        if tokens.len() > self.prefill_window {
+            return Err(DynInferError::IreeRuntime(IreeRuntimeError {
+                message: format!(
+                    "prefill length {} exceeds compiled window {}",
+                    tokens.len(),
+                    self.prefill_window
+                ),
+                status_code: None,
+            }));
+        }
+        let max_kv = self.kv.max_sequence_length.max(1) as usize;
+        if tokens.len() > max_kv {
+            return Err(DynInferError::IreeRuntime(IreeRuntimeError {
+                message: format!(
+                    "prefill length {} exceeds KV capacity {}",
+                    tokens.len(),
+                    max_kv
+                ),
+                status_code: None,
+            }));
+        }
         self.history.clear();
         self.history.extend_from_slice(tokens);
-        let (window, last) = self.window_from_history();
+        let (window, last) = self.window_from_tokens(tokens);
         let values = self.context.invoke_prefill(&window, last)?;
         if values.len() != self.metadata.vocabulary_size as usize {
             return Err(DynInferError::IreeRuntime(IreeRuntimeError {
@@ -88,16 +110,26 @@ impl ModelSession for IreeSession {
             }));
         }
         self.position = tokens.len() as u64;
-        let _ = &self.kv;
         Ok(Logits { values })
     }
 
     fn decode(&mut self, token: TokenId) -> Result<Logits> {
         let _span = info_span!("runtime.decode", token, position = self.position).entered();
-        self.history.push(token);
-        // Rolling-window re-prefill (in-process session — no subprocess).
-        let (window, last) = self.window_from_history();
-        let values = self.context.invoke_prefill(&window, last)?;
+        let max_kv = self.kv.max_sequence_length.max(1) as u64;
+        if self.position >= max_kv {
+            return Err(DynInferError::IreeRuntime(IreeRuntimeError {
+                message: format!(
+                    "decode position {} exceeds KV capacity {}",
+                    self.position, max_kv
+                ),
+                status_code: None,
+            }));
+        }
+        let values = self.context.invoke_decode_at(
+            i64::from(token),
+            self.position as i64,
+            max_kv as usize,
+        )?;
         if values.len() != self.metadata.vocabulary_size as usize {
             return Err(DynInferError::IreeRuntime(IreeRuntimeError {
                 message: format!(
@@ -108,6 +140,7 @@ impl ModelSession for IreeSession {
                 status_code: None,
             }));
         }
+        self.history.push(token);
         if self.position < self.config.max_sequence_length as u64 {
             self.position += 1;
         }

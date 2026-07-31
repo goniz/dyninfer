@@ -24,7 +24,9 @@ pub const TINY_PREFILL_WINDOW: u32 = 4;
 /// Default mutable KV capacity (decode can grow past the prefill window).
 pub const PREFILL_MAX_KV: u32 = 128;
 pub const LARGE_MAX_KV: u32 = 256;
-pub const TINY_MAX_KV: u32 = 16;
+/// Matches [`TINY_PREFILL_WINDOW`]: decode-at-last fills a dense softmax domain.
+/// Larger models pass a host `attn_bias` for padded KV slots.
+pub const TINY_MAX_KV: u32 = 4;
 
 /// Activation / logits compute type. Independent of on-disk weight dtypes.
 pub const COMPUTE_DTYPE: ScalarType = ScalarType::F32;
@@ -1321,8 +1323,24 @@ func.func private @linear_ih_tok(%x: tensor<1x{i}xf32>, %w: tensor<{h}x{i}xf32>)
         }
     }
 
+    // Dynamic-row KV update (avoid tensor.insert_slice with mixed dynamic offsets).
     out.push_str(&format!(
-        r#"func.func private @attn_decode(%q: tensor<1x{q}xf32>, %k_cache: tensor<{mk}x{nkv}x{d}xf32>, %v_cache: tensor<{mk}x{nkv}x{d}xf32>, %k_new: tensor<1x{nkv}x{d}xf32>, %v_new: tensor<1x{nkv}x{d}xf32>, %pos: index"#
+        r#"func.func private @kv_update_row(%cache: tensor<{mk}x{nkv}x{d}xf32>, %row: tensor<1x{nkv}x{d}xf32>, %pos_t: tensor<i64>) -> tensor<{mk}x{nkv}x{d}xf32> {{
+  %pos_i64 = tensor.extract %pos_t[] : tensor<i64>
+  %pos = arith.index_cast %pos_i64 : i64 to index
+  %c0 = arith.constant 0 : index
+  %y = tensor.insert_slice %row into %cache[%pos, %c0, %c0] [1, {nkv}, {d}] [1, 1, 1] : tensor<1x{nkv}x{d}xf32> into tensor<{mk}x{nkv}x{d}xf32>
+  return %y : tensor<{mk}x{nkv}x{d}xf32>
+}}
+
+"#,
+        mk = mk,
+        nkv = nkv,
+        d = d,
+    ));
+
+    out.push_str(&format!(
+        r#"func.func private @attn_decode(%q: tensor<1x{q}xf32>, %k_cache: tensor<{mk}x{nkv}x{d}xf32>, %v_cache: tensor<{mk}x{nkv}x{d}xf32>, %k_new: tensor<1x{nkv}x{d}xf32>, %v_new: tensor<1x{nkv}x{d}xf32>, %pos_t: tensor<i64>, %attn_bias: tensor<{mk}xf32>"#
     ));
     if c.has_qk_norm {
         out.push_str(&format!(
@@ -1331,6 +1349,8 @@ func.func private @linear_ih_tok(%x: tensor<1x{i}xf32>, %w: tensor<{h}x{i}xf32>)
     }
     out.push_str(&format!(
         r#") -> (tensor<1x{q}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<{mk}x{nkv}x{d}xf32>) {{
+  %pos_i64 = tensor.extract %pos_t[] : tensor<i64>
+  %pos = arith.index_cast %pos_i64 : i64 to index
   %q3 = tensor.expand_shape %q [[0], [1, 2]] output_shape [1, {nh}, {d}] : tensor<1x{q}xf32> into tensor<1x{nh}x{d}xf32>
 "#,
         q = q,
@@ -1392,9 +1412,8 @@ func.func private @linear_ih_tok(%x: tensor<1x{i}xf32>, %w: tensor<{h}x{i}xf32>)
     };
 
     out.push_str(&format!(
-        r#"  %c0_kv = arith.constant 0 : index
-  %k_upd = tensor.insert_slice %{k_ssa} into %k_cache[%pos, %c0_kv, %c0_kv] [1, {nkv}, {d}] [1, 1, 1] : tensor<1x{nkv}x{d}xf32> into tensor<{mk}x{nkv}x{d}xf32>
-  %v_upd = tensor.insert_slice %v_new into %v_cache[%pos, %c0_kv, %c0_kv] [1, {nkv}, {d}] [1, 1, 1] : tensor<1x{nkv}x{d}xf32> into tensor<{mk}x{nkv}x{d}xf32>
+        r#"  %k_upd = func.call @kv_update_row(%k_cache, %{k_ssa}, %pos_t) : (tensor<{mk}x{nkv}x{d}xf32>, tensor<1x{nkv}x{d}xf32>, tensor<i64>) -> tensor<{mk}x{nkv}x{d}xf32>
+  %v_upd = func.call @kv_update_row(%v_cache, %v_new, %pos_t) : (tensor<{mk}x{nkv}x{d}xf32>, tensor<1x{nkv}x{d}xf32>, tensor<i64>) -> tensor<{mk}x{nkv}x{d}xf32>
 "#,
         k_ssa = k_ssa,
         nkv = nkv,
@@ -1432,7 +1451,6 @@ func.func private @linear_ih_tok(%x: tensor<1x{i}xf32>, %w: tensor<{h}x{i}xf32>)
   %kt_i = tensor.empty() : tensor<{nh}x{d}x{mk}xf32>
   %kt = linalg.transpose ins(%kb : tensor<{nh}x{mk}x{d}xf32>) outs(%kt_i : tensor<{nh}x{d}x{mk}xf32>) permutation = [0, 2, 1]
   %c0 = arith.constant 0.0 : f32
-  %neg = arith.constant -1.0e+7 : f32
   %scale = arith.constant {scale:.8e} : f32
   %sc_i = tensor.empty() : tensor<{nh}x1x{mk}xf32>
   %sc_z = linalg.fill ins(%c0 : f32) outs(%sc_i : tensor<{nh}x1x{mk}xf32>) -> tensor<{nh}x1x{mk}xf32>
@@ -1445,22 +1463,29 @@ func.func private @linear_ih_tok(%x: tensor<1x{i}xf32>, %w: tensor<{h}x{i}xf32>)
       %m = arith.mulf %a, %scale : f32
       linalg.yield %m : f32
   }} -> tensor<{nh}x1x{mk}xf32>
-  %pos_i64 = arith.index_cast %pos : index to i64
-  %pos_t = tensor.from_elements %pos_i64 : tensor<i64>
-  %masked = linalg.generic {{
+  %bias_i = tensor.empty() : tensor<{nh}x1x{mk}xf32>
+  %bias_3d = linalg.generic {{
       indexing_maps = [
-        affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
-        affine_map<(d0, d1, d2) -> ()>,
+        affine_map<(d0, d1, d2) -> (d2)>,
         affine_map<(d0, d1, d2) -> (d0, d1, d2)>
       ],
       iterator_types = ["parallel", "parallel", "parallel"]}}
-    ins(%scores_s, %pos_t : tensor<{nh}x1x{mk}xf32>, tensor<i64>) outs(%scores_s : tensor<{nh}x1x{mk}xf32>) {{
-    ^bb0(%a: f32, %p: i64, %b: f32):
-      %jj = linalg.index 2 : index
-      %pi = arith.index_cast %p : i64 to index
-      %cmp = arith.cmpi sgt, %jj, %pi : index
-      %sel = arith.select %cmp, %neg, %a : f32
-      linalg.yield %sel : f32
+    ins(%attn_bias : tensor<{mk}xf32>) outs(%bias_i : tensor<{nh}x1x{mk}xf32>) {{
+    ^bb0(%b: f32, %o: f32):
+      linalg.yield %b : f32
+  }} -> tensor<{nh}x1x{mk}xf32>
+  %masked_i = tensor.empty() : tensor<{nh}x1x{mk}xf32>
+  %masked = linalg.generic {{
+      indexing_maps = [
+        affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
+        affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
+        affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+      ],
+      iterator_types = ["parallel", "parallel", "parallel"]}}
+    ins(%scores_s, %bias_3d : tensor<{nh}x1x{mk}xf32>, tensor<{nh}x1x{mk}xf32>) outs(%masked_i : tensor<{nh}x1x{mk}xf32>) {{
+    ^bb0(%a: f32, %b: f32, %o: f32):
+      %s = arith.addf %a, %b : f32
+      linalg.yield %s : f32
   }} -> tensor<{nh}x1x{mk}xf32>
   %sm_i = tensor.empty() : tensor<{nh}x1x{mk}xf32>
   %attn = linalg.softmax dimension(2) ins(%masked : tensor<{nh}x1x{mk}xf32>) outs(%sm_i : tensor<{nh}x1x{mk}xf32>) -> tensor<{nh}x1x{mk}xf32>
@@ -1557,7 +1582,7 @@ fn emit_decode(out: &mut String, c: &DenseDecoderConfig) {
     let d = c.head_dim;
     let nkv = c.num_kv_heads;
     out.push_str(&format!(
-        "func.func @decode(%token: tensor<i64>, %pos: tensor<i64>) -> tensor<{v}xf32> {{\n"
+        "func.func @decode(%token: tensor<i64>, %pos: tensor<i64>, %attn_bias: tensor<{mk}xf32>) -> tensor<{v}xf32> {{\n"
     ));
     emit_load_compute(
         out,
@@ -1569,8 +1594,6 @@ fn emit_decode(out: &mut String, c: &DenseDecoderConfig) {
     );
     out.push_str("  %tok = tensor.extract %token[] : tensor<i64>\n");
     out.push_str("  %ti = arith.index_cast %tok : i64 to index\n");
-    out.push_str("  %pos_i64 = tensor.extract %pos[] : tensor<i64>\n");
-    out.push_str("  %pos_i = arith.index_cast %pos_i64 : i64 to index\n");
     out.push_str(&format!(
         "  %row = tensor.extract_slice %emb_t[%ti, 0] [1, {h}] [1, 1] : tensor<{v}x{h}xf32> to tensor<1x{h}xf32>\n"
     ));
@@ -1697,11 +1720,11 @@ fn emit_decode(out: &mut String, c: &DenseDecoderConfig) {
         ));
         if c.has_qk_norm {
             out.push_str(&format!(
-                "  %{p}_ctx, %{p}_k_new, %{p}_v_new = func.call @attn_decode(%{p}_q, %{p}_k_old, %{p}_v_old, %{p}_k3, %{p}_v3, %pos_i, %{p}_qnw, %{p}_knw) : (tensor<1x{q}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<1x{nkv}x{d}xf32>, tensor<1x{nkv}x{d}xf32>, index, tensor<{d}xf32>, tensor<{d}xf32>) -> (tensor<1x{q}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<{mk}x{nkv}x{d}xf32>)\n"
+                "  %{p}_ctx, %{p}_k_new, %{p}_v_new = func.call @attn_decode(%{p}_q, %{p}_k_old, %{p}_v_old, %{p}_k3, %{p}_v3, %pos, %attn_bias, %{p}_qnw, %{p}_knw) : (tensor<1x{q}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<1x{nkv}x{d}xf32>, tensor<1x{nkv}x{d}xf32>, tensor<i64>, tensor<{mk}xf32>, tensor<{d}xf32>, tensor<{d}xf32>) -> (tensor<1x{q}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<{mk}x{nkv}x{d}xf32>)\n"
             ));
         } else {
             out.push_str(&format!(
-                "  %{p}_ctx, %{p}_k_new, %{p}_v_new = func.call @attn_decode(%{p}_q, %{p}_k_old, %{p}_v_old, %{p}_k3, %{p}_v3, %pos_i) : (tensor<1x{q}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<1x{nkv}x{d}xf32>, tensor<1x{nkv}x{d}xf32>, index) -> (tensor<1x{q}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<{mk}x{nkv}x{d}xf32>)\n"
+                "  %{p}_ctx, %{p}_k_new, %{p}_v_new = func.call @attn_decode(%{p}_q, %{p}_k_old, %{p}_v_old, %{p}_k3, %{p}_v3, %pos, %attn_bias) : (tensor<1x{q}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<1x{nkv}x{d}xf32>, tensor<1x{nkv}x{d}xf32>, tensor<i64>, tensor<{mk}xf32>) -> (tensor<1x{q}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<{mk}x{nkv}x{d}xf32>)\n"
             ));
         }
         out.push_str(&format!(

@@ -70,9 +70,9 @@ mod tests {
         let vmfb = fs::read(&paths.vmfb).unwrap();
         assert!(!vmfb.starts_with(b"DYNINFER_VMFB_STUB"));
         assert!(vmfb.len() > 1024, "expected a real specialized VMFB");
-
         let model = loader.load_bundle(&bundle, &ckpt).unwrap();
         assert_eq!(model.metadata().vocabulary_size, 32);
+        assert_eq!(model.manifest.kv_cache.max_sequence_length, 4);
         let mut session = model.create_session(SessionConfig::default()).unwrap();
 
         let tokens = [1u32, 2, 3, 0];
@@ -89,9 +89,22 @@ mod tests {
             &reference[..8]
         );
 
-        let decode_logits = session.decode(1).unwrap();
-        assert_eq!(decode_logits.values.len(), 32);
-        assert_eq!(session.position(), 5);
+        // Prefill([a,b,c,d]) must match prefill([a,b,c]) + decode(d) at pos=3.
+        let model_full = loader.load_bundle(&bundle, &ckpt).unwrap();
+        let mut s_full = model_full.create_session(SessionConfig::default()).unwrap();
+        let full = s_full.prefill(&[1, 2, 3, 0]).unwrap();
+        let model_step = loader.load_bundle(&bundle, &ckpt).unwrap();
+        let mut s_step = model_step.create_session(SessionConfig::default()).unwrap();
+        let _ = s_step.prefill(&[1, 2, 3]).unwrap();
+        assert_eq!(s_step.position(), 3);
+        let stepped = s_step.decode(0).unwrap();
+        let step_err = max_abs_err(&full.values, &stepped.values).unwrap();
+        assert!(
+            step_err < 1e-3,
+            "KV decode diverged from full prefill: max_abs_err={step_err}\nfull={:?}\nstep={:?}",
+            &full.values[..8],
+            &stepped.values[..8]
+        );
 
         let sum = model
             .context

@@ -22,7 +22,7 @@ use dyninfer_error::{CompilationError, Diagnostic, DynInferError, Result, Severi
 use serde::{Deserialize, Serialize};
 use tracing::{info, info_span};
 
-pub const COMPILER_VERSION: &str = "0.1.1-iree-3.11.0-kv";
+pub const COMPILER_VERSION: &str = "0.1.20-iree-3.11.0-kv-decode";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CompileOptions {

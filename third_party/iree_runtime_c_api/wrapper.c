@@ -318,27 +318,35 @@ int dyninfer_iree_session_invoke_prefill(dyninfer_iree_session_t* session,
 
 int dyninfer_iree_session_invoke_decode(dyninfer_iree_session_t* session,
                                         int64_t token, int64_t pos,
+                                        const float* attn_bias, size_t bias_len,
                                         float** out_logits, size_t* out_count) {
   *out_logits = NULL;
   *out_count = 0;
-  if (!session) {
-    set_error_msg("null session");
+  if (!session || !attn_bias || bias_len == 0) {
+    set_error_msg("decode requires session + non-empty attn_bias");
     return 1;
   }
   iree_hal_buffer_view_t* v_token = NULL;
   iree_hal_buffer_view_t* v_pos = NULL;
+  iree_hal_buffer_view_t* v_bias = NULL;
   iree_status_t status =
       allocate_i64_tensor(session->session, 0, NULL, &token, 1, &v_token);
   if (iree_status_is_ok(status)) {
     status = allocate_i64_tensor(session->session, 0, NULL, &pos, 1, &v_pos);
   }
-  iree_hal_buffer_view_t* inputs[2] = {v_token, v_pos};
   if (iree_status_is_ok(status)) {
-    status = invoke_named(session->session, "module.decode", inputs, 2,
+    iree_hal_dim_t bias_shape[1] = {(iree_hal_dim_t)bias_len};
+    status = allocate_f32_tensor(session->session, 1, bias_shape, attn_bias,
+                                 bias_len, &v_bias);
+  }
+  iree_hal_buffer_view_t* inputs[3] = {v_token, v_pos, v_bias};
+  if (iree_status_is_ok(status)) {
+    status = invoke_named(session->session, "module.decode", inputs, 3,
                           out_logits, out_count);
   }
   iree_hal_buffer_view_release(v_token);
   iree_hal_buffer_view_release(v_pos);
+  iree_hal_buffer_view_release(v_bias);
   if (!iree_status_is_ok(status)) {
     set_error_status(status);
     return 1;

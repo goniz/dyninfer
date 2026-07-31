@@ -54,6 +54,8 @@ pub mod bindings {
             session: *mut dyninfer_iree_session_t,
             token: i64,
             pos: i64,
+            attn_bias: *const f32,
+            bias_len: usize,
             out_logits: *mut *mut f32,
             out_count: *mut usize,
         ) -> c_int;

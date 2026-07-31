@@ -248,18 +248,45 @@ impl Context {
         })
     }
 
-    pub fn invoke_decode(&self, token: i64, pos: i64) -> Result<Vec<f32>> {
+    pub fn invoke_decode(&self, token: i64, pos: i64, attn_bias: &[f32]) -> Result<Vec<f32>> {
+        if attn_bias.is_empty() {
+            return Err(DynInferError::IreeRuntime(IreeRuntimeError {
+                message: "decode requires a non-empty attn_bias".into(),
+                status_code: None,
+            }));
+        }
         self.with_session(|session| {
             let mut out = ptr::null_mut();
             let mut count = 0usize;
             let rc = unsafe {
                 sys::dyninfer_iree_session_invoke_decode(
-                    session, token, pos, &mut out, &mut count,
+                    session,
+                    token,
+                    pos,
+                    attn_bias.as_ptr(),
+                    attn_bias.len(),
+                    &mut out,
+                    &mut count,
                 )
             };
             take_f32_buf(rc, out, count)
         })
     }
+
+    pub fn invoke_decode_at(&self, token: i64, pos: i64, max_kv: usize) -> Result<Vec<f32>> {
+        self.invoke_decode(token, pos, &causal_attn_bias(pos, max_kv))
+    }
+}
+
+/// `0` for `j <= pos`, else `-1e7`.
+pub fn causal_attn_bias(pos: i64, max_kv: usize) -> Vec<f32> {
+    let mut bias = vec![0.0f32; max_kv.max(1)];
+    for (j, b) in bias.iter_mut().enumerate() {
+        if (j as i64) > pos {
+            *b = -1.0e7;
+        }
+    }
+    bias
 }
 
 fn path_cstring(path: &Path) -> Result<CString> {
