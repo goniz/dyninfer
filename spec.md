@@ -101,7 +101,7 @@ Version 1 does not attempt to:
 
 - Compile arbitrary Python at inference runtime.
 - Correctly import every arbitrary Transformers model implementation.
-- Support dynamically loaded Rust plugins with an unstable Rust ABI.
+- Support dynamically loaded checkpoint extensions.
 - Match the best handwritten kernel for every model, quantization, and GPU.
 - Implement distributed inference or multi-node execution.
 - Implement training, autograd, or fine-tuning.
@@ -120,7 +120,7 @@ A SafeTensors dtype and shape do not uniquely identify a quantization algorithm.
 
 ### 5.2 Architecture and checkpoint ingestion are independent
 
-The architecture frontend MUST NOT depend directly on SafeTensors, GGUF, or MLX APIs. Checkpoint plugins MUST NOT contain model execution code.
+The architecture frontend MUST NOT depend directly on SafeTensors, GGUF, or MLX APIs. Checkpoint readers and convention decoders MUST NOT contain model execution code.
 
 ### 5.3 Quantization is an encoding contract, not merely a dtype
 
@@ -399,33 +399,39 @@ impl ArchitectureDefinition for LlamaArchitecture {
 }
 ```
 
-The Rust builder MAY directly construct MLIR through a narrow C API, but the recommended MVP is to construct an engine-owned serializable graph in Rust and pass it to the C++ compiler bridge for MLIR creation.
+The Rust builder constructs the engine dialect directly through a narrow MLIR C API wrapper (for example, `melior`). There is no engine-specific serialized graph format between the Rust builder and the compiler: the builder returns an in-memory MLIR module, which is verified before lowering. Architecture packages may contain verified MLIR source or bytecode for distribution, but source-defined architectures are translated to MLIR by Rust code rather than interpreted as an intermediate JSON graph.
 
 #### 8.3.2 Direct MLIR frontend
 
 Expert users MAY author architecture MLIR text or bytecode directly. The compiler MUST verify dialect versions and reject unsupported operations.
 
-#### 8.3.3 External importer
+#### 8.3.3 Deterministic source import
 
-A separate tool MAY import Transformers, Torch Export, ONNX, or another graph source and produce an architecture package. Python is permitted in import tooling but MUST NOT be required by the inference runtime.
+Version 1 imports supported upstream definitions through source-specific, statically linked adapters; it does not attempt to translate arbitrary Python or C++ programs. Each adapter extracts a normalized `ArchitectureDescriptor` and emits the same engine MLIR as the native Rust builder. The descriptor includes the architecture identifier, normalized configuration fields, layer schedule, operation sequence, parameter-name mapping, and the upstream source revision and content digest. The importer rejects unknown fields or source revisions instead of guessing.
+
+- A Transformers or MLX adapter reads `config.json` and, where needed, a narrowly defined subset of the model's `ModelArgs`/dataclass fields. For example, the MLX Gemma 4 text definition exposes layer counts, head dimensions, RoPE parameters, attention-layer scheduling, and optional MoE fields; the adapter maps those fields to the Gemma descriptor and rejects unsupported combinations.
+- A llama.cpp adapter reads GGUF architecture metadata and uses a maintained per-architecture mapping of its graph-builder semantics. For example, the Gemma 4 mapping records its per-layer head counts, RoPE settings, sliding-attention schedule, RMSNorm, and projection ordering. It does not parse or execute llama.cpp C++ at load time.
+- An adapter runs only in the import/build tool, records its source identity in `provenance.json`, and writes verified MLIR source or bytecode. Python may be used by an MLX/Transformers import tool, but it is never required by the inference runtime.
+
+Adding an upstream architecture is an intentional source-adapter implementation plus golden tests that compare the generated MLIR operation and parameter schema with the supported upstream revision. This makes conversion reproducible while keeping all runtime architecture selection static.
 
 ### 8.4 Configuration resolution
 
 Model configuration is resolved from ordered sources:
 
 1. Explicit CLI or API overrides.
-2. Architecture package defaults.
-3. Checkpoint metadata.
-4. Adjacent configuration files such as `config.json`.
+2. Checkpoint metadata.
+3. Adjacent model-specific configuration files such as `config.json`.
+4. Architecture package defaults, only for fields absent from the model-specific sources.
 5. Shape inference from checkpoint entries.
 
 Conflicts MUST be errors unless an explicit override policy is provided.
 
 ---
 
-## 9. Checkpoint plugin architecture
+## 9. Static checkpoint components
 
-### 9.1 Plugin levels
+### 9.1 Component levels
 
 Checkpoint support is divided into:
 
@@ -436,31 +442,30 @@ Checkpoint support is divided into:
 
 These are separate because a single container can store many conventions.
 
-### 9.2 Static plugin registry for version 1
+### 9.2 Statically selected support for version 1
 
-Version 1 uses statically linked Rust crates and explicit registration:
+Version 1 uses a fixed set of statically linked Rust implementations selected at compile time. Traits provide test seams and separate container, convention, and materialization concerns; they are not a runtime plugin mechanism.
 
 ```rust
-pub struct PluginRegistryBuilder {
+pub struct BuiltinCheckpointSupport {
     container_readers: Vec<Arc<dyn CheckpointContainerReader>>,
     convention_decoders: Vec<Arc<dyn CheckpointConventionDecoder>>,
     materializers: Vec<Arc<dyn ParameterMaterializer>>,
 }
 
-impl PluginRegistryBuilder {
-    pub fn with_builtin_plugins(mut self) -> Self {
-        self.register_container(SafeTensorsContainer::default());
-        self.register_container(GgufContainer::default());
-        self.register_container(NpzContainer::default());
-        self.register_convention(DenseConvention::default());
-        self.register_convention(GgufConvention::default());
-        self.register_convention(MlxGroupwiseConvention::default());
-        self
+impl BuiltinCheckpointSupport {
+    pub fn version_1() -> Self {
+        let mut support = Self::default();
+        support.register_container(SafeTensorsContainer::default());
+        support.register_container(GgufContainer::default());
+        support.register_convention(DenseConvention::default());
+        support.register_convention(GgufQ40Convention::default());
+        support
     }
 }
 ```
 
-Dynamic Rust shared-library plugins are explicitly deferred because Rust does not provide a stable native ABI. A future plugin protocol SHOULD use a versioned C ABI, subprocess RPC, or WebAssembly component boundary.
+The runtime MUST NOT discover, load, or install checkpoint implementations dynamically. Adding a format or convention requires a source change, review, and a new build.
 
 ### 9.3 Container reader trait
 
@@ -568,16 +573,18 @@ pub enum PhysicalEncoding {
 }
 ```
 
+`PhysicalEncoding` describes how a logical tensor is laid out in storage and therefore tells the binder which bytes to validate and the compiler which lowering is legal. `Plain` means one scalar value per logical element. `GroupQuantized` stores quantized values and per-group metadata along an axis. `BlockQuantized` stores fixed-size logical blocks whose data and auxiliary components (such as scales) are decoded together; GGUF Q4_0 is this case. `Sparse` carries an explicit sparsity layout. `Opaque` preserves an identified but unsupported codec for diagnostics only and MUST NOT be bound or silently reinterpreted.
+
 ### 9.8 Initial checkpoint support
 
 | Container | Convention | Version 1 policy |
 |---|---|---|
-| SafeTensors | Dense FP16/BF16/FP32 | Direct IREE parameter access or aligned copy |
-| GGUF | Dense FP16/BF16 | Direct parameter access |
+| SafeTensors | Dense BF16 | Direct IREE parameter access or aligned copy |
 | GGUF | Q4_0 | Fused generated matmul correctness path |
-| GGUF | Q4_K | Phase 2 |
-| NPZ | MLX dense arrays | Custom reader; staged copy or IRPA cache |
-| SafeTensors | MLX groupwise quantization | Phase 2 convention decoder |
+| SafeTensors | Dense FP16/FP32 | Deferred after the BF16 path |
+| GGUF | Dense FP16/BF16 and Q4_K | Deferred after Q4_0 |
+| NPZ | MLX dense arrays | Deferred |
+| SafeTensors | MLX groupwise quantization | Deferred |
 | Legacy GGML | Legacy model files | Deferred; recommend conversion to GGUF |
 
 ---
@@ -663,13 +670,15 @@ dyninfer.checkpoint.binding @layer0_q {
   key = "blk.0.attn_q.weight",
   logical_shape = [4096, 4096],
   encoding = #dyninfer.checkpoint.gguf_q4_0<block_size = 32>,
-  storage_bytes = 2359296 : i64,
+  storage_bytes = 9437184 : i64,
   alignment = 32 : i64
 }
 
 %q = dyninfer.model.linear %x, @layer0_q
   : tensor<?x4096xf16> -> tensor<?x4096xf16>
 ```
+
+For Q4_0, each 32-element block has a 2-byte scale and 16 packed 4-bit values, for 18 bytes per block. The example therefore requires `4096 * 4096 / 32 * 18 = 9,437,184` bytes.
 
 The bound IR SHOULD reference logical parameter symbols and external scope/key identifiers. It MUST NOT embed host-specific absolute paths.
 
@@ -868,6 +877,7 @@ typedef struct dyninfer_compile_request_t {
   dyninfer_bytes_t resolved_config_json;
   dyninfer_bytes_t binding_plan_json;
   dyninfer_bytes_t target_profile_json;
+  dyninfer_bytes_t shape_profile_json;
   dyninfer_bytes_t compile_options_json;
 } dyninfer_compile_request_t;
 
@@ -895,6 +905,8 @@ void dyninfer_compile_result_destroy(dyninfer_compile_result_t* result);
 
 #endif
 ```
+
+`shape_profile_json` is the canonical JSON serialization of the `ShapeProfile` supplied to `CompileRequest`; it contains the requested batch and sequence buckets and any other specialization bounds. The orchestrator MUST pass it unchanged to this ABI, and the compiler MUST include its digest in compilation metadata and the executable cache key. It MUST NOT infer a profile from only the target or generic compile options.
 
 The ABI MUST:
 
@@ -1664,7 +1676,7 @@ parameter slot: layers.0.attention.q.weight
 checkpoint key: blk.0.attn_q.weight
 expected: one of [dense_bf16, dense_f16, gguf_q4_0]
 actual: gguf_iq2_xxs codec version 1
-suggestion: install the iq2 codec plugin or convert the checkpoint
+suggestion: use a build that supports the iq2 codec or convert the checkpoint
 ```
 
 ---
@@ -1678,7 +1690,7 @@ suggestion: install the iq2 codec plugin or convert the checkpoint
 - Memory mapping MUST validate ranges before exposure to IREE providers.
 - Compiler execution SHOULD be isolated for downloaded architecture packages.
 - Runtime MUST NOT load arbitrary native libraries referenced by a model package.
-- Dynamic plugin installation MUST require explicit user or administrator action.
+- Runtime loading of checkpoint implementations is forbidden.
 - Cache manifests MUST be validated before loading artifacts.
 - VMFB files SHOULD be treated as executable code and loaded only from trusted or locally compiled sources.
 
@@ -1872,16 +1884,15 @@ Version 1 is complete when:
 
 The following decisions should be captured in architecture decision records during implementation:
 
-1. Whether the Rust architecture builder creates MLIR through the MLIR C API or emits an intermediate serializable graph first.
-2. Whether checkpoint canonical names are embedded into VMFBs or resolved through an aliasing parameter provider.
-3. Whether the first quantized Vulkan lowering uses pure standard/vector MLIR or a target-specific IREE compiler extension.
-4. Whether KV cache is represented as explicit tensors, HAL buffers, or a custom runtime resource in later versions.
-5. Whether the compiler is linked in-process by default or always invoked as a worker.
-6. How architecture MLIR dialect version migration is handled.
-7. How tuning data is represented and incorporated into executable cache keys.
-8. Whether sampling is compiled into the model executable or remains a Rust runtime operation.
-9. Whether tokenizer artifacts belong inside the executable bundle or in a sibling model package.
-10. How adapter overlays such as LoRA are represented without invalidating the base executable cache.
+1. Whether checkpoint canonical names are embedded into VMFBs or resolved through an aliasing parameter provider.
+2. Whether the first quantized Vulkan lowering uses pure standard/vector MLIR or a target-specific IREE compiler extension.
+3. Whether KV cache is represented as explicit tensors, HAL buffers, or a custom runtime resource in later versions.
+4. Whether the compiler is linked in-process by default or always invoked as a worker.
+5. How architecture MLIR dialect version migration is handled.
+6. How tuning data is represented and incorporated into executable cache keys.
+7. Whether sampling is compiled into the model executable or remains a Rust runtime operation.
+8. Whether tokenizer artifacts belong inside the executable bundle or in a sibling model package.
+9. How adapter overlays such as LoRA are represented without invalidating the base executable cache.
 
 ---
 
@@ -1890,10 +1901,10 @@ The following decisions should be captured in architecture decision records duri
 To minimize risk, the implementation should begin with these choices:
 
 - Linux-only source builds for IREE.
-- Rust static plugin registry.
-- Rust-generated engine graph serialized as canonical JSON, converted to MLIR by C++.
+- Fixed, statically compiled checkpoint support selected through Rust traits; no dynamic plugin system.
+- Rust architecture definitions translate directly to engine MLIR through `melior`; distributed packages contain verified MLIR source or bytecode.
 - Actual checkpoint keys embedded in the first VMFB binding implementation.
-- SafeTensors dense followed by GGUF Q4_0.
+- SafeTensors BF16 followed by GGUF Q4_0.
 - Explicit static KV-cache tensors.
 - CPU reference backend before Vulkan optimization.
 - Generic generated quantized kernels before handwritten kernels.
