@@ -1,0 +1,14 @@
+common --enable_platform_specific_config
+common --announce_rc
+common --incompatible_strict_action_env
+common --experimental_convenience_symlinks=ignore
+
+build --keep_going
+build --show_timestamps
+build --verbose_failures
+
+build:release --compilation_mode=opt
+build:release --strip=always
+
+test --test_output=errors
+test --flaky_test_attempts=2

@@ -1,0 +1,10 @@
+# Explicit host platforms for non-default ABI cases (e.g. Windows).
+# Linux GNU hosts can use Bazel's default @platforms//host.
+
+platform(
+    name = "local_linux_gnu",
+    parents = ["@platforms//host"],
+    constraint_values = [
+        "@platforms//os:linux",
+    ],
+)

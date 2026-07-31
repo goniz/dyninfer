@@ -1,0 +1,81 @@
+"""Pinned IREE prebuilt tools fetched via Bazel module http_archive repos.
+
+Linux hosts use the official IREE 3.11.0 manylinux wheels (cp312-abi3). The
+native `iree-compile` / `iree-run-module` binaries and sibling shared libraries
+are exposed as first-class targets for Rust `data` deps and future `cc_import`
+FFI wiring.
+"""
+
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+package(default_visibility = ["//visibility:public"])
+
+alias(
+    name = "compiler_libs",
+    actual = select({
+        "@platforms//cpu:x86_64": "@iree_compiler_linux_x86_64//:compiler_libs",
+        "@platforms//cpu:aarch64": "@iree_compiler_linux_aarch64//:compiler_libs",
+    }),
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+alias(
+    name = "runtime_libs",
+    actual = select({
+        "@platforms//cpu:x86_64": "@iree_runtime_linux_x86_64//:runtime_libs",
+        "@platforms//cpu:aarch64": "@iree_runtime_linux_aarch64//:runtime_libs",
+    }),
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+alias(
+    name = "iree-compile",
+    actual = select({
+        "@platforms//cpu:x86_64": "@iree_compiler_linux_x86_64//:iree-compile",
+        "@platforms//cpu:aarch64": "@iree_compiler_linux_aarch64//:iree-compile",
+    }),
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+alias(
+    name = "iree-run-module",
+    actual = select({
+        "@platforms//cpu:x86_64": "@iree_runtime_linux_x86_64//:iree-run-module",
+        "@platforms//cpu:aarch64": "@iree_runtime_linux_aarch64//:iree-run-module",
+    }),
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+alias(
+    name = "libIREECompiler",
+    actual = select({
+        "@platforms//cpu:x86_64": "@iree_compiler_linux_x86_64//:libIREECompiler",
+        "@platforms//cpu:aarch64": "@iree_compiler_linux_aarch64//:libIREECompiler",
+    }),
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+# Aggregate runfiles package for Rust crates that shell out to both tools.
+filegroup(
+    name = "tools",
+    srcs = [
+        ":compiler_libs",
+        ":runtime_libs",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+sh_binary(
+    name = "iree_compile_bin",
+    srcs = ["iree_compile_wrapper.sh"],
+    data = [":compiler_libs"],
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
+sh_test(
+    name = "iree_tools_smoke",
+    srcs = ["iree_tools_smoke.sh"],
+    data = [":tools"],
+    target_compatible_with = ["@platforms//os:linux"],
+)

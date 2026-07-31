@@ -1,0 +1,70 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/dyninfer-core",
+  "crates/dyninfer-error",
+  "crates/dyninfer-checkpoint",
+  "crates/dyninfer-checkpoint-safetensors",
+  "crates/dyninfer-checkpoint-gguf",
+  "crates/dyninfer-checkpoint-npz",
+  "crates/dyninfer-architecture",
+  "crates/dyninfer-architecture-llama",
+  "crates/dyninfer-binding",
+  "crates/dyninfer-kernel-registry",
+  "crates/dyninfer-target",
+  "crates/dyninfer-cache",
+  "crates/dyninfer-compiler-sys",
+  "crates/dyninfer-compiler",
+  "crates/iree-compiler-sys",
+  "crates/iree-runtime-sys",
+  "crates/iree-runtime",
+  "crates/dyninfer-runtime",
+  "crates/dyninfer-cli",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+version = "0.1.0"
+authors = ["dyninfer contributors"]
+repository = "https://github.com/goniz/dyninfer"
+
+[workspace.dependencies]
+anyhow = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+half = "2"
+memmap2 = "0.9"
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+hex = "0.4"
+byteorder = "1"
+tempfile = "3"
+bindgen = "0.71"
+
+# First-party crates
+dyninfer-core = { path = "crates/dyninfer-core" }
+dyninfer-error = { path = "crates/dyninfer-error" }
+dyninfer-checkpoint = { path = "crates/dyninfer-checkpoint" }
+dyninfer-checkpoint-safetensors = { path = "crates/dyninfer-checkpoint-safetensors" }
+dyninfer-checkpoint-gguf = { path = "crates/dyninfer-checkpoint-gguf" }
+dyninfer-checkpoint-npz = { path = "crates/dyninfer-checkpoint-npz" }
+dyninfer-architecture = { path = "crates/dyninfer-architecture" }
+dyninfer-architecture-llama = { path = "crates/dyninfer-architecture-llama" }
+dyninfer-binding = { path = "crates/dyninfer-binding" }
+dyninfer-kernel-registry = { path = "crates/dyninfer-kernel-registry" }
+dyninfer-target = { path = "crates/dyninfer-target" }
+dyninfer-cache = { path = "crates/dyninfer-cache" }
+dyninfer-compiler-sys = { path = "crates/dyninfer-compiler-sys" }
+dyninfer-compiler = { path = "crates/dyninfer-compiler" }
+iree-compiler-sys = { path = "crates/iree-compiler-sys" }
+iree-runtime-sys = { path = "crates/iree-runtime-sys" }
+iree-runtime = { path = "crates/iree-runtime" }
+dyninfer-runtime = { path = "crates/dyninfer-runtime" }

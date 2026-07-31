@@ -1,0 +1,50 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("@rules_rs//rs:rules_rust_bindgen.bzl", "rust_bindgen")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_bindgen(
+    name = "iree_compiler_bindings",
+    header = "//third_party/iree_compiler_c_api:wrapper.h",
+    cc_lib = "//third_party/iree_compiler_c_api:headers",
+    bindgen_flags = [
+        "--allowlist-function=ireeCompiler.*",
+        "--allowlist-type=iree_compiler_.*",
+        "--allowlist-var=IREE_COMPILER_.*",
+        "--default-enum-style=rust",
+        "--no-layout-tests",
+        "--ctypes-prefix=::core::ffi",
+        "--use-core",
+    ],
+)
+
+rust_library(
+    name = "iree-compiler-sys",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "iree_compiler_sys",
+    edition = "2024",
+    aliases = aliases(),
+    compile_data = [":iree_compiler_bindings"],
+    rustc_env = {
+        "IREE_COMPILER_BINDINGS": "$(execpath :iree_compiler_bindings)",
+    },
+    # Avoid cargo build.rs under Bazel; bindings come from rust_bindgen.
+    rustc_flags = ["--cfg=bazel"],
+    data = ["//bazel/iree:compiler_libs"],
+    deps = all_crate_deps(normal = True) + [
+        "//bazel/iree:libIREECompiler",
+    ],
+)
+
+rust_test(
+    name = "iree-compiler-sys_tests",
+    crate = ":iree-compiler-sys",
+    compile_data = [":iree_compiler_bindings"],
+    rustc_env = {
+        "IREE_COMPILER_BINDINGS": "$(execpath :iree_compiler_bindings)",
+    },
+    data = ["//bazel/iree:compiler_libs"],
+    deps = all_crate_deps(normal_dev = True),
+)

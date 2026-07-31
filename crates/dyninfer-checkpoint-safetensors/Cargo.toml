@@ -1,0 +1,18 @@
+[package]
+name = "dyninfer-checkpoint-safetensors"
+description = "SafeTensors container reader and dense convention decoder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dyninfer-checkpoint = { workspace = true }
+dyninfer-core = { workspace = true }
+dyninfer-error = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

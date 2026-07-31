@@ -1,0 +1,9 @@
+[package]
+name = "dyninfer-compiler-sys"
+description = "Raw bindings / stub for dyninfer_compiler.h"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]

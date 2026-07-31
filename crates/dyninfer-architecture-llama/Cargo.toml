@@ -1,0 +1,13 @@
+[package]
+name = "dyninfer-architecture-llama"
+description = "Llama decoder architecture definition"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dyninfer-architecture = { workspace = true }
+dyninfer-core = { workspace = true }
+dyninfer-error = { workspace = true }
+serde_json = { workspace = true }

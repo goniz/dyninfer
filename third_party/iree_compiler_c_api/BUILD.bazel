@@ -1,0 +1,21 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "wrapper.h",
+    "include/iree/compiler/embedding_api.h",
+    "include/iree/compiler/api_support.h",
+    "include/iree/compiler/loader.h",
+])
+
+cc_library(
+    name = "headers",
+    hdrs = [
+        "wrapper.h",
+        "include/iree/compiler/embedding_api.h",
+        "include/iree/compiler/api_support.h",
+        "include/iree/compiler/loader.h",
+    ],
+    includes = ["include", "."],
+)

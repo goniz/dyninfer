@@ -1,0 +1,9 @@
+[package]
+name = "iree-runtime-sys"
+description = "Unsafe stub bindings for the IREE C runtime subset"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]

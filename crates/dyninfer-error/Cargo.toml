@@ -1,0 +1,12 @@
+[package]
+name = "dyninfer-error"
+description = "Structured errors and diagnostics for Dynamic Inference Engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

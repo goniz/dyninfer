@@ -1,0 +1,7 @@
+# Pinned IREE revision used by the Bazel module (see MODULE.bazel + bazel/iree/).
+# Prebuilt tools/libs: official iree-base-compiler / iree-base-runtime manylinux wheels.
+IREE_PIP_VERSION=3.11.0
+# Exact commit embedded in the 3.11.0 wheels (libIREECompiler / iree-compile).
+IREE_GIT_COMMIT=e4a3b0405d7d23554da26403658d0e8c3c5ecf25
+# Matching source tag when building runtime/compiler from source later.
+IREE_GIT_TAG=iree-3.11.0
