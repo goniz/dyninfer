@@ -1,25 +1,31 @@
 use crate::context::Context;
 use crate::mlir_err;
+use crate::operation::Operation;
 use crate::string_ref;
 use dyninfer_error::Result;
 use dyninfer_mlir_sys::bindings::{
-    mlirModuleCreateParse, mlirModuleDestroy, mlirModuleGetOperation, mlirOperationPrint,
-    mlirOperationVerify, MlirModule, MlirStringRef,
+    mlirBlockAppendOwnedOperation, mlirBlockGetFirstOperation, mlirModuleCreateParse,
+    mlirModuleDestroy, mlirModuleGetBody, mlirModuleGetOperation, mlirOperationGetNextInBlock,
+    mlirOperationPrint, mlirOperationRemoveFromParent, mlirOperationVerify, MlirModule,
+    MlirOperation, MlirStringRef,
 };
 use std::ffi::c_void;
 
-/// Owned parsed MLIR module.
-pub struct Module<'c> {
+/// Owned MLIR module handle (lifetime tied to a [`Context`] that outlives it).
+pub struct Module {
     raw: MlirModule,
-    _ctx: &'c Context,
 }
 
-impl<'c> Module<'c> {
-    pub fn parse(ctx: &'c Context, source: &str) -> Result<Self> {
+impl Module {
+    pub fn empty(ctx: &Context) -> Result<Self> {
+        // Prefer parse over CreateEmpty: some IREE builds are happier destroying
+        // modules that went through the parser/registration path.
+        Self::parse(ctx, "module {\n}\n")
+    }
+
+    pub fn parse(ctx: &Context, source: &str) -> Result<Self> {
         ctx.clear_diagnostics();
-        let raw = unsafe {
-            mlirModuleCreateParse(ctx.raw(), string_ref::from_str(source))
-        };
+        let raw = unsafe { mlirModuleCreateParse(ctx.raw(), string_ref::from_str(source)) };
         if raw.ptr.is_null() {
             let diags = ctx.take_diagnostics();
             let detail = if diags.is_empty() {
@@ -29,15 +35,48 @@ impl<'c> Module<'c> {
             };
             return Err(mlir_err(detail, "mlir-parse"));
         }
-        Ok(Self { raw, _ctx: ctx })
+        Ok(Self { raw })
     }
 
-    pub fn verify(&self) -> Result<()> {
-        self._ctx.clear_diagnostics();
+    pub fn append_operation(&mut self, op: Operation) -> Result<()> {
+        let body = unsafe { mlirModuleGetBody(self.raw) };
+        if body.ptr.is_null() {
+            return Err(mlir_err("module body is null", "mlir-append"));
+        }
+        unsafe {
+            mlirBlockAppendOwnedOperation(body, op.into_raw());
+        }
+        Ok(())
+    }
+
+    /// Parse `asm` as `module { ... }` and move its body ops into this module.
+    pub fn append_asm_ops(&mut self, ctx: &Context, asm: &str) -> Result<()> {
+        let trimmed = asm.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        let wrapped = format!("module {{\n{trimmed}\n}}");
+        let tmp = Module::parse(ctx, &wrapped)?;
+        let tmp_body = unsafe { mlirModuleGetBody(tmp.raw) };
+        let dst_body = unsafe { mlirModuleGetBody(self.raw) };
+        let mut op = unsafe { mlirBlockGetFirstOperation(tmp_body) };
+        while !op.ptr.is_null() {
+            let next = unsafe { mlirOperationGetNextInBlock(op) };
+            unsafe {
+                mlirOperationRemoveFromParent(op);
+                mlirBlockAppendOwnedOperation(dst_body, op);
+            }
+            op = next;
+        }
+        Ok(())
+    }
+
+    pub fn verify(&self, ctx: &Context) -> Result<()> {
+        ctx.clear_diagnostics();
         let op = unsafe { mlirModuleGetOperation(self.raw) };
         let ok = unsafe { mlirOperationVerify(op) };
         if !ok {
-            let diags = self._ctx.take_diagnostics();
+            let diags = ctx.take_diagnostics();
             let detail = if diags.is_empty() {
                 "mlirOperationVerify failed".into()
             } else {
@@ -57,13 +96,17 @@ impl<'c> Module<'c> {
         }
         out
     }
-
 }
 
-impl Drop for Module<'_> {
+impl Drop for Module {
     fn drop(&mut self) {
-        unsafe {
-            mlirModuleDestroy(self.raw);
+        if !self.raw.ptr.is_null() {
+            unsafe {
+                mlirModuleDestroy(self.raw);
+            }
+            self.raw = MlirModule {
+                ptr: std::ptr::null_mut(),
+            };
         }
     }
 }
@@ -80,3 +123,6 @@ unsafe extern "C" fn append_string_callback(s: MlirStringRef, user_data: *mut c_
         }
     }
 }
+
+#[allow(dead_code)]
+pub(crate) type RawOp = MlirOperation;

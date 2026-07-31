@@ -5,14 +5,24 @@
 //! that wrapper — dialects known to IREE (including `util` / `stream`) are
 //! registered via `ireeCompilerRegisterDialects`.
 
+mod attribute;
 mod builder;
 mod context;
+pub mod dialect;
+mod location;
 mod module;
+mod operation;
+mod r#type;
 mod string_ref;
 
+pub use attribute::Attribute;
 pub use builder::{ModuleBuilder, VerifiedModule};
 pub use context::Context;
+pub use dialect::{Arith, Func, Linalg, Tensor, Util};
+pub use location::Location;
 pub use module::Module;
+pub use operation::{Operation, OperationBuilder};
+pub use r#type::Type;
 
 use dyninfer_error::{CompilationError, DynInferError, Result};
 
