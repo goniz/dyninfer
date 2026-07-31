@@ -53,6 +53,7 @@ pub mod bindings {
         pub fn dyninfer_iree_session_invoke_decode(
             session: *mut dyninfer_iree_session_t,
             token: i64,
+            pos: i64,
             out_logits: *mut *mut f32,
             out_count: *mut usize,
         ) -> c_int;

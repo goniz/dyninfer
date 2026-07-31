@@ -22,7 +22,7 @@ use dyninfer_error::{CompilationError, Diagnostic, DynInferError, Result, Severi
 use serde::{Deserialize, Serialize};
 use tracing::{info, info_span};
 
-pub const COMPILER_VERSION: &str = "0.1.0-iree-3.11.0";
+pub const COMPILER_VERSION: &str = "0.1.1-iree-3.11.0-kv";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CompileOptions {
@@ -52,6 +52,7 @@ pub struct CompileRequest<'a> {
     /// Architecture-emitted MLIR (ignored when `smoke_only`).
     pub mlir_text: &'a str,
     pub prefill_window: u32,
+    pub max_kv: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -221,7 +222,14 @@ impl ModelCompiler for LocalCompiler {
                     .first()
                     .copied()
                     .unwrap_or(1),
-                max_sequence_length: request.shape_profile.max_sequence_length,
+                max_sequence_length: if request.max_kv > 0 {
+                    request.max_kv
+                } else {
+                    request
+                        .shape_profile
+                        .max_sequence_length
+                        .max(request.prefill_window)
+                },
                 kv_head_count: request
                     .architecture
                     .resolved_config

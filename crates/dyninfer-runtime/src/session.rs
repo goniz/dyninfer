@@ -10,12 +10,12 @@ pub struct Logits {
     pub values: Vec<f32>,
 }
 
-/// Session that invokes real IREE `@prefill` / `@decode` with a static window.
+/// Session backed by a persistent in-process IREE context.
 ///
-/// Prefill right-pads/truncates to `prefill_window` and passes the index of the
-/// newest real token. Decode appends into a rolling static window (host-managed
-/// history) and reuses `@prefill` so KV stays consistent with the compiled
-/// static shapes without a separate cache ABI yet.
+/// Prefill seeds the compiled static window. Decode currently reuses `@prefill`
+/// on a host-managed rolling window (correct logits). Mutable KV globals are
+/// emitted for `@decode(token,pos)` but are not yet used here — cross-invoke
+/// KV persistence still needs validation against the prefill differential.
 pub struct IreeSession {
     metadata: ModelMetadata,
     config: SessionConfig,
@@ -95,6 +95,7 @@ impl ModelSession for IreeSession {
     fn decode(&mut self, token: TokenId) -> Result<Logits> {
         let _span = info_span!("runtime.decode", token, position = self.position).entered();
         self.history.push(token);
+        // Rolling-window re-prefill (in-process session — no subprocess).
         let (window, last) = self.window_from_history();
         let values = self.context.invoke_prefill(&window, last)?;
         if values.len() != self.metadata.vocabulary_size as usize {

@@ -40,10 +40,10 @@ int dyninfer_iree_session_invoke_prefill(dyninfer_iree_session_t* session,
                                          size_t token_count, int64_t last,
                                          float** out_logits, size_t* out_count);
 
-// module.decode — scalar token → vocab xf32.
+// module.decode — token + absolute position → vocab xf32 (updates KV cache).
 int dyninfer_iree_session_invoke_decode(dyninfer_iree_session_t* session,
-                                        int64_t token, float** out_logits,
-                                        size_t* out_count);
+                                        int64_t token, int64_t pos,
+                                        float** out_logits, size_t* out_count);
 
 #ifdef __cplusplus
 }  // extern "C"

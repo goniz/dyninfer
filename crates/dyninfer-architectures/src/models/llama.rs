@@ -159,6 +159,7 @@ impl ArchitectureDefinition for LlamaArchitecture {
         let mlir_text = emit_dense_decoder_cfg(package.id.as_str(), &cfg);
         Ok(EmitOutput {
             prefill_window: cfg.seq,
+            max_kv: cfg.max_kv,
             mlir_text,
         })
     }

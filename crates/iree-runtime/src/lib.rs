@@ -248,12 +248,14 @@ impl Context {
         })
     }
 
-    pub fn invoke_decode(&self, token: i64) -> Result<Vec<f32>> {
+    pub fn invoke_decode(&self, token: i64, pos: i64) -> Result<Vec<f32>> {
         self.with_session(|session| {
             let mut out = ptr::null_mut();
             let mut count = 0usize;
             let rc = unsafe {
-                sys::dyninfer_iree_session_invoke_decode(session, token, &mut out, &mut count)
+                sys::dyninfer_iree_session_invoke_decode(
+                    session, token, pos, &mut out, &mut count,
+                )
             };
             take_f32_buf(rc, out, count)
         })

@@ -172,6 +172,7 @@ impl ModelLoader {
             options,
             mlir_text: &emit.mlir_text,
             prefill_window: emit.prefill_window,
+            max_kv: emit.max_kv.max(emit.prefill_window),
         })?;
 
         if let Some(cache) = &self.cache {
