@@ -1,6 +1,22 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@rules_rs//rs:rust_library.bzl", "rust_library")
 load("@rules_rs//rs:rust_test.bzl", "rust_test")
+load("@rules_rs//rs:rules_rust_bindgen.bzl", "rust_bindgen")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_bindgen(
+    name = "iree_runtime_bindings",
+    header = "//third_party/iree_runtime_c_api:wrapper.h",
+    cc_lib = "//third_party/iree_runtime_c_api:headers",
+    bindgen_flags = [
+        "--allowlist-function=dyninfer_iree_.*",
+        "--allowlist-type=dyninfer_iree_.*",
+        "--no-layout-tests",
+        "--ctypes-prefix=::core::ffi",
+        "--use-core",
+    ],
+)
 
 rust_library(
     name = "iree-runtime-sys",
@@ -8,12 +24,22 @@ rust_library(
     crate_name = "iree_runtime_sys",
     edition = "2024",
     aliases = aliases(),
-    deps = all_crate_deps(normal = True),
-    visibility = ["//visibility:public"],
+    compile_data = [":iree_runtime_bindings"],
+    rustc_env = {
+        "IREE_RUNTIME_BINDINGS": "$(execpath :iree_runtime_bindings)",
+    },
+    rustc_flags = ["--cfg=bazel"],
+    deps = all_crate_deps(normal = True) + [
+        "//third_party/iree_runtime_c_api:iree_runtime_c_api",
+    ],
 )
 
 rust_test(
     name = "iree-runtime-sys_tests",
     crate = ":iree-runtime-sys",
+    compile_data = [":iree_runtime_bindings"],
+    rustc_env = {
+        "IREE_RUNTIME_BINDINGS": "$(execpath :iree_runtime_bindings)",
+    },
     deps = all_crate_deps(normal_dev = True),
 )

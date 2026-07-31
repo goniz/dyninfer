@@ -8,5 +8,6 @@ license.workspace = true
 
 [dependencies]
 dyninfer-error = { workspace = true }
+iree-runtime-sys = { workspace = true }
 tempfile = { workspace = true }
 tracing = { workspace = true }

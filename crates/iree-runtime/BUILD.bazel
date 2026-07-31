@@ -8,6 +8,7 @@ rust_library(
     crate_name = "iree_runtime",
     edition = "2024",
     aliases = aliases(),
+    # dump_devices still shells out to the prebuilt tool.
     data = ["//bazel/iree:tools"],
     deps = all_crate_deps(normal = True),
     visibility = ["//visibility:public"],

@@ -1,20 +1,21 @@
 //! Safe wrappers over IREE runtime execution.
 //!
-//! Milestone 1 drives pinned `iree-run-module` with SafeTensors external
-//! parameters (`--parameters=weights=...`). The public API never exposes raw
-//! IREE handles.
-
-#![forbid(unsafe_code)]
+//! Prefill/decode/add invoke the in-process C session (`iree-runtime-sys` →
+//! `@iree_core`). Device discovery still uses `iree-run-module --dump_devices`.
 
 mod tools;
 
 pub use tools::{discover_run_module, IreeRunTools};
 
 use dyninfer_error::{DynInferError, IreeRuntimeError, Result};
+use iree_runtime_sys as sys;
+use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
+use std::ptr;
+use std::sync::Mutex;
 use tracing::info_span;
 
-/// Process-wide IREE "instance" placeholder (tool-backed).
+/// Process-wide IREE instance (tool discovery + native session factory).
 pub struct Instance {
     tools: IreeRunTools,
 }
@@ -32,7 +33,7 @@ impl Instance {
     }
 }
 
-/// Loaded VMFB module bytes plus an optional on-disk path for tool invocation.
+/// Loaded VMFB module bytes plus an optional on-disk path for native load.
 pub struct Module {
     pub bytes: Vec<u8>,
     path: Option<PathBuf>,
@@ -84,22 +85,42 @@ impl Module {
     }
 }
 
+struct NativeSession {
+    ptr: *mut sys::dyninfer_iree_session_t,
+}
+
+// IREE sessions are thread-compatible (external sync required). We only use
+// them from the generate loop on one thread; Send allows Arc<Context>.
+unsafe impl Send for NativeSession {}
+unsafe impl Sync for NativeSession {}
+
+impl Drop for NativeSession {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { sys::dyninfer_iree_session_destroy(self.ptr) };
+            self.ptr = ptr::null_mut();
+        }
+    }
+}
+
 /// Execution context bound to a module (+ optional external parameter file).
 pub struct Context {
-    instance: Instance,
+    _instance: Instance,
     module: Module,
     parameters: Option<PathBuf>,
-    /// IREE HAL device URI (`hip`, `vulkan`, …). Empty → tool default (local).
+    /// IREE HAL driver name (`hip`, `vulkan`, …). Empty → local-task.
     device: Option<String>,
+    session: Mutex<Option<NativeSession>>,
 }
 
 impl Context {
     pub fn create(instance: Instance, module: Module) -> Result<Self> {
         Ok(Self {
-            instance,
+            _instance: instance,
             module,
             parameters: None,
             device: None,
+            session: Mutex::new(None),
         })
     }
 
@@ -108,7 +129,7 @@ impl Context {
         self
     }
 
-    /// Set `--device=` for `iree-run-module` (e.g. `hip`, `vulkan`).
+    /// Set HAL device/driver (e.g. `hip`, `vulkan`). `rocm` aliases to `hip`.
     pub fn with_device(mut self, device: impl Into<String>) -> Self {
         let d = device.into();
         self.device = if d.is_empty()
@@ -133,41 +154,152 @@ impl Context {
     pub fn module_path(&self) -> Result<&Path> {
         self.module.path.as_deref().ok_or_else(|| {
             DynInferError::IreeRuntime(IreeRuntimeError {
-                message: "module has no filesystem path for tool invocation".into(),
+                message: "module has no filesystem path for native load".into(),
                 status_code: None,
             })
         })
     }
 
+    fn with_session<R>(&self, f: impl FnOnce(*mut sys::dyninfer_iree_session_t) -> Result<R>) -> Result<R> {
+        let mut guard = self.session.lock().map_err(|_| {
+            DynInferError::IreeRuntime(IreeRuntimeError {
+                message: "IREE session mutex poisoned".into(),
+                status_code: None,
+            })
+        })?;
+        if guard.is_none() {
+            let vmfb = self.module_path()?;
+            let vmfb_c = path_cstring(vmfb)?;
+            let device_c = self
+                .device
+                .as_deref()
+                .map(CString::new)
+                .transpose()
+                .map_err(|e| {
+                    DynInferError::IreeRuntime(IreeRuntimeError {
+                        message: format!("invalid device string: {e}"),
+                        status_code: None,
+                    })
+                })?;
+            let params_c = self.parameters.as_deref().map(path_cstring).transpose()?;
+
+            let mut ptr = ptr::null_mut();
+            let rc = unsafe {
+                sys::dyninfer_iree_session_create(
+                    device_c
+                        .as_ref()
+                        .map(|c| c.as_ptr())
+                        .unwrap_or(ptr::null()),
+                    vmfb_c.as_ptr(),
+                    params_c
+                        .as_ref()
+                        .map(|c| c.as_ptr())
+                        .unwrap_or(ptr::null()),
+                    &mut ptr,
+                )
+            };
+            if rc != 0 || ptr.is_null() {
+                return Err(native_error(rc));
+            }
+            *guard = Some(NativeSession { ptr });
+        }
+        let ptr = guard.as_ref().expect("session just created").ptr;
+        f(ptr)
+    }
+
     pub fn invoke_add(&self, a: &[f32; 4], b: &[f32; 4]) -> Result<Vec<f32>> {
-        let path = self.module_path()?;
-        self.instance.tools.run_add(
-            path,
-            a,
-            b,
-            self.parameters.as_deref(),
-            self.device.as_deref(),
-        )
+        self.with_session(|session| {
+            let mut out = ptr::null_mut();
+            let mut count = 0usize;
+            let rc = unsafe {
+                sys::dyninfer_iree_session_invoke_add(
+                    session,
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    &mut out,
+                    &mut count,
+                )
+            };
+            take_f32_buf(rc, out, count)
+        })
     }
 
     pub fn invoke_prefill(&self, tokens: &[i64], last: i64) -> Result<Vec<f32>> {
-        let path = self.module_path()?;
-        self.instance.tools.run_prefill(
-            path,
-            tokens,
-            last,
-            self.parameters.as_deref(),
-            self.device.as_deref(),
-        )
+        if tokens.is_empty() {
+            return Err(DynInferError::IreeRuntime(IreeRuntimeError {
+                message: "prefill requires a non-empty token window".into(),
+                status_code: None,
+            }));
+        }
+        self.with_session(|session| {
+            let mut out = ptr::null_mut();
+            let mut count = 0usize;
+            let rc = unsafe {
+                sys::dyninfer_iree_session_invoke_prefill(
+                    session,
+                    tokens.as_ptr(),
+                    tokens.len(),
+                    last,
+                    &mut out,
+                    &mut count,
+                )
+            };
+            take_f32_buf(rc, out, count)
+        })
     }
 
     pub fn invoke_decode(&self, token: i64) -> Result<Vec<f32>> {
-        let path = self.module_path()?;
-        self.instance.tools.run_decode(
-            path,
-            token,
-            self.parameters.as_deref(),
-            self.device.as_deref(),
-        )
+        self.with_session(|session| {
+            let mut out = ptr::null_mut();
+            let mut count = 0usize;
+            let rc = unsafe {
+                sys::dyninfer_iree_session_invoke_decode(session, token, &mut out, &mut count)
+            };
+            take_f32_buf(rc, out, count)
+        })
     }
+}
+
+fn path_cstring(path: &Path) -> Result<CString> {
+    CString::new(path.to_string_lossy().as_bytes()).map_err(|e| {
+        DynInferError::IreeRuntime(IreeRuntimeError {
+            message: format!("path contains NUL: {e}"),
+            status_code: None,
+        })
+    })
+}
+
+fn last_error_string() -> String {
+    unsafe {
+        let p = sys::dyninfer_iree_last_error();
+        if p.is_null() {
+            return "unknown IREE runtime error".into();
+        }
+        CStr::from_ptr(p).to_string_lossy().into_owned()
+    }
+}
+
+fn native_error(code: i32) -> DynInferError {
+    DynInferError::IreeRuntime(IreeRuntimeError {
+        message: last_error_string(),
+        status_code: Some(code),
+    })
+}
+
+fn take_f32_buf(rc: i32, out: *mut f32, count: usize) -> Result<Vec<f32>> {
+    if rc != 0 {
+        if !out.is_null() {
+            unsafe { sys::dyninfer_iree_free(out.cast()) };
+        }
+        return Err(native_error(rc));
+    }
+    if out.is_null() {
+        return Err(DynInferError::IreeRuntime(IreeRuntimeError {
+            message: "null logits pointer from IREE session".into(),
+            status_code: None,
+        }));
+    }
+    let values = unsafe { std::slice::from_raw_parts(out, count) }.to_vec();
+    unsafe { sys::dyninfer_iree_free(out.cast()) };
+    Ok(values)
 }

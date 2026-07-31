@@ -42,5 +42,6 @@ IREE 3.11.0 targets Bazel 7; dyninfer uses Bazel 9.1.1. Required flags
 
 ## Prebuilt wheels
 
-`//bazel/iree:iree-compile`, `libIREECompiler`, `iree-run-module` remain for
-the tool-backed path until Rust FFI is switched to `//bazel/iree:runtime_cc`.
+`//bazel/iree:iree-compile` / `libIREECompiler` remain for compile; invoke path
+uses `//third_party/iree_runtime_c_api` → `//bazel/iree:runtime_cc` (in-process).
+`iree-run-module` is still used for `--dump_devices` discovery.

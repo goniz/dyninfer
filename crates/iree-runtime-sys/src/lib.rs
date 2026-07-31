@@ -1,44 +1,62 @@
-//! Unsafe raw bindings to the IREE C runtime subset.
+//! Unsafe bindings to the dyninfer IREE runtime C wrapper.
 //!
-//! Currently a stub until a pinned IREE revision is linked via Bazel.
+//! Bindings are generated with bindgen:
+//! - Bazel: `rust_bindgen` → `IREE_RUNTIME_BINDINGS`
+//! - Cargo: stub until a local IREE build is wired (prefer Bazel).
 
 #![allow(non_camel_case_types)]
+#![allow(non_snake_case)]
+#![allow(non_upper_case_globals)]
+#![allow(clippy::all)]
+#![allow(improper_ctypes)]
+#![allow(dead_code)]
 
-use std::os::raw::c_int;
-
-#[repr(C)]
-pub struct iree_instance_t {
-    _private: u8,
+#[cfg(bazel)]
+pub mod bindings {
+    include!(env!("IREE_RUNTIME_BINDINGS"));
 }
 
-#[repr(C)]
-pub struct iree_device_t {
-    _private: u8,
-}
+#[cfg(not(bazel))]
+pub mod bindings {
+    use std::os::raw::{c_char, c_int, c_void};
 
-#[repr(C)]
-pub struct iree_vm_module_t {
-    _private: u8,
-}
-
-#[repr(C)]
-pub struct iree_vm_context_t {
-    _private: u8,
-}
-
-pub type iree_status_t = c_int;
-
-pub unsafe fn iree_runtime_stub_create_instance(out: *mut *mut iree_instance_t) -> iree_status_t {
-    if out.is_null() {
-        return 1;
+    #[repr(C)]
+    pub struct dyninfer_iree_session_t {
+        _private: [u8; 0],
     }
-    let inst = Box::into_raw(Box::new(iree_instance_t { _private: 0 }));
-    unsafe { *out = inst };
-    0
-}
 
-pub unsafe fn iree_runtime_stub_destroy_instance(inst: *mut iree_instance_t) {
-    if !inst.is_null() {
-        drop(unsafe { Box::from_raw(inst) });
+    extern "C" {
+        pub fn dyninfer_iree_session_create(
+            device_uri: *const c_char,
+            vmfb_path: *const c_char,
+            parameters_path: *const c_char,
+            out_session: *mut *mut dyninfer_iree_session_t,
+        ) -> c_int;
+        pub fn dyninfer_iree_session_destroy(session: *mut dyninfer_iree_session_t);
+        pub fn dyninfer_iree_last_error() -> *const c_char;
+        pub fn dyninfer_iree_free(p: *mut c_void);
+        pub fn dyninfer_iree_session_invoke_add(
+            session: *mut dyninfer_iree_session_t,
+            a: *const f32,
+            b: *const f32,
+            out_logits: *mut *mut f32,
+            out_count: *mut usize,
+        ) -> c_int;
+        pub fn dyninfer_iree_session_invoke_prefill(
+            session: *mut dyninfer_iree_session_t,
+            tokens: *const i64,
+            token_count: usize,
+            last: i64,
+            out_logits: *mut *mut f32,
+            out_count: *mut usize,
+        ) -> c_int;
+        pub fn dyninfer_iree_session_invoke_decode(
+            session: *mut dyninfer_iree_session_t,
+            token: i64,
+            out_logits: *mut *mut f32,
+            out_count: *mut usize,
+        ) -> c_int;
     }
 }
+
+pub use bindings::*;
