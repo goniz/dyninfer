@@ -9,20 +9,24 @@ mod attribute;
 mod builder;
 mod context;
 pub mod dialect;
+mod func_builder;
 mod location;
 mod module;
 mod operation;
 mod r#type;
 mod string_ref;
+mod value;
 
 pub use attribute::Attribute;
 pub use builder::{ModuleBuilder, VerifiedModule};
 pub use context::Context;
 pub use dialect::{Arith, Func, Linalg, Tensor, Util};
+pub use func_builder::FuncBuilder;
 pub use location::Location;
 pub use module::Module;
 pub use operation::{Operation, OperationBuilder};
 pub use r#type::Type;
+pub use value::Value;
 
 use dyninfer_error::{CompilationError, DynInferError, Result};
 

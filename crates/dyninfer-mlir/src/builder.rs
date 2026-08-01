@@ -4,6 +4,7 @@ use crate::dialect::{Arith, Func, Linalg, Tensor, Util};
 use crate::location::Location;
 use crate::mlir_err;
 use crate::module::Module;
+use crate::func_builder::FuncBuilder;
 use crate::operation::{Operation, OperationBuilder};
 use crate::r#type::Type;
 use dyninfer_error::Result;
@@ -120,6 +121,15 @@ impl ModuleBuilder {
 
     pub fn func_asm(&mut self, asm: &str) -> Result<()> {
         Func::append_asm(self, asm)
+    }
+
+    /// Start a typed [`FuncBuilder`] (melior-style).
+    pub fn func(&self, name: impl Into<String>) -> FuncBuilder {
+        FuncBuilder::new(name)
+    }
+
+    pub fn func_private(&self, name: impl Into<String>) -> FuncBuilder {
+        FuncBuilder::new(name).private()
     }
 
     pub fn arith_asm(&mut self, asm: &str) -> Result<()> {

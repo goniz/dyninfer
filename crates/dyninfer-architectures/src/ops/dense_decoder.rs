@@ -8,11 +8,12 @@
 //! Activations / logits use [`COMPUTE_DTYPE`] (currently f32); narrower float
 //! weights are cast after load.
 
+use crate::ops::kernels;
 use dyninfer_architecture::ArchitecturePackage;
 use dyninfer_checkpoint::CheckpointCatalog;
 use dyninfer_core::{ScalarType, StorageElementType};
 use dyninfer_error::Result;
-use dyninfer_mlir::ModuleBuilder;
+use dyninfer_mlir::{FuncBuilder, ModuleBuilder};
 use std::collections::BTreeMap;
 
 /// Default static prefill window for mid-size dense models.
@@ -230,27 +231,11 @@ pub fn build_dense_decoder(
 ) -> Result<()> {
     let _ = arch_id; // retained for call-site tracing / future module attrs
     emit_globals(builder, c)?;
-    append_asm_section(builder, |out| emit_helpers(out, c))?;
-    append_asm_section(builder, |out| emit_prefill(out, c))?;
-    append_asm_section(builder, |out| emit_decode(out, c))?;
-    builder.func_asm(
-        r#"
-func.func @add(%a: tensor<4xf32>, %b: tensor<4xf32>) -> tensor<4xf32> {
-  %0 = arith.addf %a, %b : tensor<4xf32>
-  return %0 : tensor<4xf32>
-}
-"#,
-    )?;
+    emit_helpers(builder, c)?;
+    emit_prefill(builder, c)?;
+    emit_decode(builder, c)?;
+    kernels::emit_add_smoke(builder)?;
     Ok(())
-}
-
-fn append_asm_section(
-    builder: &mut ModuleBuilder,
-    emit: impl FnOnce(&mut String),
-) -> Result<()> {
-    let mut out = String::new();
-    emit(&mut out);
-    builder.append_toplevel_asm(&out)
 }
 
 fn catalog_param_dtype(param: &dyninfer_checkpoint::LogicalParameter) -> Option<ScalarType> {
@@ -279,7 +264,7 @@ fn emit_global(
 
 /// Load a weight global and cast to [`COMPUTE_DTYPE`] when the checkpoint dtype differs.
 fn emit_load_compute(
-    out: &mut String,
+    f: &mut FuncBuilder,
     c: &DenseDecoderConfig,
     ssa: &str,
     sym: &str,
@@ -289,26 +274,19 @@ fn emit_load_compute(
     let storage = c.param_dtype(canonical);
     let wt = mlir_ty(storage);
     let ct = mlir_ty(COMPUTE_DTYPE);
-    if storage == COMPUTE_DTYPE {
-        out.push_str(&format!(
-            "  %{ssa} = util.global.load @{sym} : tensor<{shape}x{ct}>\n"
-        ));
-        return;
-    }
     match storage {
         ScalarType::F16 | ScalarType::Bf16 if COMPUTE_DTYPE == ScalarType::F32 => {
-            out.push_str(&format!(
-                "  %{ssa}_native = util.global.load @{sym} : tensor<{shape}x{wt}>\n"
-            ));
-            out.push_str(&format!(
-                "  %{ssa} = arith.extf %{ssa}_native : tensor<{shape}x{wt}> to tensor<{shape}x{ct}>\n"
-            ));
+            kernels::load_compute(f, ssa, sym, &wt, &ct, shape);
+        }
+        ScalarType::F32 if COMPUTE_DTYPE == ScalarType::F32 => {
+            kernels::load_compute(f, ssa, sym, &wt, &ct, shape);
         }
         other => panic!(
             "dense decoder: cannot cast checkpoint dtype {other} → compute {COMPUTE_DTYPE} for {canonical}"
         ),
     }
 }
+
 
 fn emit_globals(builder: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()> {
     let (v, h, i) = (c.vocab, c.hidden, c.intermediate);
@@ -432,7 +410,7 @@ fn emit_globals(builder: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<(
     Ok(())
 }
 
-fn emit_helpers(out: &mut String, c: &DenseDecoderConfig) {
+fn emit_helpers(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()> {
     let (s, h, i, nh, nkv, d) = (
         c.seq,
         c.hidden,
@@ -443,167 +421,55 @@ fn emit_helpers(out: &mut String, c: &DenseDecoderConfig) {
     );
     let (q, kv) = (c.q_dim(), c.kv_dim());
     let g = c.gqa_group();
-    let eps = format!("{:.8e}", c.rms_norm_eps);
-    let h_f = format!("{:.1}", h as f32);
-    let d_f = format!("{:.1}", d as f32);
 
-    out.push_str(&format!(
-        r#"func.func private @rms_norm(%x: tensor<{s}x{h}xf32>, %w: tensor<{h}xf32>) -> tensor<{s}x{h}xf32> {{
-  %c0 = arith.constant 0.0 : f32
-  %one = arith.constant 1.0 : f32
-  %eps = arith.constant {eps} : f32
-  %ch = arith.constant {h_f} : f32
-  %sq = linalg.generic {{
-      indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>],
-      iterator_types = ["parallel", "parallel"]}}
-    ins(%x : tensor<{s}x{h}xf32>) outs(%x : tensor<{s}x{h}xf32>) {{
-    ^bb0(%a: f32, %b: f32):
-      %p = arith.mulf %a, %a : f32
-      linalg.yield %p : f32
-  }} -> tensor<{s}x{h}xf32>
-  %init = tensor.empty() : tensor<{s}xf32>
-  %z = linalg.fill ins(%c0 : f32) outs(%init : tensor<{s}xf32>) -> tensor<{s}xf32>
-  %ms = linalg.reduce ins(%sq : tensor<{s}x{h}xf32>) outs(%z : tensor<{s}xf32>) dimensions = [1]
-    (%in: f32, %acc: f32) {{
-      %s = arith.addf %in, %acc : f32
-      linalg.yield %s : f32
-    }}
-  %inv = linalg.generic {{
-      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],
-      iterator_types = ["parallel"]}}
-    ins(%ms : tensor<{s}xf32>) outs(%ms : tensor<{s}xf32>) {{
-    ^bb0(%a: f32, %b: f32):
-      %m = arith.divf %a, %ch : f32
-      %meps = arith.addf %m, %eps : f32
-      %root = math.sqrt %meps : f32
-      %i = arith.divf %one, %root : f32
-      linalg.yield %i : f32
-  }} -> tensor<{s}xf32>
-  %y = linalg.generic {{
-      indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0)>, affine_map<(d0, d1) -> (d1)>, affine_map<(d0, d1) -> (d0, d1)>],
-      iterator_types = ["parallel", "parallel"]}}
-    ins(%x, %inv, %w : tensor<{s}x{h}xf32>, tensor<{s}xf32>, tensor<{h}xf32>) outs(%x : tensor<{s}x{h}xf32>) {{
-    ^bb0(%a: f32, %i: f32, %ww: f32, %o: f32):
-      %t = arith.mulf %a, %i : f32
-      %r = arith.mulf %t, %ww : f32
-      linalg.yield %r : f32
-  }} -> tensor<{s}x{h}xf32>
-  return %y : tensor<{s}x{h}xf32>
-}}
-
-func.func private @linear_hq(%x: tensor<{s}x{h}xf32>, %w: tensor<{q}x{h}xf32>) -> tensor<{s}x{q}xf32> {{
-  %c0 = arith.constant 0.0 : f32
-  %ti = tensor.empty() : tensor<{h}x{q}xf32>
-  %wt = linalg.transpose ins(%w : tensor<{q}x{h}xf32>) outs(%ti : tensor<{h}x{q}xf32>) permutation = [1, 0]
-  %init = tensor.empty() : tensor<{s}x{q}xf32>
-  %z = linalg.fill ins(%c0 : f32) outs(%init : tensor<{s}x{q}xf32>) -> tensor<{s}x{q}xf32>
-  %y = linalg.matmul ins(%x, %wt : tensor<{s}x{h}xf32>, tensor<{h}x{q}xf32>) outs(%z : tensor<{s}x{q}xf32>) -> tensor<{s}x{q}xf32>
-  return %y : tensor<{s}x{q}xf32>
-}}
-
-func.func private @linear_hkv(%x: tensor<{s}x{h}xf32>, %w: tensor<{kv}x{h}xf32>) -> tensor<{s}x{kv}xf32> {{
-  %c0 = arith.constant 0.0 : f32
-  %ti = tensor.empty() : tensor<{h}x{kv}xf32>
-  %wt = linalg.transpose ins(%w : tensor<{kv}x{h}xf32>) outs(%ti : tensor<{h}x{kv}xf32>) permutation = [1, 0]
-  %init = tensor.empty() : tensor<{s}x{kv}xf32>
-  %z = linalg.fill ins(%c0 : f32) outs(%init : tensor<{s}x{kv}xf32>) -> tensor<{s}x{kv}xf32>
-  %y = linalg.matmul ins(%x, %wt : tensor<{s}x{h}xf32>, tensor<{h}x{kv}xf32>) outs(%z : tensor<{s}x{kv}xf32>) -> tensor<{s}x{kv}xf32>
-  return %y : tensor<{s}x{kv}xf32>
-}}
-
-func.func private @linear_qh(%x: tensor<{s}x{q}xf32>, %w: tensor<{h}x{q}xf32>) -> tensor<{s}x{h}xf32> {{
-  %c0 = arith.constant 0.0 : f32
-  %ti = tensor.empty() : tensor<{q}x{h}xf32>
-  %wt = linalg.transpose ins(%w : tensor<{h}x{q}xf32>) outs(%ti : tensor<{q}x{h}xf32>) permutation = [1, 0]
-  %init = tensor.empty() : tensor<{s}x{h}xf32>
-  %z = linalg.fill ins(%c0 : f32) outs(%init : tensor<{s}x{h}xf32>) -> tensor<{s}x{h}xf32>
-  %y = linalg.matmul ins(%x, %wt : tensor<{s}x{q}xf32>, tensor<{q}x{h}xf32>) outs(%z : tensor<{s}x{h}xf32>) -> tensor<{s}x{h}xf32>
-  return %y : tensor<{s}x{h}xf32>
-}}
-
-func.func private @linear_hi(%x: tensor<{s}x{h}xf32>, %w: tensor<{i}x{h}xf32>) -> tensor<{s}x{i}xf32> {{
-  %c0 = arith.constant 0.0 : f32
-  %ti = tensor.empty() : tensor<{h}x{i}xf32>
-  %wt = linalg.transpose ins(%w : tensor<{i}x{h}xf32>) outs(%ti : tensor<{h}x{i}xf32>) permutation = [1, 0]
-  %init = tensor.empty() : tensor<{s}x{i}xf32>
-  %z = linalg.fill ins(%c0 : f32) outs(%init : tensor<{s}x{i}xf32>) -> tensor<{s}x{i}xf32>
-  %y = linalg.matmul ins(%x, %wt : tensor<{s}x{h}xf32>, tensor<{h}x{i}xf32>) outs(%z : tensor<{s}x{i}xf32>) -> tensor<{s}x{i}xf32>
-  return %y : tensor<{s}x{i}xf32>
-}}
-
-func.func private @linear_ih(%x: tensor<{s}x{i}xf32>, %w: tensor<{h}x{i}xf32>) -> tensor<{s}x{h}xf32> {{
-  %c0 = arith.constant 0.0 : f32
-  %ti = tensor.empty() : tensor<{i}x{h}xf32>
-  %wt = linalg.transpose ins(%w : tensor<{h}x{i}xf32>) outs(%ti : tensor<{i}x{h}xf32>) permutation = [1, 0]
-  %init = tensor.empty() : tensor<{s}x{h}xf32>
-  %z = linalg.fill ins(%c0 : f32) outs(%init : tensor<{s}x{h}xf32>) -> tensor<{s}x{h}xf32>
-  %y = linalg.matmul ins(%x, %wt : tensor<{s}x{i}xf32>, tensor<{i}x{h}xf32>) outs(%z : tensor<{s}x{h}xf32>) -> tensor<{s}x{h}xf32>
-  return %y : tensor<{s}x{h}xf32>
-}}
-
-"#,
-        s = s,
-        h = h,
-        i = i,
-        q = q,
-        kv = kv,
-        eps = eps,
-        h_f = h_f,
-    ));
+    kernels::emit_rms_norm(module, "rms_norm", s, h, c.rms_norm_eps)?;
+    kernels::emit_linear(module, "linear_hq", s, h, q, true)?;
+    kernels::emit_linear(module, "linear_hkv", s, h, kv, true)?;
+    kernels::emit_linear(module, "linear_qh", s, q, h, true)?;
+    kernels::emit_linear(module, "linear_hi", s, h, i, true)?;
+    kernels::emit_linear(module, "linear_ih", s, i, h, true)?;
 
     if c.has_qk_norm {
-        emit_rms_norm_heads(out, s, nh, d, &eps, &d_f, "rms_norm_q_heads");
+        kernels::emit_rms_norm_heads(module, "rms_norm_q_heads", s, nh, d, c.rms_norm_eps)?;
         if nkv != nh {
-            emit_rms_norm_heads(out, s, nkv, d, &eps, &d_f, "rms_norm_kv_heads");
+            kernels::emit_rms_norm_heads(module, "rms_norm_kv_heads", s, nkv, d, c.rms_norm_eps)?;
         }
     }
 
     if nkv != nh {
-        out.push_str(&format!(
-            r#"func.func private @repeat_kv(%x: tensor<{s}x{nkv}x{d}xf32>) -> tensor<{s}x{nh}x{d}xf32> {{
-  %init = tensor.empty() : tensor<{s}x{nh}x{d}xf32>
-  %y = linalg.generic {{
-      indexing_maps = [
-        affine_map<(p, h, dim) -> (p, h floordiv {g}, dim)>,
-        affine_map<(p, h, dim) -> (p, h, dim)>
-      ],
-      iterator_types = ["parallel", "parallel", "parallel"]}}
-    ins(%x : tensor<{s}x{nkv}x{d}xf32>) outs(%init : tensor<{s}x{nh}x{d}xf32>) {{
-    ^bb0(%a: f32, %o: f32):
-      linalg.yield %a : f32
-  }} -> tensor<{s}x{nh}x{d}xf32>
-  return %y : tensor<{s}x{nh}x{d}xf32>
-}}
-
-"#,
-            s = s,
-            nkv = nkv,
-            nh = nh,
-            d = d,
-            g = g,
-        ));
+        kernels::emit_repeat_kv(module, "repeat_kv", s, nkv, nh, d, g)?;
     }
 
     if let Some(theta) = c.rope_theta {
-        emit_rope_helper(out, s, nh, d, theta, "apply_rope_q");
+        kernels::emit_rope(module, "apply_rope_q", s, nh, d, theta)?;
         if nkv != nh {
-            emit_rope_helper(out, s, nkv, d, theta, "apply_rope_kv");
+            kernels::emit_rope(module, "apply_rope_kv", s, nkv, d, theta)?;
         }
     }
 
+    emit_attn(module, c)?;
+    emit_decode_helpers(module, c)?;
+    Ok(())
+}
+
+fn emit_attn(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()> {
+    let (s, nh, nkv, d) = (c.seq, c.num_heads, c.num_kv_heads, c.head_dim);
+    let (q, kv) = (c.q_dim(), c.kv_dim());
     let scale = 1.0 / (d as f32).sqrt();
     // Returns (context, k_post_rope [S×nkv×d], v [S×nkv×d]) so callers can seed KV cache.
-    out.push_str(&format!(
-        r#"func.func private @attn(%q: tensor<{s}x{q}xf32>, %k: tensor<{s}x{kv}xf32>, %v: tensor<{s}x{kv}xf32>"#
-    ));
+    let mut f = module.func_private("attn");
+    f.arg("q", format!("tensor<{s}x{q}xf32>"));
+    f.arg("k", format!("tensor<{s}x{kv}xf32>"));
+    f.arg("v", format!("tensor<{s}x{kv}xf32>"));
     if c.has_qk_norm {
-        out.push_str(&format!(
-            ", %q_norm: tensor<{d}xf32>, %k_norm: tensor<{d}xf32>"
-        ));
+        f.arg("q_norm", format!("tensor<{d}xf32>"));
+        f.arg("k_norm", format!("tensor<{d}xf32>"));
     }
-    out.push_str(&format!(
-        r#") -> (tensor<{s}x{q}xf32>, tensor<{s}x{nkv}x{d}xf32>, tensor<{s}x{nkv}x{d}xf32>) {{
-  %q3 = tensor.expand_shape %q [[0], [1, 2]] output_shape [{s}, {nh}, {d}] : tensor<{s}x{q}xf32> into tensor<{s}x{nh}x{d}xf32>
+    f.result_ty(format!("tensor<{s}x{q}xf32>"));
+    f.result_ty(format!("tensor<{s}x{nkv}x{d}xf32>"));
+    f.result_ty(format!("tensor<{s}x{nkv}x{d}xf32>"));
+    f.op_asm(format!(
+        r#"  %q3 = tensor.expand_shape %q [[0], [1, 2]] output_shape [{s}, {nh}, {d}] : tensor<{s}x{q}xf32> into tensor<{s}x{nh}x{d}xf32>
   %k3 = tensor.expand_shape %k [[0], [1, 2]] output_shape [{s}, {nkv}, {d}] : tensor<{s}x{kv}xf32> into tensor<{s}x{nkv}x{d}xf32>
   %v3 = tensor.expand_shape %v [[0], [1, 2]] output_shape [{s}, {nkv}, {d}] : tensor<{s}x{kv}xf32> into tensor<{s}x{nkv}x{d}xf32>
 "#,
@@ -616,7 +482,7 @@ func.func private @linear_ih(%x: tensor<{s}x{i}xf32>, %w: tensor<{h}x{i}xf32>) -
     ));
 
     let q_heads = if c.has_qk_norm {
-        out.push_str(&format!(
+        f.op_asm(format!(
             "  %qn = func.call @rms_norm_q_heads(%q3, %q_norm) : (tensor<{s}x{nh}x{d}xf32>, tensor<{d}xf32>) -> tensor<{s}x{nh}x{d}xf32>\n",
             s = s, nh = nh, d = d,
         ));
@@ -630,7 +496,7 @@ func.func private @linear_ih(%x: tensor<{s}x{i}xf32>, %w: tensor<{h}x{i}xf32>) -
         } else {
             "rms_norm_q_heads"
         };
-        out.push_str(&format!(
+        f.op_asm(format!(
             "  %kn = func.call @{kn_fn}(%k3, %k_norm) : (tensor<{s}x{nkv}x{d}xf32>, tensor<{d}xf32>) -> tensor<{s}x{nkv}x{d}xf32>\n",
             kn_fn = kn_fn,
             s = s,
@@ -643,7 +509,7 @@ func.func private @linear_ih(%x: tensor<{s}x{i}xf32>, %w: tensor<{h}x{i}xf32>) -
     };
 
     let (q_ssa, k_ssa) = if c.rope_theta.is_some() {
-        out.push_str(&format!(
+        f.op_asm(format!(
             r#"  %qr = func.call @apply_rope_q(%{q_heads}) : (tensor<{s}x{nh}x{d}xf32>) -> tensor<{s}x{nh}x{d}xf32>
 "#,
             q_heads = q_heads,
@@ -656,7 +522,7 @@ func.func private @linear_ih(%x: tensor<{s}x{i}xf32>, %w: tensor<{h}x{i}xf32>) -
         } else {
             "apply_rope_q"
         };
-        out.push_str(&format!(
+        f.op_asm(format!(
             r#"  %kr = func.call @{rope_kv}(%{k_heads}) : (tensor<{s}x{nkv}x{d}xf32>) -> tensor<{s}x{nkv}x{d}xf32>
 "#,
             rope_kv = rope_kv,
@@ -671,7 +537,7 @@ func.func private @linear_ih(%x: tensor<{s}x{i}xf32>, %w: tensor<{h}x{i}xf32>) -
     };
 
     let k_full = if nkv != nh {
-        out.push_str(&format!(
+        f.op_asm(format!(
             "  %krep = func.call @repeat_kv(%{k_ssa}) : (tensor<{s}x{nkv}x{d}xf32>) -> tensor<{s}x{nh}x{d}xf32>\n",
             k_ssa = k_ssa,
             s = s,
@@ -679,7 +545,7 @@ func.func private @linear_ih(%x: tensor<{s}x{i}xf32>, %w: tensor<{h}x{i}xf32>) -
             nh = nh,
             d = d,
         ));
-        out.push_str(&format!(
+        f.op_asm(format!(
             "  %vrep = func.call @repeat_kv(%v3) : (tensor<{s}x{nkv}x{d}xf32>) -> tensor<{s}x{nh}x{d}xf32>\n",
             s = s,
             nkv = nkv,
@@ -691,7 +557,7 @@ func.func private @linear_ih(%x: tensor<{s}x{i}xf32>, %w: tensor<{h}x{i}xf32>) -
         (k_ssa, "v3")
     };
 
-    out.push_str(&format!(
+    f.op_asm(format!(
         r#"  %q_ti = tensor.empty() : tensor<{nh}x{s}x{d}xf32>
   %k_ti = tensor.empty() : tensor<{nh}x{s}x{d}xf32>
   %v_ti = tensor.empty() : tensor<{nh}x{s}x{d}xf32>
@@ -734,8 +600,6 @@ func.func private @linear_ih(%x: tensor<{s}x{i}xf32>, %w: tensor<{h}x{i}xf32>) -
   %ctx_t = linalg.transpose ins(%ctx_b : tensor<{nh}x{s}x{d}xf32>) outs(%ctx_t_i : tensor<{s}x{nh}x{d}xf32>) permutation = [1, 0, 2]
   %ctx = tensor.collapse_shape %ctx_t [[0], [1, 2]] : tensor<{s}x{nh}x{d}xf32> into tensor<{s}x{q}xf32>
   return %ctx, %{k_ssa}, %v3 : tensor<{s}x{q}xf32>, tensor<{s}x{nkv}x{d}xf32>, tensor<{s}x{nkv}x{d}xf32>
-}}
-
 "#,
         s = s,
         q = q,
@@ -749,432 +613,10 @@ func.func private @linear_ih(%x: tensor<{s}x{i}xf32>, %w: tensor<{h}x{i}xf32>) -
         v_full = k_full.1,
     ));
 
-    emit_decode_helpers(out, c);
+    f.finish(module)
 }
 
-fn emit_rms_norm_heads(
-    out: &mut String,
-    s: u32,
-    nh: u32,
-    d: u32,
-    eps: &str,
-    d_f: &str,
-    name: &str,
-) {
-    out.push_str(&format!(
-        r#"func.func private @{name}(%x: tensor<{s}x{nh}x{d}xf32>, %w: tensor<{d}xf32>) -> tensor<{s}x{nh}x{d}xf32> {{
-  %c0 = arith.constant 0.0 : f32
-  %one = arith.constant 1.0 : f32
-  %eps = arith.constant {eps} : f32
-  %cd = arith.constant {d_f} : f32
-  %sq = linalg.generic {{
-      indexing_maps = [affine_map<(p, h, dim) -> (p, h, dim)>, affine_map<(p, h, dim) -> (p, h, dim)>],
-      iterator_types = ["parallel", "parallel", "parallel"]}}
-    ins(%x : tensor<{s}x{nh}x{d}xf32>) outs(%x : tensor<{s}x{nh}x{d}xf32>) {{
-    ^bb0(%a: f32, %b: f32):
-      %p = arith.mulf %a, %a : f32
-      linalg.yield %p : f32
-  }} -> tensor<{s}x{nh}x{d}xf32>
-  %init = tensor.empty() : tensor<{s}x{nh}xf32>
-  %z = linalg.fill ins(%c0 : f32) outs(%init : tensor<{s}x{nh}xf32>) -> tensor<{s}x{nh}xf32>
-  %ms = linalg.reduce ins(%sq : tensor<{s}x{nh}x{d}xf32>) outs(%z : tensor<{s}x{nh}xf32>) dimensions = [2]
-    (%in: f32, %acc: f32) {{
-      %s = arith.addf %in, %acc : f32
-      linalg.yield %s : f32
-    }}
-  %inv = linalg.generic {{
-      indexing_maps = [affine_map<(p, h) -> (p, h)>, affine_map<(p, h) -> (p, h)>],
-      iterator_types = ["parallel", "parallel"]}}
-    ins(%ms : tensor<{s}x{nh}xf32>) outs(%ms : tensor<{s}x{nh}xf32>) {{
-    ^bb0(%a: f32, %b: f32):
-      %m = arith.divf %a, %cd : f32
-      %meps = arith.addf %m, %eps : f32
-      %root = math.sqrt %meps : f32
-      %i = arith.divf %one, %root : f32
-      linalg.yield %i : f32
-  }} -> tensor<{s}x{nh}xf32>
-  %y = linalg.generic {{
-      indexing_maps = [
-        affine_map<(p, h, dim) -> (p, h, dim)>,
-        affine_map<(p, h, dim) -> (p, h)>,
-        affine_map<(p, h, dim) -> (dim)>,
-        affine_map<(p, h, dim) -> (p, h, dim)>
-      ],
-      iterator_types = ["parallel", "parallel", "parallel"]}}
-    ins(%x, %inv, %w : tensor<{s}x{nh}x{d}xf32>, tensor<{s}x{nh}xf32>, tensor<{d}xf32>) outs(%x : tensor<{s}x{nh}x{d}xf32>) {{
-    ^bb0(%a: f32, %i: f32, %ww: f32, %o: f32):
-      %t = arith.mulf %a, %i : f32
-      %r = arith.mulf %t, %ww : f32
-      linalg.yield %r : f32
-  }} -> tensor<{s}x{nh}x{d}xf32>
-  return %y : tensor<{s}x{nh}x{d}xf32>
-}}
-
-"#,
-        name = name,
-        s = s,
-        nh = nh,
-        d = d,
-        eps = eps,
-        d_f = d_f,
-    ));
-}
-
-fn emit_rope_helper(out: &mut String, s: u32, nh: u32, d: u32, theta: f32, name: &str) {
-    // HuggingFace Llama/Qwen RoPE: rotate_half.
-    //   x1, x2 = x[..., :D/2], x[..., D/2:]
-    //   out = cat(x1*cos - x2*sin, x1*sin + x2*cos)
-    // Cos/sin tables are [S, D/2] with freq_i = theta^(-2i/D).
-    let half = (d / 2) as usize;
-    let mut cos_rows = Vec::with_capacity(s as usize);
-    let mut sin_rows = Vec::with_capacity(s as usize);
-    for pos in 0..s {
-        let mut cos_row = Vec::with_capacity(half);
-        let mut sin_row = Vec::with_capacity(half);
-        for i in 0..half {
-            let freq = 1.0 / theta.powf((2 * i) as f32 / d as f32);
-            let angle = pos as f32 * freq;
-            cos_row.push(format!("{:.8e}", angle.cos()));
-            sin_row.push(format!("{:.8e}", angle.sin()));
-        }
-        cos_rows.push(format!("[{}]", cos_row.join(", ")));
-        sin_rows.push(format!("[{}]", sin_row.join(", ")));
-    }
-    let cos_lit = cos_rows.join(", ");
-    let sin_lit = sin_rows.join(", ");
-    out.push_str(&format!(
-        r#"func.func private @{name}(%x: tensor<{s}x{nh}x{d}xf32>) -> tensor<{s}x{nh}x{d}xf32> {{
-  %cos = arith.constant dense<[{cos_lit}]> : tensor<{s}x{half}xf32>
-  %sin = arith.constant dense<[{sin_lit}]> : tensor<{s}x{half}xf32>
-  %init = tensor.empty() : tensor<{s}x{nh}x{d}xf32>
-  %y = linalg.generic {{
-      indexing_maps = [
-        affine_map<(p, h, dim) -> (p, h, dim)>,
-        affine_map<(p, h, dim) -> (p, h, dim)>
-      ],
-      iterator_types = ["parallel", "parallel", "parallel"]}}
-    ins(%x : tensor<{s}x{nh}x{d}xf32>) outs(%init : tensor<{s}x{nh}x{d}xf32>) {{
-    ^bb0(%a: f32, %o: f32):
-      %p = linalg.index 0 : index
-      %hh = linalg.index 1 : index
-      %dim = linalg.index 2 : index
-      %half_i = arith.constant {half} : index
-      %in_first = arith.cmpi ult, %dim, %half_i : index
-      %pair_lo = arith.remui %dim, %half_i : index
-      %dim_hi = arith.addi %pair_lo, %half_i : index
-      %x1 = tensor.extract %x[%p, %hh, %pair_lo] : tensor<{s}x{nh}x{d}xf32>
-      %x2 = tensor.extract %x[%p, %hh, %dim_hi] : tensor<{s}x{nh}x{d}xf32>
-      %cv = tensor.extract %cos[%p, %pair_lo] : tensor<{s}x{half}xf32>
-      %sv = tensor.extract %sin[%p, %pair_lo] : tensor<{s}x{half}xf32>
-      %x1c = arith.mulf %x1, %cv : f32
-      %x2s = arith.mulf %x2, %sv : f32
-      %x1s = arith.mulf %x1, %sv : f32
-      %x2c = arith.mulf %x2, %cv : f32
-      %lo = arith.subf %x1c, %x2s : f32
-      %hi = arith.addf %x1s, %x2c : f32
-      %r = arith.select %in_first, %lo, %hi : f32
-      linalg.yield %r : f32
-  }} -> tensor<{s}x{nh}x{d}xf32>
-  return %y : tensor<{s}x{nh}x{d}xf32>
-}}
-
-"#,
-        name = name,
-        s = s,
-        nh = nh,
-        d = d,
-        half = half,
-        cos_lit = cos_lit,
-        sin_lit = sin_lit,
-    ));
-}
-
-fn emit_prefill(out: &mut String, c: &DenseDecoderConfig) {
-    let (s, h, v) = (c.seq, c.hidden, c.vocab);
-    let (q, kv) = (c.q_dim(), c.kv_dim());
-    let d = c.head_dim;
-    // Tokens are left-aligned (right-padded). `%last` is the index of the
-    // newest real token so RoPE/causal attention ignore trailing pads.
-    out.push_str(&format!(
-        "func.func @prefill(%tokens: tensor<{s}xi64>, %last: tensor<i64>) -> tensor<{v}xf32> {{\n"
-    ));
-    emit_load_compute(
-        out,
-        c,
-        "emb_t",
-        "token_embd_weight",
-        "token_embd.weight",
-        &format!("{v}x{h}"),
-    );
-
-    // Embedding gather (unrolled).
-    out.push_str(&format!(
-        "  %h_acc0 = tensor.empty() : tensor<{s}x{h}xf32>\n"
-    ));
-    for pos in 0..s {
-        out.push_str(&format!("  %c{pos}i = arith.constant {pos} : index\n"));
-        out.push_str(&format!(
-            "  %t{pos} = tensor.extract %tokens[%c{pos}i] : tensor<{s}xi64>\n"
-        ));
-        out.push_str(&format!(
-            "  %i{pos} = arith.index_cast %t{pos} : i64 to index\n"
-        ));
-        out.push_str(&format!(
-            "  %r{pos} = tensor.extract_slice %emb_t[%i{pos}, 0] [1, {h}] [1, 1] : tensor<{v}x{h}xf32> to tensor<1x{h}xf32>\n"
-        ));
-        let prev = if pos == 0 {
-            "h_acc0".to_string()
-        } else {
-            format!("h_acc{pos}")
-        };
-        let next = format!("h_acc{}", pos + 1);
-        out.push_str(&format!(
-            "  %{next} = tensor.insert_slice %r{pos} into %{prev}[{pos}, 0] [1, {h}] [1, 1] : tensor<1x{h}xf32> into tensor<{s}x{h}xf32>\n"
-        ));
-    }
-    let mut h_name = format!("h_acc{s}");
-
-    for layer in 0..c.num_layers {
-        let p = format!("blk{layer}");
-        let n = format!("blk.{layer}");
-        emit_load_compute(
-            out,
-            c,
-            &format!("{p}_attn_nw"),
-            &format!("{p}_attn_norm_weight"),
-            &format!("{n}.attn_norm.weight"),
-            &format!("{h}"),
-        );
-        emit_load_compute(
-            out,
-            c,
-            &format!("{p}_wq"),
-            &format!("{p}_attn_q_weight"),
-            &format!("{n}.attn_q.weight"),
-            &format!("{q}x{h}"),
-        );
-        emit_load_compute(
-            out,
-            c,
-            &format!("{p}_wk"),
-            &format!("{p}_attn_k_weight"),
-            &format!("{n}.attn_k.weight"),
-            &format!("{kv}x{h}"),
-        );
-        emit_load_compute(
-            out,
-            c,
-            &format!("{p}_wv"),
-            &format!("{p}_attn_v_weight"),
-            &format!("{n}.attn_v.weight"),
-            &format!("{kv}x{h}"),
-        );
-        emit_load_compute(
-            out,
-            c,
-            &format!("{p}_wo"),
-            &format!("{p}_attn_output_weight"),
-            &format!("{n}.attn_output.weight"),
-            &format!("{h}x{q}"),
-        );
-        if c.has_qk_norm {
-            emit_load_compute(
-                out,
-                c,
-                &format!("{p}_qnw"),
-                &format!("{p}_attn_q_norm_weight"),
-                &format!("{n}.attn_q_norm.weight"),
-                &format!("{d}"),
-            );
-            emit_load_compute(
-                out,
-                c,
-                &format!("{p}_knw"),
-                &format!("{p}_attn_k_norm_weight"),
-                &format!("{n}.attn_k_norm.weight"),
-                &format!("{d}"),
-            );
-        }
-        emit_load_compute(
-            out,
-            c,
-            &format!("{p}_ffn_nw"),
-            &format!("{p}_ffn_norm_weight"),
-            &format!("{n}.ffn_norm.weight"),
-            &format!("{h}"),
-        );
-        emit_load_compute(
-            out,
-            c,
-            &format!("{p}_wgate"),
-            &format!("{p}_ffn_gate_weight"),
-            &format!("{n}.ffn_gate.weight"),
-            &format!("{}x{h}", c.intermediate),
-        );
-        emit_load_compute(
-            out,
-            c,
-            &format!("{p}_wup"),
-            &format!("{p}_ffn_up_weight"),
-            &format!("{n}.ffn_up.weight"),
-            &format!("{}x{h}", c.intermediate),
-        );
-        emit_load_compute(
-            out,
-            c,
-            &format!("{p}_wdown"),
-            &format!("{p}_ffn_down_weight"),
-            &format!("{n}.ffn_down.weight"),
-            &format!("{h}x{}", c.intermediate),
-        );
-
-        let xin = h_name.clone();
-        out.push_str(&format!(
-            "  %{p}_xn = func.call @rms_norm(%{xin}, %{p}_attn_nw) : (tensor<{s}x{h}xf32>, tensor<{h}xf32>) -> tensor<{s}x{h}xf32>\n"
-        ));
-        out.push_str(&format!(
-            "  %{p}_q = func.call @linear_hq(%{p}_xn, %{p}_wq) : (tensor<{s}x{h}xf32>, tensor<{q}x{h}xf32>) -> tensor<{s}x{q}xf32>\n"
-        ));
-        out.push_str(&format!(
-            "  %{p}_k = func.call @linear_hkv(%{p}_xn, %{p}_wk) : (tensor<{s}x{h}xf32>, tensor<{kv}x{h}xf32>) -> tensor<{s}x{kv}xf32>\n"
-        ));
-        out.push_str(&format!(
-            "  %{p}_v = func.call @linear_hkv(%{p}_xn, %{p}_wv) : (tensor<{s}x{h}xf32>, tensor<{kv}x{h}xf32>) -> tensor<{s}x{kv}xf32>\n"
-        ));
-        let nkv = c.num_kv_heads;
-        let mk = c.max_kv;
-        if c.has_qk_norm {
-            out.push_str(&format!(
-                "  %{p}_ctx, %{p}_kc, %{p}_vc = func.call @attn(%{p}_q, %{p}_k, %{p}_v, %{p}_qnw, %{p}_knw) : (tensor<{s}x{q}xf32>, tensor<{s}x{kv}xf32>, tensor<{s}x{kv}xf32>, tensor<{d}xf32>, tensor<{d}xf32>) -> (tensor<{s}x{q}xf32>, tensor<{s}x{nkv}x{d}xf32>, tensor<{s}x{nkv}x{d}xf32>)\n"
-            ));
-        } else {
-            out.push_str(&format!(
-                "  %{p}_ctx, %{p}_kc, %{p}_vc = func.call @attn(%{p}_q, %{p}_k, %{p}_v) : (tensor<{s}x{q}xf32>, tensor<{s}x{kv}xf32>, tensor<{s}x{kv}xf32>) -> (tensor<{s}x{q}xf32>, tensor<{s}x{nkv}x{d}xf32>, tensor<{s}x{nkv}x{d}xf32>)\n"
-            ));
-        }
-        // Seed mutable KV at positions [0, seq).
-        out.push_str(&format!(
-            "  %{p}_k_old = util.global.load @kv_k{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
-        ));
-        out.push_str(&format!(
-            "  %{p}_v_old = util.global.load @kv_v{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
-        ));
-        out.push_str(&format!(
-            "  %{p}_k_new = tensor.insert_slice %{p}_kc into %{p}_k_old[0, 0, 0] [{s}, {nkv}, {d}] [1, 1, 1] : tensor<{s}x{nkv}x{d}xf32> into tensor<{mk}x{nkv}x{d}xf32>\n"
-        ));
-        out.push_str(&format!(
-            "  %{p}_v_new = tensor.insert_slice %{p}_vc into %{p}_v_old[0, 0, 0] [{s}, {nkv}, {d}] [1, 1, 1] : tensor<{s}x{nkv}x{d}xf32> into tensor<{mk}x{nkv}x{d}xf32>\n"
-        ));
-        out.push_str(&format!(
-            "  util.global.store %{p}_k_new, @kv_k{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
-        ));
-        out.push_str(&format!(
-            "  util.global.store %{p}_v_new, @kv_v{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
-        ));
-        out.push_str(&format!(
-            "  %{p}_o = func.call @linear_qh(%{p}_ctx, %{p}_wo) : (tensor<{s}x{q}xf32>, tensor<{h}x{q}xf32>) -> tensor<{s}x{h}xf32>\n"
-        ));
-        out.push_str(&format!(
-            "  %{p}_h2 = arith.addf %{xin}, %{p}_o : tensor<{s}x{h}xf32>\n"
-        ));
-        out.push_str(&format!(
-            "  %{p}_fn = func.call @rms_norm(%{p}_h2, %{p}_ffn_nw) : (tensor<{s}x{h}xf32>, tensor<{h}xf32>) -> tensor<{s}x{h}xf32>\n"
-        ));
-        out.push_str(&format!(
-            "  %{p}_gate = func.call @linear_hi(%{p}_fn, %{p}_wgate) : (tensor<{s}x{h}xf32>, tensor<{i}x{h}xf32>) -> tensor<{s}x{i}xf32>\n",
-            i = c.intermediate
-        ));
-        out.push_str(&format!(
-            "  %{p}_up = func.call @linear_hi(%{p}_fn, %{p}_wup) : (tensor<{s}x{h}xf32>, tensor<{i}x{h}xf32>) -> tensor<{s}x{i}xf32>\n",
-            i = c.intermediate
-        ));
-        out.push_str(&format!(
-            r#"  %{p}_silu = linalg.generic {{
-      indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>],
-      iterator_types = ["parallel", "parallel"]}}
-    ins(%{p}_gate : tensor<{s}x{i}xf32>) outs(%{p}_gate : tensor<{s}x{i}xf32>) {{
-    ^bb0(%a: f32, %b: f32):
-      %n = arith.negf %a : f32
-      %e = math.exp %n : f32
-      %one = arith.constant 1.0 : f32
-      %den = arith.addf %one, %e : f32
-      %sg = arith.divf %a, %den : f32
-      linalg.yield %sg : f32
-  }} -> tensor<{s}x{i}xf32>
-"#,
-            i = c.intermediate
-        ));
-        out.push_str(&format!(
-            "  %{p}_ff = arith.mulf %{p}_silu, %{p}_up : tensor<{s}x{i}xf32>\n",
-            i = c.intermediate
-        ));
-        out.push_str(&format!(
-            "  %{p}_down = func.call @linear_ih(%{p}_ff, %{p}_wdown) : (tensor<{s}x{i}xf32>, tensor<{h}x{i}xf32>) -> tensor<{s}x{h}xf32>\n",
-            i = c.intermediate
-        ));
-        out.push_str(&format!(
-            "  %{p}_hout = arith.addf %{p}_h2, %{p}_down : tensor<{s}x{h}xf32>\n"
-        ));
-        h_name = format!("{p}_hout");
-    }
-
-    emit_load_compute(
-        out,
-        c,
-        "out_nw",
-        "output_norm_weight",
-        "output_norm.weight",
-        &format!("{h}"),
-    );
-    emit_load_compute(
-        out,
-        c,
-        "wout",
-        "output_weight",
-        "output.weight",
-        &format!("{v}x{h}"),
-    );
-    out.push_str("  %last_i64 = tensor.extract %last[] : tensor<i64>\n");
-    out.push_str("  %li = arith.index_cast %last_i64 : i64 to index\n");
-    out.push_str(&format!(
-        "  %last_row = tensor.extract_slice %{h_name}[%li, 0] [1, {h}] [1, 1] : tensor<{s}x{h}xf32> to tensor<1x{h}xf32>\n"
-    ));
-    // Tile to S for rms_norm helper, take row 0.
-    out.push_str(&format!(
-        "  %last_tile = tensor.empty() : tensor<{s}x{h}xf32>\n"
-    ));
-    out.push_str(&format!(
-        "  %last_s = tensor.insert_slice %last_row into %last_tile[0, 0] [1, {h}] [1, 1] : tensor<1x{h}xf32> into tensor<{s}x{h}xf32>\n"
-    ));
-    out.push_str(&format!(
-        "  %ln = func.call @rms_norm(%last_s, %out_nw) : (tensor<{s}x{h}xf32>, tensor<{h}xf32>) -> tensor<{s}x{h}xf32>\n"
-    ));
-    out.push_str(&format!(
-        "  %ln1 = tensor.extract_slice %ln[0, 0] [1, {h}] [1, 1] : tensor<{s}x{h}xf32> to tensor<1x{h}xf32>\n"
-    ));
-    out.push_str("  %c0f = arith.constant 0.0 : f32\n");
-    out.push_str(&format!(
-        "  %wt_i = tensor.empty() : tensor<{h}x{v}xf32>\n"
-    ));
-    out.push_str(&format!(
-        "  %wt = linalg.transpose ins(%wout : tensor<{v}x{h}xf32>) outs(%wt_i : tensor<{h}x{v}xf32>) permutation = [1, 0]\n"
-    ));
-    out.push_str(&format!(
-        "  %yi = tensor.empty() : tensor<1x{v}xf32>\n"
-    ));
-    out.push_str(&format!(
-        "  %yz = linalg.fill ins(%c0f : f32) outs(%yi : tensor<1x{v}xf32>) -> tensor<1x{v}xf32>\n"
-    ));
-    out.push_str(&format!(
-        "  %y = linalg.matmul ins(%ln1, %wt : tensor<1x{h}xf32>, tensor<{h}x{v}xf32>) outs(%yz : tensor<1x{v}xf32>) -> tensor<1x{v}xf32>\n"
-    ));
-    out.push_str(&format!(
-        "  %logits = tensor.collapse_shape %y [[0, 1]] : tensor<1x{v}xf32> into tensor<{v}xf32>\n"
-    ));
-    out.push_str(&format!("  return %logits : tensor<{v}xf32>\n}}\n\n"));
-}
-
-fn emit_decode_helpers(out: &mut String, c: &DenseDecoderConfig) {
+fn emit_decode_helpers(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()> {
     let (mk, h, i, nh, nkv, d) = (
         c.max_kv,
         c.hidden,
@@ -1185,193 +627,79 @@ fn emit_decode_helpers(out: &mut String, c: &DenseDecoderConfig) {
     );
     let (q, kv) = (c.q_dim(), c.kv_dim());
     let g = c.gqa_group();
-    let eps = format!("{:.8e}", c.rms_norm_eps);
-    let h_f = format!("{:.1}", h as f32);
-    let d_f = format!("{:.1}", d as f32);
     let scale = 1.0 / (d as f32).sqrt();
 
-    out.push_str(&format!(
-        r#"func.func private @rms_norm_tok(%x: tensor<1x{h}xf32>, %w: tensor<{h}xf32>) -> tensor<1x{h}xf32> {{
-  %c0 = arith.constant 0.0 : f32
-  %one = arith.constant 1.0 : f32
-  %eps = arith.constant {eps} : f32
-  %ch = arith.constant {h_f} : f32
-  %sq = linalg.generic {{
-      indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>],
-      iterator_types = ["parallel", "parallel"]}}
-    ins(%x : tensor<1x{h}xf32>) outs(%x : tensor<1x{h}xf32>) {{
-    ^bb0(%a: f32, %b: f32):
-      %p = arith.mulf %a, %a : f32
-      linalg.yield %p : f32
-  }} -> tensor<1x{h}xf32>
-  %init = tensor.empty() : tensor<1xf32>
-  %z = linalg.fill ins(%c0 : f32) outs(%init : tensor<1xf32>) -> tensor<1xf32>
-  %ms = linalg.reduce ins(%sq : tensor<1x{h}xf32>) outs(%z : tensor<1xf32>) dimensions = [1]
-    (%in: f32, %acc: f32) {{
-      %s = arith.addf %in, %acc : f32
-      linalg.yield %s : f32
-    }}
-  %inv = linalg.generic {{
-      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],
-      iterator_types = ["parallel"]}}
-    ins(%ms : tensor<1xf32>) outs(%ms : tensor<1xf32>) {{
-    ^bb0(%a: f32, %b: f32):
-      %m = arith.divf %a, %ch : f32
-      %meps = arith.addf %m, %eps : f32
-      %root = math.sqrt %meps : f32
-      %ii = arith.divf %one, %root : f32
-      linalg.yield %ii : f32
-  }} -> tensor<1xf32>
-  %y = linalg.generic {{
-      indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0)>, affine_map<(d0, d1) -> (d1)>, affine_map<(d0, d1) -> (d0, d1)>],
-      iterator_types = ["parallel", "parallel"]}}
-    ins(%x, %inv, %w : tensor<1x{h}xf32>, tensor<1xf32>, tensor<{h}xf32>) outs(%x : tensor<1x{h}xf32>) {{
-    ^bb0(%a: f32, %ii: f32, %ww: f32, %o: f32):
-      %t = arith.mulf %a, %ii : f32
-      %r = arith.mulf %t, %ww : f32
-      linalg.yield %r : f32
-  }} -> tensor<1x{h}xf32>
-  return %y : tensor<1x{h}xf32>
-}}
-
-func.func private @linear_hq_tok(%x: tensor<1x{h}xf32>, %w: tensor<{q}x{h}xf32>) -> tensor<1x{q}xf32> {{
-  %c0 = arith.constant 0.0 : f32
-  %ti = tensor.empty() : tensor<{h}x{q}xf32>
-  %wt = linalg.transpose ins(%w : tensor<{q}x{h}xf32>) outs(%ti : tensor<{h}x{q}xf32>) permutation = [1, 0]
-  %init = tensor.empty() : tensor<1x{q}xf32>
-  %z = linalg.fill ins(%c0 : f32) outs(%init : tensor<1x{q}xf32>) -> tensor<1x{q}xf32>
-  %y = linalg.matmul ins(%x, %wt : tensor<1x{h}xf32>, tensor<{h}x{q}xf32>) outs(%z : tensor<1x{q}xf32>) -> tensor<1x{q}xf32>
-  return %y : tensor<1x{q}xf32>
-}}
-
-func.func private @linear_hkv_tok(%x: tensor<1x{h}xf32>, %w: tensor<{kv}x{h}xf32>) -> tensor<1x{kv}xf32> {{
-  %c0 = arith.constant 0.0 : f32
-  %ti = tensor.empty() : tensor<{h}x{kv}xf32>
-  %wt = linalg.transpose ins(%w : tensor<{kv}x{h}xf32>) outs(%ti : tensor<{h}x{kv}xf32>) permutation = [1, 0]
-  %init = tensor.empty() : tensor<1x{kv}xf32>
-  %z = linalg.fill ins(%c0 : f32) outs(%init : tensor<1x{kv}xf32>) -> tensor<1x{kv}xf32>
-  %y = linalg.matmul ins(%x, %wt : tensor<1x{h}xf32>, tensor<{h}x{kv}xf32>) outs(%z : tensor<1x{kv}xf32>) -> tensor<1x{kv}xf32>
-  return %y : tensor<1x{kv}xf32>
-}}
-
-func.func private @linear_qh_tok(%x: tensor<1x{q}xf32>, %w: tensor<{h}x{q}xf32>) -> tensor<1x{h}xf32> {{
-  %c0 = arith.constant 0.0 : f32
-  %ti = tensor.empty() : tensor<{q}x{h}xf32>
-  %wt = linalg.transpose ins(%w : tensor<{h}x{q}xf32>) outs(%ti : tensor<{q}x{h}xf32>) permutation = [1, 0]
-  %init = tensor.empty() : tensor<1x{h}xf32>
-  %z = linalg.fill ins(%c0 : f32) outs(%init : tensor<1x{h}xf32>) -> tensor<1x{h}xf32>
-  %y = linalg.matmul ins(%x, %wt : tensor<1x{q}xf32>, tensor<{q}x{h}xf32>) outs(%z : tensor<1x{h}xf32>) -> tensor<1x{h}xf32>
-  return %y : tensor<1x{h}xf32>
-}}
-
-func.func private @linear_hi_tok(%x: tensor<1x{h}xf32>, %w: tensor<{i}x{h}xf32>) -> tensor<1x{i}xf32> {{
-  %c0 = arith.constant 0.0 : f32
-  %ti = tensor.empty() : tensor<{h}x{i}xf32>
-  %wt = linalg.transpose ins(%w : tensor<{i}x{h}xf32>) outs(%ti : tensor<{h}x{i}xf32>) permutation = [1, 0]
-  %init = tensor.empty() : tensor<1x{i}xf32>
-  %z = linalg.fill ins(%c0 : f32) outs(%init : tensor<1x{i}xf32>) -> tensor<1x{i}xf32>
-  %y = linalg.matmul ins(%x, %wt : tensor<1x{h}xf32>, tensor<{h}x{i}xf32>) outs(%z : tensor<1x{i}xf32>) -> tensor<1x{i}xf32>
-  return %y : tensor<1x{i}xf32>
-}}
-
-func.func private @linear_ih_tok(%x: tensor<1x{i}xf32>, %w: tensor<{h}x{i}xf32>) -> tensor<1x{h}xf32> {{
-  %c0 = arith.constant 0.0 : f32
-  %ti = tensor.empty() : tensor<{i}x{h}xf32>
-  %wt = linalg.transpose ins(%w : tensor<{h}x{i}xf32>) outs(%ti : tensor<{i}x{h}xf32>) permutation = [1, 0]
-  %init = tensor.empty() : tensor<1x{h}xf32>
-  %z = linalg.fill ins(%c0 : f32) outs(%init : tensor<1x{h}xf32>) -> tensor<1x{h}xf32>
-  %y = linalg.matmul ins(%x, %wt : tensor<1x{i}xf32>, tensor<{i}x{h}xf32>) outs(%z : tensor<1x{h}xf32>) -> tensor<1x{h}xf32>
-  return %y : tensor<1x{h}xf32>
-}}
-
-"#,
-        h = h,
-        i = i,
-        q = q,
-        kv = kv,
-        eps = eps,
-        h_f = h_f,
-    ));
+    kernels::emit_rms_norm(module, "rms_norm_tok", 1, h, c.rms_norm_eps)?;
+    kernels::emit_linear(module, "linear_hq_tok", 1, h, q, true)?;
+    kernels::emit_linear(module, "linear_hkv_tok", 1, h, kv, true)?;
+    kernels::emit_linear(module, "linear_qh_tok", 1, q, h, true)?;
+    kernels::emit_linear(module, "linear_hi_tok", 1, h, i, true)?;
+    kernels::emit_linear(module, "linear_ih_tok", 1, i, h, true)?;
 
     if c.has_qk_norm {
-        emit_rms_norm_heads(out, 1, nh, d, &eps, &d_f, "rms_norm_q_heads_tok");
+        kernels::emit_rms_norm_heads(module, "rms_norm_q_heads_tok", 1, nh, d, c.rms_norm_eps)?;
         if nkv != nh {
-            emit_rms_norm_heads(out, 1, nkv, d, &eps, &d_f, "rms_norm_kv_heads_tok");
+            kernels::emit_rms_norm_heads(module, "rms_norm_kv_heads_tok", 1, nkv, d, c.rms_norm_eps)?;
         }
     }
 
     if nkv != nh {
-        out.push_str(&format!(
-            r#"func.func private @repeat_kv_mk(%x: tensor<{mk}x{nkv}x{d}xf32>) -> tensor<{mk}x{nh}x{d}xf32> {{
-  %init = tensor.empty() : tensor<{mk}x{nh}x{d}xf32>
-  %y = linalg.generic {{
-      indexing_maps = [
-        affine_map<(p, h, dim) -> (p, h floordiv {g}, dim)>,
-        affine_map<(p, h, dim) -> (p, h, dim)>
-      ],
-      iterator_types = ["parallel", "parallel", "parallel"]}}
-    ins(%x : tensor<{mk}x{nkv}x{d}xf32>) outs(%init : tensor<{mk}x{nh}x{d}xf32>) {{
-    ^bb0(%a: f32, %o: f32):
-      linalg.yield %a : f32
-  }} -> tensor<{mk}x{nh}x{d}xf32>
-  return %y : tensor<{mk}x{nh}x{d}xf32>
-}}
-
-"#,
-            mk = mk,
-            nkv = nkv,
-            nh = nh,
-            d = d,
-            g = g,
-        ));
+        kernels::emit_repeat_kv(module, "repeat_kv_mk", mk, nkv, nh, d, g)?;
     }
 
     if let Some(theta) = c.rope_theta {
-        emit_rope_at_helper(out, mk, nh, d, theta, "apply_rope_q_at");
+        kernels::emit_rope_at(module, "apply_rope_q_at", mk, nh, d, theta)?;
         if nkv != nh {
-            emit_rope_at_helper(out, mk, nkv, d, theta, "apply_rope_kv_at");
+            kernels::emit_rope_at(module, "apply_rope_kv_at", mk, nkv, d, theta)?;
         }
     }
 
-    // Dynamic-row KV update (avoid tensor.insert_slice with mixed dynamic offsets).
-    out.push_str(&format!(
-        r#"func.func private @kv_update_row(%cache: tensor<{mk}x{nkv}x{d}xf32>, %row: tensor<1x{nkv}x{d}xf32>, %pos_t: tensor<i64>) -> tensor<{mk}x{nkv}x{d}xf32> {{
-  %pos_i64 = tensor.extract %pos_t[] : tensor<i64>
+    {
+        let mut f = module.func_private("kv_update_row");
+        f.arg("cache", format!("tensor<{mk}x{nkv}x{d}xf32>"));
+        f.arg("row", format!("tensor<1x{nkv}x{d}xf32>"));
+        f.arg("pos_t", "tensor<i64>");
+        f.result_ty(format!("tensor<{mk}x{nkv}x{d}xf32>"));
+        f.op_asm(format!(
+            r#"  %pos_i64 = tensor.extract %pos_t[] : tensor<i64>
   %pos = arith.index_cast %pos_i64 : i64 to index
   %c0 = arith.constant 0 : index
   %y = tensor.insert_slice %row into %cache[%pos, %c0, %c0] [1, {nkv}, {d}] [1, 1, 1] : tensor<1x{nkv}x{d}xf32> into tensor<{mk}x{nkv}x{d}xf32>
-  return %y : tensor<{mk}x{nkv}x{d}xf32>
-}}
-
-"#,
-        mk = mk,
-        nkv = nkv,
-        d = d,
-    ));
-
-    out.push_str(&format!(
-        r#"func.func private @attn_decode(%q: tensor<1x{q}xf32>, %k_cache: tensor<{mk}x{nkv}x{d}xf32>, %v_cache: tensor<{mk}x{nkv}x{d}xf32>, %k_new: tensor<1x{nkv}x{d}xf32>, %v_new: tensor<1x{nkv}x{d}xf32>, %pos_t: tensor<i64>, %attn_bias: tensor<{mk}xf32>"#
-    ));
-    if c.has_qk_norm {
-        out.push_str(&format!(
-            ", %q_norm: tensor<{d}xf32>, %k_norm: tensor<{d}xf32>"
+  return %y : tensor<{mk}x{nkv}x{d}xf32>"#,
+            mk = mk,
+            nkv = nkv,
+            d = d,
         ));
+        f.finish(module)?;
     }
-    out.push_str(&format!(
-        r#") -> (tensor<1x{q}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<{mk}x{nkv}x{d}xf32>) {{
-  %pos_i64 = tensor.extract %pos_t[] : tensor<i64>
+
+    let mut f = module.func_private("attn_decode");
+    f.arg("q", format!("tensor<1x{q}xf32>"));
+    f.arg("k_cache", format!("tensor<{mk}x{nkv}x{d}xf32>"));
+    f.arg("v_cache", format!("tensor<{mk}x{nkv}x{d}xf32>"));
+    f.arg("k_new", format!("tensor<1x{nkv}x{d}xf32>"));
+    f.arg("v_new", format!("tensor<1x{nkv}x{d}xf32>"));
+    f.arg("pos_t", "tensor<i64>");
+    f.arg("attn_bias", format!("tensor<{mk}xf32>"));
+    if c.has_qk_norm {
+        f.arg("q_norm", format!("tensor<{d}xf32>"));
+        f.arg("k_norm", format!("tensor<{d}xf32>"));
+    }
+    f.result_ty(format!("tensor<1x{q}xf32>"));
+    f.result_ty(format!("tensor<{mk}x{nkv}x{d}xf32>"));
+    f.result_ty(format!("tensor<{mk}x{nkv}x{d}xf32>"));
+    f.op_asm(format!(
+        r#"  %pos_i64 = tensor.extract %pos_t[] : tensor<i64>
   %pos = arith.index_cast %pos_i64 : i64 to index
   %q3 = tensor.expand_shape %q [[0], [1, 2]] output_shape [1, {nh}, {d}] : tensor<1x{q}xf32> into tensor<1x{nh}x{d}xf32>
 "#,
         q = q,
-        mk = mk,
-        nkv = nkv,
         d = d,
         nh = nh,
     ));
 
     let q_heads = if c.has_qk_norm {
-        out.push_str(&format!(
+        f.op_asm(format!(
             "  %qn = func.call @rms_norm_q_heads_tok(%q3, %q_norm) : (tensor<1x{nh}x{d}xf32>, tensor<{d}xf32>) -> tensor<1x{nh}x{d}xf32>\n",
             nh = nh,
             d = d,
@@ -1386,7 +714,7 @@ func.func private @linear_ih_tok(%x: tensor<1x{i}xf32>, %w: tensor<{h}x{i}xf32>)
         } else {
             "rms_norm_q_heads_tok"
         };
-        out.push_str(&format!(
+        f.op_asm(format!(
             "  %kn = func.call @{kn_fn}(%k_new, %k_norm) : (tensor<1x{nkv}x{d}xf32>, tensor<{d}xf32>) -> tensor<1x{nkv}x{d}xf32>\n",
             kn_fn = kn_fn,
             nkv = nkv,
@@ -1398,7 +726,7 @@ func.func private @linear_ih_tok(%x: tensor<1x{i}xf32>, %w: tensor<{h}x{i}xf32>)
     };
 
     let (q_ssa, k_ssa) = if c.rope_theta.is_some() {
-        out.push_str(&format!(
+        f.op_asm(format!(
             "  %qr = func.call @apply_rope_q_at(%{q_heads}, %pos) : (tensor<1x{nh}x{d}xf32>, index) -> tensor<1x{nh}x{d}xf32>\n",
             q_heads = q_heads,
             nh = nh,
@@ -1409,7 +737,7 @@ func.func private @linear_ih_tok(%x: tensor<1x{i}xf32>, %w: tensor<{h}x{i}xf32>)
         } else {
             "apply_rope_q_at"
         };
-        out.push_str(&format!(
+        f.op_asm(format!(
             "  %kr = func.call @{rope_kv}(%{k_heads}, %pos) : (tensor<1x{nkv}x{d}xf32>, index) -> tensor<1x{nkv}x{d}xf32>\n",
             rope_kv = rope_kv,
             k_heads = k_heads,
@@ -1421,7 +749,7 @@ func.func private @linear_ih_tok(%x: tensor<1x{i}xf32>, %w: tensor<{h}x{i}xf32>)
         (q_heads, k_heads)
     };
 
-    out.push_str(&format!(
+    f.op_asm(format!(
         r#"  %k_upd = func.call @kv_update_row(%k_cache, %{k_ssa}, %pos_t) : (tensor<{mk}x{nkv}x{d}xf32>, tensor<1x{nkv}x{d}xf32>, tensor<i64>) -> tensor<{mk}x{nkv}x{d}xf32>
   %v_upd = func.call @kv_update_row(%v_cache, %v_new, %pos_t) : (tensor<{mk}x{nkv}x{d}xf32>, tensor<1x{nkv}x{d}xf32>, tensor<i64>) -> tensor<{mk}x{nkv}x{d}xf32>
 "#,
@@ -1432,14 +760,14 @@ func.func private @linear_ih_tok(%x: tensor<1x{i}xf32>, %w: tensor<{h}x{i}xf32>)
     ));
 
     let (k_full, v_full) = if nkv != nh {
-        out.push_str(&format!(
+        f.op_asm(format!(
             "  %krep = func.call @repeat_kv_mk(%k_upd) : (tensor<{mk}x{nkv}x{d}xf32>) -> tensor<{mk}x{nh}x{d}xf32>\n",
             mk = mk,
             nkv = nkv,
             nh = nh,
             d = d,
         ));
-        out.push_str(&format!(
+        f.op_asm(format!(
             "  %vrep = func.call @repeat_kv_mk(%v_upd) : (tensor<{mk}x{nkv}x{d}xf32>) -> tensor<{mk}x{nh}x{d}xf32>\n",
             mk = mk,
             nkv = nkv,
@@ -1451,7 +779,7 @@ func.func private @linear_ih_tok(%x: tensor<1x{i}xf32>, %w: tensor<{h}x{i}xf32>)
         ("k_upd", "v_upd")
     };
 
-    out.push_str(&format!(
+    f.op_asm(format!(
         r#"  %q_ti = tensor.empty() : tensor<{nh}x1x{d}xf32>
   %k_ti = tensor.empty() : tensor<{nh}x{mk}x{d}xf32>
   %v_ti = tensor.empty() : tensor<{nh}x{mk}x{d}xf32>
@@ -1506,8 +834,6 @@ func.func private @linear_ih_tok(%x: tensor<1x{i}xf32>, %w: tensor<{h}x{i}xf32>)
   %ctx_t = linalg.transpose ins(%ctx_b : tensor<{nh}x1x{d}xf32>) outs(%ctx_t_i : tensor<1x{nh}x{d}xf32>) permutation = [1, 0, 2]
   %ctx = tensor.collapse_shape %ctx_t [[0], [1, 2]] : tensor<1x{nh}x{d}xf32> into tensor<1x{q}xf32>
   return %ctx, %k_upd, %v_upd : tensor<1x{q}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<{mk}x{nkv}x{d}xf32>
-}}
-
 "#,
         q = q,
         nh = nh,
@@ -1519,101 +845,62 @@ func.func private @linear_ih_tok(%x: tensor<1x{i}xf32>, %w: tensor<{h}x{i}xf32>)
         k_full = k_full,
         v_full = v_full,
     ));
+
+    f.finish(module)
 }
 
-fn emit_rope_at_helper(out: &mut String, mk: u32, nh: u32, d: u32, theta: f32, name: &str) {
-    let half = (d / 2) as usize;
-    let mut cos_rows = Vec::with_capacity(mk as usize);
-    let mut sin_rows = Vec::with_capacity(mk as usize);
-    for pos in 0..mk {
-        let mut cos_row = Vec::with_capacity(half);
-        let mut sin_row = Vec::with_capacity(half);
-        for i in 0..half {
-            let freq = 1.0 / theta.powf((2 * i) as f32 / d as f32);
-            let angle = pos as f32 * freq;
-            cos_row.push(format!("{:.8e}", angle.cos()));
-            sin_row.push(format!("{:.8e}", angle.sin()));
-        }
-        cos_rows.push(format!("[{}]", cos_row.join(", ")));
-        sin_rows.push(format!("[{}]", sin_row.join(", ")));
-    }
-    let cos_lit = cos_rows.join(", ");
-    let sin_lit = sin_rows.join(", ");
-    out.push_str(&format!(
-        r#"func.func private @{name}(%x: tensor<1x{nh}x{d}xf32>, %pos: index) -> tensor<1x{nh}x{d}xf32> {{
-  %cos = arith.constant dense<[{cos_lit}]> : tensor<{mk}x{half}xf32>
-  %sin = arith.constant dense<[{sin_lit}]> : tensor<{mk}x{half}xf32>
-  %init = tensor.empty() : tensor<1x{nh}x{d}xf32>
-  %y = linalg.generic {{
-      indexing_maps = [
-        affine_map<(p, h, dim) -> (p, h, dim)>,
-        affine_map<(p, h, dim) -> (p, h, dim)>
-      ],
-      iterator_types = ["parallel", "parallel", "parallel"]}}
-    ins(%x : tensor<1x{nh}x{d}xf32>) outs(%init : tensor<1x{nh}x{d}xf32>) {{
-    ^bb0(%a: f32, %o: f32):
-      %c0i = arith.constant 0 : index
-      %hh = linalg.index 1 : index
-      %dim = linalg.index 2 : index
-      %half_i = arith.constant {half} : index
-      %in_first = arith.cmpi ult, %dim, %half_i : index
-      %pair_lo = arith.remui %dim, %half_i : index
-      %dim_hi = arith.addi %pair_lo, %half_i : index
-      %x1 = tensor.extract %x[%c0i, %hh, %pair_lo] : tensor<1x{nh}x{d}xf32>
-      %x2 = tensor.extract %x[%c0i, %hh, %dim_hi] : tensor<1x{nh}x{d}xf32>
-      %cv = tensor.extract %cos[%pos, %pair_lo] : tensor<{mk}x{half}xf32>
-      %sv = tensor.extract %sin[%pos, %pair_lo] : tensor<{mk}x{half}xf32>
-      %x1c = arith.mulf %x1, %cv : f32
-      %x2s = arith.mulf %x2, %sv : f32
-      %x1s = arith.mulf %x1, %sv : f32
-      %x2c = arith.mulf %x2, %cv : f32
-      %lo = arith.subf %x1c, %x2s : f32
-      %hi = arith.addf %x1s, %x2c : f32
-      %r = arith.select %in_first, %lo, %hi : f32
-      linalg.yield %r : f32
-  }} -> tensor<1x{nh}x{d}xf32>
-  return %y : tensor<1x{nh}x{d}xf32>
-}}
+fn emit_prefill(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()> {
 
-"#,
-        name = name,
-        mk = mk,
-        nh = nh,
-        d = d,
-        half = half,
-        cos_lit = cos_lit,
-        sin_lit = sin_lit,
-    ));
-}
-
-fn emit_decode(out: &mut String, c: &DenseDecoderConfig) {
-    let (h, v, mk) = (c.hidden, c.vocab, c.max_kv);
+    let (s, h, v) = (c.seq, c.hidden, c.vocab);
     let (q, kv) = (c.q_dim(), c.kv_dim());
     let d = c.head_dim;
-    let nkv = c.num_kv_heads;
-    out.push_str(&format!(
-        "func.func @decode(%token: tensor<i64>, %pos: tensor<i64>, %attn_bias: tensor<{mk}xf32>) -> tensor<{v}xf32> {{\n"
-    ));
+    // Tokens are left-aligned (right-padded). `%last` is the index of the
+    // newest real token so RoPE/causal attention ignore trailing pads.
+    let mut f = module.func("prefill");
+    f.arg("tokens", format!("tensor<{s}xi64>"));
+    f.arg("last", "tensor<i64>");
+    f.result_ty(format!("tensor<{v}xf32>"));
     emit_load_compute(
-        out,
+        &mut f,
         c,
         "emb_t",
         "token_embd_weight",
         "token_embd.weight",
         &format!("{v}x{h}"),
     );
-    out.push_str("  %tok = tensor.extract %token[] : tensor<i64>\n");
-    out.push_str("  %ti = arith.index_cast %tok : i64 to index\n");
-    out.push_str(&format!(
-        "  %row = tensor.extract_slice %emb_t[%ti, 0] [1, {h}] [1, 1] : tensor<{v}x{h}xf32> to tensor<1x{h}xf32>\n"
+
+    // Embedding gather (unrolled).
+    f.op_asm(format!(
+        "  %h_acc0 = tensor.empty() : tensor<{s}x{h}xf32>\n"
     ));
-    let mut h_name = "row".to_string();
+    for pos in 0..s {
+        f.op_asm(format!("  %c{pos}i = arith.constant {pos} : index\n"));
+        f.op_asm(format!(
+            "  %t{pos} = tensor.extract %tokens[%c{pos}i] : tensor<{s}xi64>\n"
+        ));
+        f.op_asm(format!(
+            "  %i{pos} = arith.index_cast %t{pos} : i64 to index\n"
+        ));
+        f.op_asm(format!(
+            "  %r{pos} = tensor.extract_slice %emb_t[%i{pos}, 0] [1, {h}] [1, 1] : tensor<{v}x{h}xf32> to tensor<1x{h}xf32>\n"
+        ));
+        let prev = if pos == 0 {
+            "h_acc0".to_string()
+        } else {
+            format!("h_acc{pos}")
+        };
+        let next = format!("h_acc{}", pos + 1);
+        f.op_asm(format!(
+            "  %{next} = tensor.insert_slice %r{pos} into %{prev}[{pos}, 0] [1, {h}] [1, 1] : tensor<1x{h}xf32> into tensor<{s}x{h}xf32>\n"
+        ));
+    }
+    let mut h_name = format!("h_acc{s}");
 
     for layer in 0..c.num_layers {
         let p = format!("blk{layer}");
         let n = format!("blk.{layer}");
         emit_load_compute(
-            out,
+            &mut f,
             c,
             &format!("{p}_attn_nw"),
             &format!("{p}_attn_norm_weight"),
@@ -1621,7 +908,7 @@ fn emit_decode(out: &mut String, c: &DenseDecoderConfig) {
             &format!("{h}"),
         );
         emit_load_compute(
-            out,
+            &mut f,
             c,
             &format!("{p}_wq"),
             &format!("{p}_attn_q_weight"),
@@ -1629,7 +916,7 @@ fn emit_decode(out: &mut String, c: &DenseDecoderConfig) {
             &format!("{q}x{h}"),
         );
         emit_load_compute(
-            out,
+            &mut f,
             c,
             &format!("{p}_wk"),
             &format!("{p}_attn_k_weight"),
@@ -1637,7 +924,7 @@ fn emit_decode(out: &mut String, c: &DenseDecoderConfig) {
             &format!("{kv}x{h}"),
         );
         emit_load_compute(
-            out,
+            &mut f,
             c,
             &format!("{p}_wv"),
             &format!("{p}_attn_v_weight"),
@@ -1645,7 +932,7 @@ fn emit_decode(out: &mut String, c: &DenseDecoderConfig) {
             &format!("{kv}x{h}"),
         );
         emit_load_compute(
-            out,
+            &mut f,
             c,
             &format!("{p}_wo"),
             &format!("{p}_attn_output_weight"),
@@ -1654,7 +941,7 @@ fn emit_decode(out: &mut String, c: &DenseDecoderConfig) {
         );
         if c.has_qk_norm {
             emit_load_compute(
-                out,
+                &mut f,
                 c,
                 &format!("{p}_qnw"),
                 &format!("{p}_attn_q_norm_weight"),
@@ -1662,7 +949,7 @@ fn emit_decode(out: &mut String, c: &DenseDecoderConfig) {
                 &format!("{d}"),
             );
             emit_load_compute(
-                out,
+                &mut f,
                 c,
                 &format!("{p}_knw"),
                 &format!("{p}_attn_k_norm_weight"),
@@ -1671,7 +958,7 @@ fn emit_decode(out: &mut String, c: &DenseDecoderConfig) {
             );
         }
         emit_load_compute(
-            out,
+            &mut f,
             c,
             &format!("{p}_ffn_nw"),
             &format!("{p}_ffn_norm_weight"),
@@ -1679,7 +966,7 @@ fn emit_decode(out: &mut String, c: &DenseDecoderConfig) {
             &format!("{h}"),
         );
         emit_load_compute(
-            out,
+            &mut f,
             c,
             &format!("{p}_wgate"),
             &format!("{p}_ffn_gate_weight"),
@@ -1687,7 +974,7 @@ fn emit_decode(out: &mut String, c: &DenseDecoderConfig) {
             &format!("{}x{h}", c.intermediate),
         );
         emit_load_compute(
-            out,
+            &mut f,
             c,
             &format!("{p}_wup"),
             &format!("{p}_ffn_up_weight"),
@@ -1695,7 +982,7 @@ fn emit_decode(out: &mut String, c: &DenseDecoderConfig) {
             &format!("{}x{h}", c.intermediate),
         );
         emit_load_compute(
-            out,
+            &mut f,
             c,
             &format!("{p}_wdown"),
             &format!("{p}_ffn_down_weight"),
@@ -1704,63 +991,331 @@ fn emit_decode(out: &mut String, c: &DenseDecoderConfig) {
         );
 
         let xin = h_name.clone();
-        out.push_str(&format!(
-            "  %{p}_xn = func.call @rms_norm_tok(%{xin}, %{p}_attn_nw) : (tensor<1x{h}xf32>, tensor<{h}xf32>) -> tensor<1x{h}xf32>\n"
+        f.op_asm(format!(
+            "  %{p}_xn = func.call @rms_norm(%{xin}, %{p}_attn_nw) : (tensor<{s}x{h}xf32>, tensor<{h}xf32>) -> tensor<{s}x{h}xf32>\n"
         ));
-        out.push_str(&format!(
-            "  %{p}_q = func.call @linear_hq_tok(%{p}_xn, %{p}_wq) : (tensor<1x{h}xf32>, tensor<{q}x{h}xf32>) -> tensor<1x{q}xf32>\n"
+        f.op_asm(format!(
+            "  %{p}_q = func.call @linear_hq(%{p}_xn, %{p}_wq) : (tensor<{s}x{h}xf32>, tensor<{q}x{h}xf32>) -> tensor<{s}x{q}xf32>\n"
         ));
-        out.push_str(&format!(
-            "  %{p}_k = func.call @linear_hkv_tok(%{p}_xn, %{p}_wk) : (tensor<1x{h}xf32>, tensor<{kv}x{h}xf32>) -> tensor<1x{kv}xf32>\n"
+        f.op_asm(format!(
+            "  %{p}_k = func.call @linear_hkv(%{p}_xn, %{p}_wk) : (tensor<{s}x{h}xf32>, tensor<{kv}x{h}xf32>) -> tensor<{s}x{kv}xf32>\n"
         ));
-        out.push_str(&format!(
-            "  %{p}_v = func.call @linear_hkv_tok(%{p}_xn, %{p}_wv) : (tensor<1x{h}xf32>, tensor<{kv}x{h}xf32>) -> tensor<1x{kv}xf32>\n"
+        f.op_asm(format!(
+            "  %{p}_v = func.call @linear_hkv(%{p}_xn, %{p}_wv) : (tensor<{s}x{h}xf32>, tensor<{kv}x{h}xf32>) -> tensor<{s}x{kv}xf32>\n"
         ));
-        out.push_str(&format!(
-            "  %{p}_k3 = tensor.expand_shape %{p}_k [[0], [1, 2]] output_shape [1, {nkv}, {d}] : tensor<1x{kv}xf32> into tensor<1x{nkv}x{d}xf32>\n"
-        ));
-        out.push_str(&format!(
-            "  %{p}_v3 = tensor.expand_shape %{p}_v [[0], [1, 2]] output_shape [1, {nkv}, {d}] : tensor<1x{kv}xf32> into tensor<1x{nkv}x{d}xf32>\n"
-        ));
-        out.push_str(&format!(
+        let nkv = c.num_kv_heads;
+        let mk = c.max_kv;
+        if c.has_qk_norm {
+            f.op_asm(format!(
+                "  %{p}_ctx, %{p}_kc, %{p}_vc = func.call @attn(%{p}_q, %{p}_k, %{p}_v, %{p}_qnw, %{p}_knw) : (tensor<{s}x{q}xf32>, tensor<{s}x{kv}xf32>, tensor<{s}x{kv}xf32>, tensor<{d}xf32>, tensor<{d}xf32>) -> (tensor<{s}x{q}xf32>, tensor<{s}x{nkv}x{d}xf32>, tensor<{s}x{nkv}x{d}xf32>)\n"
+            ));
+        } else {
+            f.op_asm(format!(
+                "  %{p}_ctx, %{p}_kc, %{p}_vc = func.call @attn(%{p}_q, %{p}_k, %{p}_v) : (tensor<{s}x{q}xf32>, tensor<{s}x{kv}xf32>, tensor<{s}x{kv}xf32>) -> (tensor<{s}x{q}xf32>, tensor<{s}x{nkv}x{d}xf32>, tensor<{s}x{nkv}x{d}xf32>)\n"
+            ));
+        }
+        // Seed mutable KV at positions [0, seq).
+        f.op_asm(format!(
             "  %{p}_k_old = util.global.load @kv_k{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
         ));
-        out.push_str(&format!(
+        f.op_asm(format!(
+            "  %{p}_v_old = util.global.load @kv_v{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
+        ));
+        f.op_asm(format!(
+            "  %{p}_k_new = tensor.insert_slice %{p}_kc into %{p}_k_old[0, 0, 0] [{s}, {nkv}, {d}] [1, 1, 1] : tensor<{s}x{nkv}x{d}xf32> into tensor<{mk}x{nkv}x{d}xf32>\n"
+        ));
+        f.op_asm(format!(
+            "  %{p}_v_new = tensor.insert_slice %{p}_vc into %{p}_v_old[0, 0, 0] [{s}, {nkv}, {d}] [1, 1, 1] : tensor<{s}x{nkv}x{d}xf32> into tensor<{mk}x{nkv}x{d}xf32>\n"
+        ));
+        f.op_asm(format!(
+            "  util.global.store %{p}_k_new, @kv_k{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
+        ));
+        f.op_asm(format!(
+            "  util.global.store %{p}_v_new, @kv_v{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
+        ));
+        f.op_asm(format!(
+            "  %{p}_o = func.call @linear_qh(%{p}_ctx, %{p}_wo) : (tensor<{s}x{q}xf32>, tensor<{h}x{q}xf32>) -> tensor<{s}x{h}xf32>\n"
+        ));
+        f.op_asm(format!(
+            "  %{p}_h2 = arith.addf %{xin}, %{p}_o : tensor<{s}x{h}xf32>\n"
+        ));
+        f.op_asm(format!(
+            "  %{p}_fn = func.call @rms_norm(%{p}_h2, %{p}_ffn_nw) : (tensor<{s}x{h}xf32>, tensor<{h}xf32>) -> tensor<{s}x{h}xf32>\n"
+        ));
+        f.op_asm(format!(
+            "  %{p}_gate = func.call @linear_hi(%{p}_fn, %{p}_wgate) : (tensor<{s}x{h}xf32>, tensor<{i}x{h}xf32>) -> tensor<{s}x{i}xf32>\n",
+            i = c.intermediate
+        ));
+        f.op_asm(format!(
+            "  %{p}_up = func.call @linear_hi(%{p}_fn, %{p}_wup) : (tensor<{s}x{h}xf32>, tensor<{i}x{h}xf32>) -> tensor<{s}x{i}xf32>\n",
+            i = c.intermediate
+        ));
+        f.op_asm(format!(
+            r#"  %{p}_silu = linalg.generic {{
+      indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>],
+      iterator_types = ["parallel", "parallel"]}}
+    ins(%{p}_gate : tensor<{s}x{i}xf32>) outs(%{p}_gate : tensor<{s}x{i}xf32>) {{
+    ^bb0(%a: f32, %b: f32):
+      %n = arith.negf %a : f32
+      %e = math.exp %n : f32
+      %one = arith.constant 1.0 : f32
+      %den = arith.addf %one, %e : f32
+      %sg = arith.divf %a, %den : f32
+      linalg.yield %sg : f32
+  }} -> tensor<{s}x{i}xf32>
+"#,
+            i = c.intermediate
+        ));
+        f.op_asm(format!(
+            "  %{p}_ff = arith.mulf %{p}_silu, %{p}_up : tensor<{s}x{i}xf32>\n",
+            i = c.intermediate
+        ));
+        f.op_asm(format!(
+            "  %{p}_down = func.call @linear_ih(%{p}_ff, %{p}_wdown) : (tensor<{s}x{i}xf32>, tensor<{h}x{i}xf32>) -> tensor<{s}x{h}xf32>\n",
+            i = c.intermediate
+        ));
+        f.op_asm(format!(
+            "  %{p}_hout = arith.addf %{p}_h2, %{p}_down : tensor<{s}x{h}xf32>\n"
+        ));
+        h_name = format!("{p}_hout");
+    }
+
+    emit_load_compute(
+        &mut f,
+        c,
+        "out_nw",
+        "output_norm_weight",
+        "output_norm.weight",
+        &format!("{h}"),
+    );
+    emit_load_compute(
+        &mut f,
+        c,
+        "wout",
+        "output_weight",
+        "output.weight",
+        &format!("{v}x{h}"),
+    );
+    f.op_asm("  %last_i64 = tensor.extract %last[] : tensor<i64>\n");
+    f.op_asm("  %li = arith.index_cast %last_i64 : i64 to index\n");
+    f.op_asm(format!(
+        "  %last_row = tensor.extract_slice %{h_name}[%li, 0] [1, {h}] [1, 1] : tensor<{s}x{h}xf32> to tensor<1x{h}xf32>\n"
+    ));
+    // Tile to S for rms_norm helper, take row 0.
+    f.op_asm(format!(
+        "  %last_tile = tensor.empty() : tensor<{s}x{h}xf32>\n"
+    ));
+    f.op_asm(format!(
+        "  %last_s = tensor.insert_slice %last_row into %last_tile[0, 0] [1, {h}] [1, 1] : tensor<1x{h}xf32> into tensor<{s}x{h}xf32>\n"
+    ));
+    f.op_asm(format!(
+        "  %ln = func.call @rms_norm(%last_s, %out_nw) : (tensor<{s}x{h}xf32>, tensor<{h}xf32>) -> tensor<{s}x{h}xf32>\n"
+    ));
+    f.op_asm(format!(
+        "  %ln1 = tensor.extract_slice %ln[0, 0] [1, {h}] [1, 1] : tensor<{s}x{h}xf32> to tensor<1x{h}xf32>\n"
+    ));
+    f.op_asm("  %c0f = arith.constant 0.0 : f32\n");
+    f.op_asm(format!(
+        "  %wt_i = tensor.empty() : tensor<{h}x{v}xf32>\n"
+    ));
+    f.op_asm(format!(
+        "  %wt = linalg.transpose ins(%wout : tensor<{v}x{h}xf32>) outs(%wt_i : tensor<{h}x{v}xf32>) permutation = [1, 0]\n"
+    ));
+    f.op_asm(format!(
+        "  %yi = tensor.empty() : tensor<1x{v}xf32>\n"
+    ));
+    f.op_asm(format!(
+        "  %yz = linalg.fill ins(%c0f : f32) outs(%yi : tensor<1x{v}xf32>) -> tensor<1x{v}xf32>\n"
+    ));
+    f.op_asm(format!(
+        "  %y = linalg.matmul ins(%ln1, %wt : tensor<1x{h}xf32>, tensor<{h}x{v}xf32>) outs(%yz : tensor<1x{v}xf32>) -> tensor<1x{v}xf32>\n"
+    ));
+    f.op_asm(format!(
+        "  %logits = tensor.collapse_shape %y [[0, 1]] : tensor<1x{v}xf32> into tensor<{v}xf32>\n"
+    ));
+    f.op_asm(format!("  return %logits : tensor<{v}xf32>"));
+
+    f.finish(module)
+}
+
+fn emit_decode(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()> {
+
+    let (h, v, mk) = (c.hidden, c.vocab, c.max_kv);
+    let (q, kv) = (c.q_dim(), c.kv_dim());
+    let d = c.head_dim;
+    let nkv = c.num_kv_heads;
+    let mut f = module.func("decode");
+    f.arg("token", "tensor<i64>");
+    f.arg("pos", "tensor<i64>");
+    f.arg("attn_bias", format!("tensor<{mk}xf32>"));
+    f.result_ty(format!("tensor<{v}xf32>"));
+    emit_load_compute(
+        &mut f,
+        c,
+        "emb_t",
+        "token_embd_weight",
+        "token_embd.weight",
+        &format!("{v}x{h}"),
+    );
+    f.op_asm("  %tok = tensor.extract %token[] : tensor<i64>\n");
+    f.op_asm("  %ti = arith.index_cast %tok : i64 to index\n");
+    f.op_asm(format!(
+        "  %row = tensor.extract_slice %emb_t[%ti, 0] [1, {h}] [1, 1] : tensor<{v}x{h}xf32> to tensor<1x{h}xf32>\n"
+    ));
+    let mut h_name = "row".to_string();
+
+    for layer in 0..c.num_layers {
+        let p = format!("blk{layer}");
+        let n = format!("blk.{layer}");
+        emit_load_compute(
+            &mut f,
+            c,
+            &format!("{p}_attn_nw"),
+            &format!("{p}_attn_norm_weight"),
+            &format!("{n}.attn_norm.weight"),
+            &format!("{h}"),
+        );
+        emit_load_compute(
+            &mut f,
+            c,
+            &format!("{p}_wq"),
+            &format!("{p}_attn_q_weight"),
+            &format!("{n}.attn_q.weight"),
+            &format!("{q}x{h}"),
+        );
+        emit_load_compute(
+            &mut f,
+            c,
+            &format!("{p}_wk"),
+            &format!("{p}_attn_k_weight"),
+            &format!("{n}.attn_k.weight"),
+            &format!("{kv}x{h}"),
+        );
+        emit_load_compute(
+            &mut f,
+            c,
+            &format!("{p}_wv"),
+            &format!("{p}_attn_v_weight"),
+            &format!("{n}.attn_v.weight"),
+            &format!("{kv}x{h}"),
+        );
+        emit_load_compute(
+            &mut f,
+            c,
+            &format!("{p}_wo"),
+            &format!("{p}_attn_output_weight"),
+            &format!("{n}.attn_output.weight"),
+            &format!("{h}x{q}"),
+        );
+        if c.has_qk_norm {
+            emit_load_compute(
+                &mut f,
+                c,
+                &format!("{p}_qnw"),
+                &format!("{p}_attn_q_norm_weight"),
+                &format!("{n}.attn_q_norm.weight"),
+                &format!("{d}"),
+            );
+            emit_load_compute(
+                &mut f,
+                c,
+                &format!("{p}_knw"),
+                &format!("{p}_attn_k_norm_weight"),
+                &format!("{n}.attn_k_norm.weight"),
+                &format!("{d}"),
+            );
+        }
+        emit_load_compute(
+            &mut f,
+            c,
+            &format!("{p}_ffn_nw"),
+            &format!("{p}_ffn_norm_weight"),
+            &format!("{n}.ffn_norm.weight"),
+            &format!("{h}"),
+        );
+        emit_load_compute(
+            &mut f,
+            c,
+            &format!("{p}_wgate"),
+            &format!("{p}_ffn_gate_weight"),
+            &format!("{n}.ffn_gate.weight"),
+            &format!("{}x{h}", c.intermediate),
+        );
+        emit_load_compute(
+            &mut f,
+            c,
+            &format!("{p}_wup"),
+            &format!("{p}_ffn_up_weight"),
+            &format!("{n}.ffn_up.weight"),
+            &format!("{}x{h}", c.intermediate),
+        );
+        emit_load_compute(
+            &mut f,
+            c,
+            &format!("{p}_wdown"),
+            &format!("{p}_ffn_down_weight"),
+            &format!("{n}.ffn_down.weight"),
+            &format!("{h}x{}", c.intermediate),
+        );
+
+        let xin = h_name.clone();
+        f.op_asm(format!(
+            "  %{p}_xn = func.call @rms_norm_tok(%{xin}, %{p}_attn_nw) : (tensor<1x{h}xf32>, tensor<{h}xf32>) -> tensor<1x{h}xf32>\n"
+        ));
+        f.op_asm(format!(
+            "  %{p}_q = func.call @linear_hq_tok(%{p}_xn, %{p}_wq) : (tensor<1x{h}xf32>, tensor<{q}x{h}xf32>) -> tensor<1x{q}xf32>\n"
+        ));
+        f.op_asm(format!(
+            "  %{p}_k = func.call @linear_hkv_tok(%{p}_xn, %{p}_wk) : (tensor<1x{h}xf32>, tensor<{kv}x{h}xf32>) -> tensor<1x{kv}xf32>\n"
+        ));
+        f.op_asm(format!(
+            "  %{p}_v = func.call @linear_hkv_tok(%{p}_xn, %{p}_wv) : (tensor<1x{h}xf32>, tensor<{kv}x{h}xf32>) -> tensor<1x{kv}xf32>\n"
+        ));
+        f.op_asm(format!(
+            "  %{p}_k3 = tensor.expand_shape %{p}_k [[0], [1, 2]] output_shape [1, {nkv}, {d}] : tensor<1x{kv}xf32> into tensor<1x{nkv}x{d}xf32>\n"
+        ));
+        f.op_asm(format!(
+            "  %{p}_v3 = tensor.expand_shape %{p}_v [[0], [1, 2]] output_shape [1, {nkv}, {d}] : tensor<1x{kv}xf32> into tensor<1x{nkv}x{d}xf32>\n"
+        ));
+        f.op_asm(format!(
+            "  %{p}_k_old = util.global.load @kv_k{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
+        ));
+        f.op_asm(format!(
             "  %{p}_v_old = util.global.load @kv_v{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
         ));
         if c.has_qk_norm {
-            out.push_str(&format!(
+            f.op_asm(format!(
                 "  %{p}_ctx, %{p}_k_new, %{p}_v_new = func.call @attn_decode(%{p}_q, %{p}_k_old, %{p}_v_old, %{p}_k3, %{p}_v3, %pos, %attn_bias, %{p}_qnw, %{p}_knw) : (tensor<1x{q}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<1x{nkv}x{d}xf32>, tensor<1x{nkv}x{d}xf32>, tensor<i64>, tensor<{mk}xf32>, tensor<{d}xf32>, tensor<{d}xf32>) -> (tensor<1x{q}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<{mk}x{nkv}x{d}xf32>)\n"
             ));
         } else {
-            out.push_str(&format!(
+            f.op_asm(format!(
                 "  %{p}_ctx, %{p}_k_new, %{p}_v_new = func.call @attn_decode(%{p}_q, %{p}_k_old, %{p}_v_old, %{p}_k3, %{p}_v3, %pos, %attn_bias) : (tensor<1x{q}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<1x{nkv}x{d}xf32>, tensor<1x{nkv}x{d}xf32>, tensor<i64>, tensor<{mk}xf32>) -> (tensor<1x{q}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<{mk}x{nkv}x{d}xf32>)\n"
             ));
         }
-        out.push_str(&format!(
+        f.op_asm(format!(
             "  util.global.store %{p}_k_new, @kv_k{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
         ));
-        out.push_str(&format!(
+        f.op_asm(format!(
             "  util.global.store %{p}_v_new, @kv_v{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
         ));
-        out.push_str(&format!(
+        f.op_asm(format!(
             "  %{p}_o = func.call @linear_qh_tok(%{p}_ctx, %{p}_wo) : (tensor<1x{q}xf32>, tensor<{h}x{q}xf32>) -> tensor<1x{h}xf32>\n"
         ));
-        out.push_str(&format!(
+        f.op_asm(format!(
             "  %{p}_h2 = arith.addf %{xin}, %{p}_o : tensor<1x{h}xf32>\n"
         ));
-        out.push_str(&format!(
+        f.op_asm(format!(
             "  %{p}_fn = func.call @rms_norm_tok(%{p}_h2, %{p}_ffn_nw) : (tensor<1x{h}xf32>, tensor<{h}xf32>) -> tensor<1x{h}xf32>\n"
         ));
-        out.push_str(&format!(
+        f.op_asm(format!(
             "  %{p}_gate = func.call @linear_hi_tok(%{p}_fn, %{p}_wgate) : (tensor<1x{h}xf32>, tensor<{i}x{h}xf32>) -> tensor<1x{i}xf32>\n",
             i = c.intermediate
         ));
-        out.push_str(&format!(
+        f.op_asm(format!(
             "  %{p}_up = func.call @linear_hi_tok(%{p}_fn, %{p}_wup) : (tensor<1x{h}xf32>, tensor<{i}x{h}xf32>) -> tensor<1x{i}xf32>\n",
             i = c.intermediate
         ));
-        out.push_str(&format!(
+        f.op_asm(format!(
             r#"  %{p}_silu = linalg.generic {{
       indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>],
       iterator_types = ["parallel", "parallel"]}}
@@ -1776,22 +1331,22 @@ fn emit_decode(out: &mut String, c: &DenseDecoderConfig) {
 "#,
             i = c.intermediate
         ));
-        out.push_str(&format!(
+        f.op_asm(format!(
             "  %{p}_ff = arith.mulf %{p}_silu, %{p}_up : tensor<1x{i}xf32>\n",
             i = c.intermediate
         ));
-        out.push_str(&format!(
+        f.op_asm(format!(
             "  %{p}_down = func.call @linear_ih_tok(%{p}_ff, %{p}_wdown) : (tensor<1x{i}xf32>, tensor<{h}x{i}xf32>) -> tensor<1x{h}xf32>\n",
             i = c.intermediate
         ));
-        out.push_str(&format!(
+        f.op_asm(format!(
             "  %{p}_hout = arith.addf %{p}_h2, %{p}_down : tensor<1x{h}xf32>\n"
         ));
         h_name = format!("{p}_hout");
     }
 
     emit_load_compute(
-        out,
+        &mut f,
         c,
         "out_nw",
         "output_norm_weight",
@@ -1799,33 +1354,36 @@ fn emit_decode(out: &mut String, c: &DenseDecoderConfig) {
         &format!("{h}"),
     );
     emit_load_compute(
-        out,
+        &mut f,
         c,
         "wout",
         "output_weight",
         "output.weight",
         &format!("{v}x{h}"),
     );
-    out.push_str(&format!(
+    f.op_asm(format!(
         "  %ln = func.call @rms_norm_tok(%{h_name}, %out_nw) : (tensor<1x{h}xf32>, tensor<{h}xf32>) -> tensor<1x{h}xf32>\n"
     ));
-    out.push_str("  %c0f = arith.constant 0.0 : f32\n");
-    out.push_str(&format!("  %wt_i = tensor.empty() : tensor<{h}x{v}xf32>\n"));
-    out.push_str(&format!(
+    f.op_asm("  %c0f = arith.constant 0.0 : f32\n");
+    f.op_asm(format!("  %wt_i = tensor.empty() : tensor<{h}x{v}xf32>\n"));
+    f.op_asm(format!(
         "  %wt = linalg.transpose ins(%wout : tensor<{v}x{h}xf32>) outs(%wt_i : tensor<{h}x{v}xf32>) permutation = [1, 0]\n"
     ));
-    out.push_str(&format!("  %yi = tensor.empty() : tensor<1x{v}xf32>\n"));
-    out.push_str(&format!(
+    f.op_asm(format!("  %yi = tensor.empty() : tensor<1x{v}xf32>\n"));
+    f.op_asm(format!(
         "  %yz = linalg.fill ins(%c0f : f32) outs(%yi : tensor<1x{v}xf32>) -> tensor<1x{v}xf32>\n"
     ));
-    out.push_str(&format!(
+    f.op_asm(format!(
         "  %y = linalg.matmul ins(%ln, %wt : tensor<1x{h}xf32>, tensor<{h}x{v}xf32>) outs(%yz : tensor<1x{v}xf32>) -> tensor<1x{v}xf32>\n"
     ));
-    out.push_str(&format!(
+    f.op_asm(format!(
         "  %logits = tensor.collapse_shape %y [[0, 1]] : tensor<1x{v}xf32> into tensor<{v}xf32>\n"
     ));
-    out.push_str(&format!("  return %logits : tensor<{v}xf32>\n}}\n\n"));
+    f.op_asm(format!("  return %logits : tensor<{v}xf32>"));
+
+    f.finish(module)
 }
+
 
 #[cfg(test)]
 mod tests {
