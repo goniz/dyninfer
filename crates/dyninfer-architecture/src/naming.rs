@@ -1,6 +1,26 @@
-//! HuggingFace Transformers → GGUF-style canonical parameter names.
+//! HF Transformers → GGUF-style canonical names (llama.cpp `TENSOR_NAMES`).
 //!
-//! Shared by Llama-family and Qwen3 architectures (same Transformers layout).
+//! # Why this exists
+//!
+//! Checkpoints arrive with **container-native** keys:
+//! - SafeTensors / HF: `model.layers.0.self_attn.q_proj.weight`
+//! - GGUF: `blk.0.attn_q.weight`
+//!
+//! Architecture slots and the dense emitter speak **one** canonical vocabulary
+//! (GGUF-style). This module is the HF→canonical table for decoder layouts that
+//! share Transformers' Llama/Mistral/Qwen3 module paths. GGUF keys pass through
+//! unchanged. Returns `None` only for non-weights (RoPE caches / `inv_freq`).
+//!
+//! Tied embeddings (`lm_head` absent) are handled later by
+//! [`tie_output_to_embed`], not here.
+//!
+//! # Onboarding a new architecture
+//!
+//! Reuse this helper **only** if the HF weight tree matches this table.
+//! Otherwise implement `ArchitectureDefinition::canonicalize_param` in the
+//! arch file with its own map — do not grow this into a mega-registry.
+//! Verified against llama.cpp `gguf/constants.py` (`TENSOR_NAMES`) /
+//! `tensor_mapping.py`.
 
 /// Skip tensor, or map HF key → canonical, or keep non-HF keys as-is.
 pub fn canonicalize_hf_family(key: &str) -> Option<String> {

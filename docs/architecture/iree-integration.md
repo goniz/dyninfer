@@ -51,6 +51,7 @@ Meta-1B-scale models still fall back to the constant-logits bridge.
 
 ## Next steps
 
-1. Opt-in `@iree_core` source build (see `SOURCE.md`).
-2. In-process runtime C API (`iree-runtime-sys`) replacing `iree-run-module`.
-3. Explicit KV-cache ABI (M1 uses host history + static-window `@prefill`).
+1. Grow high-level `ModelBuilder` / kernel helpers so architecture emitters stop
+   hand-authoring large `linalg` asm blobs (melior bindings ≠ a zml-like DSL).
+2. Optional bf16/fp16 compute dtype gated on target HAL (M1 uses f32).
+3. Drop wheel `iree-run-module` once device discovery is fully in-process.

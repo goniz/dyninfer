@@ -26,6 +26,8 @@ static CONFIG_SCHEMA: LazyLock<ConfigSchema> = LazyLock::new(|| ConfigSchema {
         field("context_length", "u32", true, Some(serde_json::json!(40960))),
         field("rms_norm_eps", "f64", false, Some(serde_json::json!(1e-6))),
         field("rope_theta", "f64", false, Some(serde_json::json!(1_000_000.0))),
+        field("prefill_window", "u32", false, None),
+        field("max_kv", "u32", false, None),
     ],
 });
 

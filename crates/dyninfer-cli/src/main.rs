@@ -98,6 +98,12 @@ enum Commands {
         max_new_tokens: usize,
         #[arg(long)]
         output_bundle: Option<PathBuf>,
+        /// Prefill token window baked into the compiled executable (recompile to change).
+        #[arg(long)]
+        prefill_window: Option<u32>,
+        /// Mutable KV capacity baked into the executable (`>= prefill_window`).
+        #[arg(long)]
+        max_kv: Option<u32>,
     },
     /// Compile and run the trivial `@add` smoke module through real IREE.
     Smoke {
@@ -323,6 +329,8 @@ fn main() -> anyhow::Result<()> {
             prompt,
             max_new_tokens,
             output_bundle,
+            prefill_window,
+            max_kv,
         } => {
             let model_dir = match (hf, model_dir) {
                 (Some(repo), None) => {
@@ -343,7 +351,14 @@ fn main() -> anyhow::Result<()> {
             let loader = ModelLoader::default();
             let id = loader.resolve_architecture(Some(&architecture), &ckpt)?;
             eprintln!("architecture {}", id);
-            let paths = loader.compile_to_bundle(
+            let mut overrides = dyninfer_core::MetadataMap::new();
+            if let Some(w) = prefill_window {
+                overrides.insert("prefill_window".into(), serde_json::json!(w));
+            }
+            if let Some(k) = max_kv {
+                overrides.insert("max_kv".into(), serde_json::json!(k));
+            }
+            let paths = loader.compile_to_bundle_with_overrides(
                 &id,
                 &ckpt,
                 &target,
@@ -352,6 +367,7 @@ fn main() -> anyhow::Result<()> {
                     mode: "local-jit".into(),
                     ..Default::default()
                 },
+                &overrides,
             )?;
             let model = loader.load_bundle(&paths.root, &ckpt)?;
             let tokenizer = load_tokenizer(&model_dir)?;

@@ -15,6 +15,9 @@ use dyninfer_core::ArchitectureId;
 use dyninfer_error::{CompilationError, DynInferError, Result};
 use std::sync::LazyLock;
 
+/// Declares which hyperparams this arch reads from `--set` / config.json / GGUF
+/// metadata. Defaults are used only when a key is absent (synthetic fixture /
+/// incomplete metadata) — real HF checkpoints override every required field.
 static CONFIG_SCHEMA: LazyLock<ConfigSchema> = LazyLock::new(|| ConfigSchema {
     fields: vec![
         field("num_layers", "u32", true, Some(serde_json::json!(2))),
@@ -27,6 +30,9 @@ static CONFIG_SCHEMA: LazyLock<ConfigSchema> = LazyLock::new(|| ConfigSchema {
         field("context_length", "u32", true, Some(serde_json::json!(2048))),
         field("rms_norm_eps", "f64", false, Some(serde_json::json!(1e-5))),
         field("rope_theta", "f64", false, None),
+        // Compile-time specialization shapes (override dense-emitter heuristics).
+        field("prefill_window", "u32", false, None),
+        field("max_kv", "u32", false, None),
     ],
 });
 
@@ -46,6 +52,11 @@ impl ArchitectureDefinition for LlamaArchitecture {
         &CONFIG_SCHEMA
     }
 
+    /// HF `model_type` / `architectures[]` stems routed here.
+    ///
+    /// Mistral shares Llama's Transformers weight layout
+    /// (`self_attn.*_proj`, SwiGLU `mlp.*`, same layernorm names), so it maps to
+    /// this arch — same choice as mlx-lm / llama.cpp convert scripts.
     fn model_types(&self) -> &[&str] {
         &[
             "llama",
@@ -76,6 +87,7 @@ impl ArchitectureDefinition for LlamaArchitecture {
     }
 
     fn canonicalize_param(&self, key: &str) -> Option<String> {
+        // HF → GGUF-style names; verified against llama.cpp TENSOR_NAMES.
         canonicalize_hf_family(key)
     }
 

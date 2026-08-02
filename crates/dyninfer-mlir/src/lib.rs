@@ -4,6 +4,15 @@
 //! narrow C API wrapper (melior-style), verifies it, then lowers. This crate is
 //! that wrapper — dialects known to IREE (including `util` / `stream`) are
 //! registered via `ireeCompilerRegisterDialects`.
+//!
+//! # Melior vs a tensor DSL
+//!
+//! [melior](https://github.com/mlir-rs/melior) (and this crate) are **MLIR C API
+//! bindings**: Context / Module / OperationBuilder / dialect helpers. They do
+//! **not** compile Rust (or Zig) into graphs the way [zml](https://github.com/zml/zml)
+//! does (Zig `Tensor` API → StableHLO → PJRT). Graph volume for Llama/Qwen lives
+//! in `dyninfer-architecture` emitters; shrinking that means higher-level
+//! `ModelBuilder` / kernel helpers, not switching binding crates.
 
 mod attribute;
 mod builder;

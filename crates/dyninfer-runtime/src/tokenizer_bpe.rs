@@ -442,12 +442,38 @@ mod tests {
 
     #[test]
     fn encodes_once_upon_a_time() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../architectures/testdata/maykeye-tinyllama-v0/tokenizer.json");
-        if !path.is_file() {
-            eprintln!("skip: tokenizer fixture missing");
+        // Prefer HF Hub cache (weights/tokenizer are not vendored in-repo).
+        let path = if let Ok(home) = std::env::var("HOME") {
+            let hub = Path::new(&home).join(".cache/huggingface/hub");
+            let mut found = None;
+            if let Ok(rd) = fs::read_dir(&hub) {
+                for ent in rd.flatten() {
+                    let name = ent.file_name();
+                    let name = name.to_string_lossy();
+                    if name.contains("TinyLLama-v0") || name.contains("tinyllama") {
+                        if let Ok(snaps) = fs::read_dir(ent.path().join("snapshots")) {
+                            for snap in snaps.flatten() {
+                                let tok = snap.path().join("tokenizer.json");
+                                if tok.is_file() {
+                                    found = Some(tok);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if found.is_some() {
+                        break;
+                    }
+                }
+            }
+            found
+        } else {
+            None
+        };
+        let Some(path) = path else {
+            eprintln!("skip: Maykeye/TinyLLama-v0 tokenizer not in HF cache");
             return;
-        }
+        };
         let tok = BpeTokenizer::from_file(&path).unwrap();
         assert!(!tok.is_byte_level());
         let ids = tok.encode("Once upon a time", true).unwrap();

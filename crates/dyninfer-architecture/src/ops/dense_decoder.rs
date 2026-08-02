@@ -1,12 +1,28 @@
 //! Shared dense causal-decoder MLIR emitter (ops library).
 //!
 //! Architecture files (`models/*`) configure [`DenseDecoderConfig`] and call
-//! [`emit_dense_decoder`]. Supports MHA/GQA, independent `head_dim`, optional
+//! [`emit_dense_decoder_cfg`]. Supports MHA/GQA, independent `head_dim`, optional
 //! Q/K RMSNorm, and HuggingFace Llama/Qwen-style (`rotate_half`) RoPE.
 //!
 //! Weight globals always use the per-tensor dtype from the checkpoint catalog.
 //! Activations / logits use [`COMPUTE_DTYPE`] (currently f32); narrower float
 //! weights are cast after load.
+//!
+//! # Prefill / KV sizes
+//!
+//! `seq` / `max_kv` are **compile-time specialization shapes** baked into the
+//! MLIR (static `tensor<Sx…>` types). They are not runtime generate knobs —
+//! changing them requires a recompile. Defaults below are PoC-sized so CPU
+//! compile + e2e stays tractable; override via config
+//! (`--set prefill_window=N --set max_kv=M` or CLI `--prefill-window` /
+//! `--max-kv` on `generate`).
+//!
+//! # Emission style
+//!
+//! Large blocks still use `FuncBuilder::op_asm` for region-heavy `linalg`
+//! ops. That is assembly buffered then verified — same abstraction level as
+//! melior bindings, **not** a zml-like tensor DSL. Follow-up is higher-level
+//! helpers (`attn`, `rope`, …), not switching IR frontends.
 
 use crate::ops::kernels;
 use crate::ArchitecturePackage;
@@ -16,7 +32,7 @@ use dyninfer_error::Result;
 use dyninfer_mlir::{FuncBuilder, ModuleBuilder};
 use std::collections::BTreeMap;
 
-/// Default static prefill window for mid-size dense models.
+/// Default static prefill window for mid-size dense models (e.g. Maykeye 64-d).
 pub const PREFILL_WINDOW: u32 = 64;
 /// Smaller window for large models (Qwen3-0.6B) to keep compile/runtime tractable.
 pub const LARGE_PREFILL_WINDOW: u32 = 32;
@@ -31,6 +47,10 @@ pub const LARGE_MAX_KV: u32 = 256;
 pub const TINY_MAX_KV: u32 = 4;
 
 /// Activation / logits compute type. Independent of on-disk weight dtypes.
+///
+/// Fixed to f32 for Milestone-1 correctness (matches the Rust reference path).
+/// bf16/fp16 compute is a follow-up gated on target HAL support — not a
+/// checkpoint property.
 pub const COMPUTE_DTYPE: ScalarType = ScalarType::F32;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -94,7 +114,12 @@ impl DenseDecoderConfig {
             }
             default
         };
-        let hidden = u(&["hidden_size", "llama.embedding_length"], 64);
+        let hidden = u(
+            // HF config.json keys, then GGUF metadata aliases (`llama.*` is the
+            // GGUF namespace even when the arch file is Qwen — not Llama-specific).
+            &["hidden_size", "llama.embedding_length"],
+            64,
+        );
         let num_heads = u(&["num_heads", "llama.attention.head_count"], 4);
         let num_kv_heads = u(
             &["num_kv_heads", "llama.attention.head_count_kv"],
@@ -106,15 +131,20 @@ impl DenseDecoderConfig {
             1,
         );
         let head_dim = u(&["head_dim"], hidden / num_heads.max(1));
-        let is_tiny = vocab == 32 && hidden == 64 && num_heads == 4;
+        // Heuristic buckets when the caller did not pass explicit shapes.
+        // Values are intentionally small for PoC compile times.
+        let is_synthetic = vocab == 32 && hidden == 64 && num_heads == 4;
         let is_large = vocab > 50_000 || num_layers > 16 || hidden >= 1024;
-        let (seq, max_kv) = if is_tiny {
+        let (default_seq, default_max_kv) = if is_synthetic {
             (TINY_PREFILL_WINDOW, TINY_MAX_KV)
         } else if is_large {
             (LARGE_PREFILL_WINDOW, LARGE_MAX_KV)
         } else {
             (PREFILL_WINDOW, PREFILL_MAX_KV)
         };
+        // Explicit overrides win (CLI `--prefill-window` / `--set prefill_window=`).
+        let seq = u(&["prefill_window"], default_seq);
+        let max_kv = u(&["max_kv"], default_max_kv);
         let rope_theta = meta
             .get("rope_theta")
             .and_then(|v| v.as_f64())
@@ -149,7 +179,7 @@ impl DenseDecoderConfig {
             seq,
             max_kv: max_kv.max(seq),
             rms_norm_eps: f(&["rms_norm_eps"], 1e-5),
-            rope_theta: if is_tiny {
+            rope_theta: if is_synthetic {
                 None
             } else {
                 rope_theta.or(Some(10000.0))
@@ -176,7 +206,9 @@ impl DenseDecoderConfig {
             .unwrap_or(ScalarType::F32)
     }
 
-    pub fn is_tiny_m1(&self) -> bool {
+    /// True for the synthetic Milestone-1 fixture (`tiny_llama_dense_f32`):
+    /// vocab=32, hidden=64, 1 layer, seq=4, no RoPE — used by differential e2e.
+    pub fn is_synthetic_fixture(&self) -> bool {
         self.vocab == 32
             && self.hidden == 64
             && self.intermediate == 128
@@ -203,7 +235,8 @@ impl DenseDecoderConfig {
             && self.hidden <= 2048
             && self.head_dim <= 256
             && self.q_dim() <= 4096
-            && (self.seq == 4 || self.seq == 32 || self.seq == 64)
+            && self.seq >= 1
+            && self.seq <= 256
             && self.max_kv >= self.seq
             && self.max_kv <= 512
     }
@@ -558,6 +591,8 @@ fn emit_attn(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()> {
     };
 
     f.op_asm(format!(
+        // Region-heavy linalg still emitted as verified assembly snippets.
+        // Typed OperationBuilder helpers would not shrink this meaningfully yet.
         r#"  %q_ti = tensor.empty() : tensor<{nh}x{s}x{d}xf32>
   %k_ti = tensor.empty() : tensor<{nh}x{s}x{d}xf32>
   %v_ti = tensor.empty() : tensor<{nh}x{s}x{d}xf32>
@@ -850,6 +885,9 @@ fn emit_decode_helpers(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Re
 }
 
 fn emit_prefill(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()> {
+    // Prefill is still largely `op_asm` for region-bearing linalg. Typed
+    // melior/IREE dialect helpers cover single ops; they do not remove the need
+    // to author the graph. See crate-level docs in `dyninfer-mlir`.
 
     let (s, h, v) = (c.seq, c.hidden, c.vocab);
     let (q, kv) = (c.q_dim(), c.kv_dim());
@@ -1437,7 +1475,7 @@ mod tests {
             param_dtypes: BTreeMap::new(),
         };
         assert!(c.supports_dense_emit());
-        assert!(c.is_tiny_m1());
+        assert!(c.is_synthetic_fixture());
     }
 
     #[test]

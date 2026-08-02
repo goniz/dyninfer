@@ -1,8 +1,10 @@
 """IREE integration: source module (`@iree_core`) + pinned prebuilt wheels.
 
-- Source: `bazel_dep` + `git_override` on `iree_core` (see MODULE.bazel).
+- Source: `bazel_dep` + `git_override` on `iree_core` (see MODULE.bazel) —
+  in-process runtime C API (`:runtime_cc`).
 - Wheels: manylinux `iree-compile` / `iree-run-module` / `libIREECompiler.so`
-  for the existing tool-backed compile/run path.
+  for compile + HAL discovery (`--dump_devices`). Wheels remain even while the
+  source runtime is linked: the CLI tools are not produced by `:runtime_cc`.
 """
 
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
