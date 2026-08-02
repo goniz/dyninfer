@@ -1,6 +1,6 @@
 [package]
 name = "dyninfer-architecture"
-description = "Architecture registry, config schema, and package model"
+description = "Architecture registry, config schema, package model, and built-in model graphs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

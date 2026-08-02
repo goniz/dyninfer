@@ -3,13 +3,12 @@
 #[cfg(test)]
 mod tests {
     use crate::{
-        generate_greedy, load_tokenizer, resolve_hf_snapshot, CausalLanguageModel, GenerateConfig,
-        ModelLoader,
+        generate_greedy, load_tokenizer, resolve_hf_snapshot, GenerateConfig, ModelLoader,
     };
     use crate::find_safetensors_checkpoint;
     use dyninfer_compiler::{CompileOptions, IreeTools};
     use dyninfer_core::{ArchitectureId, SessionConfig};
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     fn iree_available() -> bool {
         IreeTools::discover().is_ok()
@@ -24,40 +23,8 @@ mod tests {
                 return Some(p);
             }
         }
-        // Prefer the user's Hugging Face Hub cache (no vendored copy required).
-        if let Ok(snap) = resolve_hf_snapshot("Maykeye/TinyLLama-v0", Some("main")) {
-            return Some(snap);
-        }
-        // Bazel runfiles / vendored testdata fallback.
-        let candidates = [
-            "architectures/testdata/maykeye-tinyllama-v0",
-            "maykeye-tinyllama-v0",
-            "../architectures/testdata/maykeye-tinyllama-v0",
-            "../../architectures/testdata/maykeye-tinyllama-v0",
-        ];
-        for c in candidates {
-            let p = PathBuf::from(c);
-            if find_safetensors_checkpoint(&p).is_ok() {
-                return Some(p);
-            }
-        }
-        if let Ok(src) = std::env::var("TEST_SRCDIR") {
-            let p = Path::new(&src)
-                .join("_main")
-                .join("architectures/testdata/maykeye-tinyllama-v0");
-            if find_safetensors_checkpoint(&p).is_ok() {
-                return Some(p);
-            }
-        }
-        if let Ok(rf) = std::env::var("RUNFILES_DIR") {
-            let p = Path::new(&rf)
-                .join("_main")
-                .join("architectures/testdata/maykeye-tinyllama-v0");
-            if find_safetensors_checkpoint(&p).is_ok() {
-                return Some(p);
-            }
-        }
-        None
+        // Hugging Face Hub cache only — weights are not vendored in-repo.
+        resolve_hf_snapshot("Maykeye/TinyLLama-v0", Some("main")).ok()
     }
 
     #[test]
@@ -67,7 +34,9 @@ mod tests {
             return;
         }
         let Some(model_dir) = maykeye_dir() else {
-            eprintln!("skipping: Maykeye/TinyLLama-v0 not in HF cache or testdata");
+            eprintln!(
+                "skipping: Maykeye/TinyLLama-v0 not in HF cache (hf download Maykeye/TinyLLama-v0)"
+            );
             return;
         };
         eprintln!("maykeye model_dir={}", model_dir.display());

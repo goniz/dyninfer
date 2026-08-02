@@ -9,7 +9,6 @@ rust_binary(
     aliases = aliases(),
     data = [
         "//bazel/iree:tools",
-        "//architectures/testdata:maykeye_tinyllama_v0",
     ],
     deps = all_crate_deps(normal = True),
     visibility = ["//visibility:public"],

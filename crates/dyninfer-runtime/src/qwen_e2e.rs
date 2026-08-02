@@ -6,7 +6,7 @@ mod tests {
         find_safetensors_checkpoint, generate_greedy, load_tokenizer, resolve_hf_snapshot,
         CausalLanguageModel, GenerateConfig, ModelLoader,
     };
-    use dyninfer_architectures::LARGE_PREFILL_WINDOW;
+    use dyninfer_architecture::LARGE_PREFILL_WINDOW;
     use dyninfer_compiler::{CompileOptions, IreeTools};
     use dyninfer_core::{ArchitectureId, SessionConfig};
     use std::path::{Path, PathBuf};

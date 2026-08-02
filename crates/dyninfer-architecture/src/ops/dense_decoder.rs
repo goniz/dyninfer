@@ -9,7 +9,7 @@
 //! weights are cast after load.
 
 use crate::ops::kernels;
-use dyninfer_architecture::ArchitecturePackage;
+use crate::ArchitecturePackage;
 use dyninfer_checkpoint::CheckpointCatalog;
 use dyninfer_core::{ScalarType, StorageElementType};
 use dyninfer_error::Result;

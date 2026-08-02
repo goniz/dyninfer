@@ -32,8 +32,8 @@ pub fn field(
     ty: &str,
     required: bool,
     default: Option<serde_json::Value>,
-) -> dyninfer_architecture::ConfigField {
-    dyninfer_architecture::ConfigField {
+) -> crate::ConfigField {
+    crate::ConfigField {
         name: name.into(),
         ty: ty.into(),
         required,

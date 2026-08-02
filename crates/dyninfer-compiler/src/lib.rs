@@ -2,7 +2,7 @@
 //! `iree-compile` subprocess fallback.
 //!
 //! Architecture-specific MLIR is supplied by the caller (from
-//! `dyninfer-architectures`); this crate only drives IREE.
+//! `dyninfer-architecture`); this crate only drives IREE.
 
 #![forbid(unsafe_code)]
 

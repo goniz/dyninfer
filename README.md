@@ -31,11 +31,11 @@ Differential check: `bazel test //crates/dyninfer-runtime:dyninfer-runtime_tests
 ### Real TinyStories Llama example
 
 Uses ungated [Maykeye/TinyLLama-v0](https://huggingface.co/Maykeye/TinyLLama-v0)
-(~9MB BF16 Llama). Prefer the local Hugging Face Hub cache
-(`HF_HUB_CACHE` / `~/.cache/huggingface/hub`); testdata is only a fallback.
+(~9MB BF16 Llama) from the local Hugging Face Hub cache
+(`HF_HUB_CACHE` / `~/.cache/huggingface/hub`).
 ### Qwen3-0.6B (GQA + Q/K norm)
 
-Architectures live in [`crates/dyninfer-architectures`](crates/dyninfer-architectures)
+Built-in model graphs live in [`crates/dyninfer-architecture`](crates/dyninfer-architecture)
 (`models/llama.rs`, `models/qwen3.rs`, …). CLI defaults to `--architecture auto`
 (from `config.json` `model_type`).
 
@@ -55,8 +55,8 @@ bazel run //crates/dyninfer-cli:dyninfer -- generate \
 ### TinyStories Llama example
 
 Uses ungated [Maykeye/TinyLLama-v0](https://huggingface.co/Maykeye/TinyLLama-v0)
-(~9MB BF16 Llama). Prefer the local Hugging Face Hub cache
-(`HF_HUB_CACHE` / `~/.cache/huggingface/hub`); testdata is only a fallback.
+(~9MB BF16 Llama) from the local Hugging Face Hub cache
+(`HF_HUB_CACHE` / `~/.cache/huggingface/hub`).
 
 ```bash
 # one-time: populate the Hub cache
@@ -77,7 +77,8 @@ Bazel is the primary build: it fetches pinned IREE tools via `MODULE.bazel`
 bazel build //crates/dyninfer-cli:dyninfer
 bazel test //crates/... //bazel/iree:iree_tools_smoke
 bazel run //crates/dyninfer-cli:dyninfer -- smoke
-bazel run //crates/dyninfer-cli:dyninfer -- checkpoint inspect architectures/testdata/tiny-llama.safetensors
+# after: hf download Maykeye/TinyLLama-v0
+bazel run //crates/dyninfer-cli:dyninfer -- generate --hf Maykeye/TinyLLama-v0 --prompt "Hello"
 ```
 
 Cargo remains usable for crate-level iteration. For IREE under cargo only,

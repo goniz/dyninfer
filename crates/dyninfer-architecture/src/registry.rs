@@ -1,13 +1,12 @@
 use crate::builder::{ArchitectureDefinition, ModelBuilder};
 use crate::config::ResolvedModelConfig;
+use crate::emit::EmitOutput;
 use crate::package::ArchitecturePackage;
 use dyninfer_checkpoint::{
-    schema_fingerprint_from_parameters, CheckpointCatalog, LogicalParameter, ParameterCatalog,
-};
-use dyninfer_core::{
-    ArchitectureId, CanonicalParameterName, MetadataMap,
+    schema_fingerprint_from_parameters, CheckpointCatalog, ParameterCatalog,
 };
 use dyninfer_checkpoint::infer_role;
+use dyninfer_core::{ArchitectureId, CanonicalParameterName, MetadataMap};
 use dyninfer_error::{ArchitectureMismatchError, DynInferError, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,22 +35,28 @@ impl ArchitectureRegistry {
         self.defs.keys().map(|s| s.as_str())
     }
 
+    fn require(&self, id: &ArchitectureId) -> Result<Arc<dyn ArchitectureDefinition>> {
+        self.get(id).ok_or_else(|| {
+            DynInferError::ArchitectureMismatch(ArchitectureMismatchError {
+                message: format!("unknown architecture `{id}`"),
+                architecture_id: Some(id.to_string()),
+                detail: None,
+            })
+        })
+    }
+
     /// Find an architecture that lists `model_type` in [`ArchitectureDefinition::model_types`].
     pub fn find_by_model_type(&self, model_type: &str) -> Option<ArchitectureId> {
         let needle = model_type.trim();
         if needle.is_empty() {
             return None;
         }
-        for def in self.defs.values() {
-            if def
-                .model_types()
+        self.defs.values().find_map(|def| {
+            def.model_types()
                 .iter()
                 .any(|t| t.eq_ignore_ascii_case(needle))
-            {
-                return Some(def.id());
-            }
-        }
-        None
+                .then(|| def.id())
+        })
     }
 
     /// Resolve architecture from checkpoint metadata (`model_type` / `hf_architecture`).
@@ -81,13 +86,7 @@ impl ArchitectureRegistry {
         id: &ArchitectureId,
         catalog: &mut CheckpointCatalog,
     ) -> Result<()> {
-        let def = self.get(id).ok_or_else(|| {
-            DynInferError::ArchitectureMismatch(ArchitectureMismatchError {
-                message: format!("unknown architecture `{id}`"),
-                architecture_id: Some(id.to_string()),
-                detail: None,
-            })
-        })?;
+        let def = self.require(id)?;
 
         let mut remapped = Vec::with_capacity(catalog.parameters.len());
         for param in &catalog.parameters {
@@ -140,13 +139,7 @@ impl ArchitectureRegistry {
         checkpoint_meta: &MetadataMap,
     ) -> Result<ArchitecturePackage> {
         let _span = info_span!("architecture.load", architecture = %id).entered();
-        let def = self.get(id).ok_or_else(|| {
-            DynInferError::ArchitectureMismatch(ArchitectureMismatchError {
-                message: format!("unknown architecture `{id}`"),
-                architecture_id: Some(id.to_string()),
-                detail: None,
-            })
-        })?;
+        let def = self.require(id)?;
         let defaults = MetadataMap::new();
         let config = def
             .config_schema()
@@ -166,13 +159,7 @@ impl ArchitectureRegistry {
         id: &ArchitectureId,
         config: &ResolvedModelConfig,
     ) -> Result<ArchitecturePackage> {
-        let def = self.get(id).ok_or_else(|| {
-            DynInferError::ArchitectureMismatch(ArchitectureMismatchError {
-                message: format!("unknown architecture `{id}`"),
-                architecture_id: Some(id.to_string()),
-                detail: None,
-            })
-        })?;
+        let def = self.require(id)?;
         let mut builder = ModelBuilder::new()?;
         builder.set_architecture_id(def.id());
         let module = def.build(config, &mut builder)?;
@@ -188,15 +175,8 @@ impl ArchitectureRegistry {
         id: &ArchitectureId,
         package: &ArchitecturePackage,
         catalog: &CheckpointCatalog,
-    ) -> Result<crate::emit::EmitOutput> {
-        let def = self.get(id).ok_or_else(|| {
-            DynInferError::ArchitectureMismatch(ArchitectureMismatchError {
-                message: format!("unknown architecture `{id}`"),
-                architecture_id: Some(id.to_string()),
-                detail: None,
-            })
-        })?;
-        def.emit_executable(package, catalog)
+    ) -> Result<EmitOutput> {
+        self.require(id)?.emit_executable(package, catalog)
     }
 }
 
@@ -212,13 +192,4 @@ fn meta_model_type_candidates(meta: &MetadataMap) -> Vec<String> {
         }
     }
     out
-}
-
-/// Deduplicate parameters by canonical name (last wins).
-pub fn dedupe_parameters(parameters: Vec<LogicalParameter>) -> Vec<LogicalParameter> {
-    let mut map = std::collections::BTreeMap::new();
-    for p in parameters {
-        map.insert(p.canonical_name.to_string(), p);
-    }
-    map.into_values().collect()
 }

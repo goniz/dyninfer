@@ -14,7 +14,7 @@ mod stories_e2e;
 mod tokenizer_bpe;
 
 pub use builtins::{default_architecture_registry, default_checkpoint_support};
-pub use dyninfer_architectures::{LARGE_PREFILL_WINDOW, PREFILL_WINDOW, TINY_PREFILL_WINDOW};
+pub use dyninfer_architecture::{LARGE_PREFILL_WINDOW, PREFILL_WINDOW, TINY_PREFILL_WINDOW};
 pub use generate::{
     argmax, generate_greedy, load_tokenizer, GenerateConfig, GenerateOutput, GenerateStats,
 };

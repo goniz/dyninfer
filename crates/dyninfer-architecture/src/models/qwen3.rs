@@ -5,7 +5,7 @@
 use crate::naming::{canonicalize_hf_family, tie_output_to_embed};
 use crate::ops::{emit_dense_decoder_cfg, DenseDecoderConfig};
 use crate::slots::field;
-use dyninfer_architecture::{
+use crate::{
     ArchitectureDefinition, ArchitecturePackage, ConfigSchema, EmitOutput, ModelBuilder,
     ModelModule, ResolvedModelConfig,
 };

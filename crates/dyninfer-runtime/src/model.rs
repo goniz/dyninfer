@@ -89,7 +89,7 @@ impl ModelLoader {
         checkpoint: impl AsRef<Path>,
     ) -> Result<ArchitectureId> {
         let catalog = self.inspect(checkpoint)?;
-        dyninfer_architectures::resolve_architecture(
+        dyninfer_architecture::resolve_architecture(
             &self.architectures,
             override_id,
             &catalog.metadata,

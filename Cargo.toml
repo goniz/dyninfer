@@ -8,7 +8,6 @@ members = [
   "crates/dyninfer-checkpoint-gguf",
   "crates/dyninfer-checkpoint-npz",
   "crates/dyninfer-architecture",
-  "crates/dyninfer-architectures",
   "crates/dyninfer-binding",
   "crates/dyninfer-kernel-registry",
   "crates/dyninfer-target",
@@ -59,7 +58,6 @@ dyninfer-checkpoint-safetensors = { path = "crates/dyninfer-checkpoint-safetenso
 dyninfer-checkpoint-gguf = { path = "crates/dyninfer-checkpoint-gguf" }
 dyninfer-checkpoint-npz = { path = "crates/dyninfer-checkpoint-npz" }
 dyninfer-architecture = { path = "crates/dyninfer-architecture" }
-dyninfer-architectures = { path = "crates/dyninfer-architectures" }
 dyninfer-binding = { path = "crates/dyninfer-binding" }
 dyninfer-kernel-registry = { path = "crates/dyninfer-kernel-registry" }
 dyninfer-target = { path = "crates/dyninfer-target" }

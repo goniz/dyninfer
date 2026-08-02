@@ -1,7 +1,8 @@
 //! Raw FFI surface for `dyninfer_compiler.h`.
 //!
-//! Until the C++ library is linked through Bazel, this crate provides an
-//! in-process stub that mirrors the ABI semantics used by higher layers.
+//! In-process Rust stub mirroring the C ABI until a real `compiler/capi`
+//! library is linked through Bazel. (There is no separate C++ stub translation
+//! unit; this crate is the stub.)
 
 #![allow(non_camel_case_types)]
 #![allow(clippy::missing_safety_doc)]

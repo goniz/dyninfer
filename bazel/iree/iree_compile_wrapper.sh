@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
+# Thin Bazel sh_binary entrypoint for the pinned `iree-compile` wheel.
+#
+# Why this exists: `rules_rs` / `bazel run` tests need a stable label
+# (`//bazel/iree:iree_compile_bin`) whose runfiles contain the platform-selected
+# IREE compiler archive. The real binary lives under a repo-select / bzlmod
+# prefix that differs between:
+#   - directory runfiles (`RUNFILES_DIR/.../iree_compiler_linux_$arch/...`)
+#   - bzlmod canonical names (`+http_archive+iree_compiler_linux_$arch/...`)
+#   - manifest-only layouts (`RUNFILES_MANIFEST_FILE`)
+# This script locates that binary and exec's it with the caller's argv so Rust
+# crates can shell out without hard-coding runfiles paths.
 set -euo pipefail
 
-# Resolve the real iree-compile from Bazel runfiles (repo-select layout).
 RUNFILES_DIR="${RUNFILES_DIR:-}"
 if [[ -z "${RUNFILES_DIR}" && -n "${RUNFILES_MANIFEST_FILE:-}" ]]; then
   # Manifest mode: look up by key.

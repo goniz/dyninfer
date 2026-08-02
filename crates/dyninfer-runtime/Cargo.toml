@@ -8,7 +8,6 @@ license.workspace = true
 
 [dependencies]
 dyninfer-architecture = { workspace = true }
-dyninfer-architectures = { workspace = true }
 dyninfer-binding = { workspace = true }
 dyninfer-cache = { workspace = true }
 dyninfer-checkpoint = { workspace = true }

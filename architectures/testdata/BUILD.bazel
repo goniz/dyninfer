@@ -1,11 +1,10 @@
 package(default_visibility = ["//visibility:public"])
 
+# Tokenizer / config fixtures only — model weights come from Hugging Face Hub.
 filegroup(
     name = "maykeye_tinyllama_v0",
-    srcs = glob(["maykeye-tinyllama-v0/**"]),
-)
-
-filegroup(
-    name = "tiny_llama_fixture",
-    srcs = glob(["tiny-llama*"], allow_empty = True),
+    srcs = glob(
+        ["maykeye-tinyllama-v0/**"],
+        exclude = ["maykeye-tinyllama-v0/**/*.safetensors"],
+    ),
 )

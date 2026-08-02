@@ -10,6 +10,6 @@ pub fn default_checkpoint_support() -> BuiltinCheckpointSupport {
 
 pub fn default_architecture_registry() -> ArchitectureRegistry {
     let mut reg = ArchitectureRegistry::new();
-    dyninfer_architectures::register_all(&mut reg);
+    dyninfer_architecture::register_all(&mut reg);
     reg
 }
