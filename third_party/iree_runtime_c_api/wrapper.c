@@ -90,6 +90,158 @@ static iree_status_t append_parameters_module(iree_runtime_session_t* session,
   return status;
 }
 
+// Bind host-owned f32 (or other) blobs under scope "weights". Caller retains
+// ownership of |params[i].data| for the session lifetime.
+static iree_status_t append_host_parameters_module(
+    iree_runtime_session_t* session, const dyninfer_iree_host_param_t* params,
+    size_t param_count) {
+  if (!params || param_count == 0) {
+    return iree_ok_status();
+  }
+
+  iree_allocator_t host_allocator =
+      iree_runtime_session_host_allocator(session);
+  iree_vm_instance_t* vm_instance =
+      iree_runtime_instance_vm_instance(iree_runtime_session_instance(session));
+
+  iree_io_parameter_index_t* index = NULL;
+  IREE_RETURN_IF_ERROR(iree_io_parameter_index_create(host_allocator, &index));
+  iree_status_t status = iree_io_parameter_index_reserve(index, param_count);
+
+  for (size_t i = 0; iree_status_is_ok(status) && i < param_count; ++i) {
+    if (!params[i].key || !params[i].data || params[i].length == 0) {
+      status = iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                                "host param %zu missing key/data", i);
+      break;
+    }
+    iree_io_file_handle_t* handle = NULL;
+    status = iree_io_file_handle_wrap_host_allocation(
+        IREE_IO_FILE_ACCESS_READ,
+        iree_make_byte_span((void*)params[i].data, params[i].length),
+        iree_io_file_handle_release_callback_null(), host_allocator, &handle);
+    if (!iree_status_is_ok(status)) break;
+
+    iree_io_parameter_index_entry_t entry = {
+        .key = iree_make_cstring_view(params[i].key),
+        .metadata = iree_const_byte_span_empty(),
+        .length = (uint64_t)params[i].length,
+        .type = IREE_IO_PARAMETER_INDEX_ENTRY_STORAGE_TYPE_FILE,
+        .storage =
+            {
+                .file =
+                    {
+                        .handle = handle,
+                        .offset = 0,
+                    },
+            },
+    };
+    status = iree_io_parameter_index_add(index, &entry);
+    // Index retains the handle; drop our local ref.
+    iree_io_file_handle_release(handle);
+  }
+
+  iree_io_parameter_provider_t* provider = NULL;
+  if (iree_status_is_ok(status)) {
+    status = iree_io_parameter_index_provider_create(
+        iree_make_cstring_view("weights"), index,
+        IREE_IO_PARAMETER_INDEX_PROVIDER_DEFAULT_MAX_CONCURRENT_OPERATIONS,
+        host_allocator, &provider);
+  }
+  iree_io_parameter_index_release(index);
+
+  iree_vm_module_t* module = NULL;
+  if (iree_status_is_ok(status)) {
+    status = iree_io_parameters_module_create(vm_instance, /*provider_count=*/1,
+                                             &provider, host_allocator, &module);
+  }
+  iree_io_parameter_provider_release(provider);
+
+  if (iree_status_is_ok(status)) {
+    status = iree_runtime_session_append_module(session, module);
+  }
+  iree_vm_module_release(module);
+  return status;
+}
+
+static int session_create_common(const char* device_uri, const char* vmfb_path,
+                                 const char* parameters_path,
+                                 const dyninfer_iree_host_param_t* host_params,
+                                 size_t host_param_count,
+                                 dyninfer_iree_session_t** out_session) {
+  *out_session = NULL;
+  g_last_error[0] = '\0';
+  if (!vmfb_path || !out_session) {
+    set_error_msg("vmfb_path and out_session are required");
+    return 1;
+  }
+
+  const char* driver =
+      (device_uri && device_uri[0] != '\0') ? device_uri : "local-task";
+
+  dyninfer_iree_session_t* s =
+      (dyninfer_iree_session_t*)calloc(1, sizeof(*s));
+  if (!s) {
+    set_error_msg("calloc session");
+    return 1;
+  }
+
+  iree_runtime_instance_options_t instance_options;
+  iree_runtime_instance_options_initialize(&instance_options);
+  iree_runtime_instance_options_use_all_available_drivers(&instance_options);
+  iree_status_t status = iree_runtime_instance_create(
+      &instance_options, iree_allocator_system(), &s->instance);
+
+  if (iree_status_is_ok(status)) {
+    status = iree_runtime_instance_try_create_default_device(
+        s->instance, iree_make_cstring_view(driver), &s->device);
+  }
+
+  iree_runtime_session_options_t session_options;
+  iree_runtime_session_options_initialize(&session_options);
+  if (iree_status_is_ok(status)) {
+    status = iree_runtime_session_create_with_device(
+        s->instance, &session_options, s->device,
+        iree_runtime_instance_host_allocator(s->instance), &s->session);
+  }
+
+  if (iree_status_is_ok(status)) {
+    if (host_params && host_param_count > 0) {
+      status = append_host_parameters_module(s->session, host_params,
+                                             host_param_count);
+    } else {
+      status = append_parameters_module(s->session, parameters_path);
+    }
+  }
+  if (iree_status_is_ok(status)) {
+    status = iree_runtime_session_append_bytecode_module_from_file(s->session,
+                                                                   vmfb_path);
+  }
+
+  if (!iree_status_is_ok(status)) {
+    set_error_status(status);
+    dyninfer_iree_session_destroy(s);
+    return 1;
+  }
+  *out_session = s;
+  return 0;
+}
+
+int dyninfer_iree_session_create(const char* device_uri, const char* vmfb_path,
+                                 const char* parameters_path,
+                                 dyninfer_iree_session_t** out_session) {
+  return session_create_common(device_uri, vmfb_path, parameters_path,
+                               /*host_params=*/NULL, /*host_param_count=*/0,
+                               out_session);
+}
+
+int dyninfer_iree_session_create_with_host_params(
+    const char* device_uri, const char* vmfb_path,
+    const dyninfer_iree_host_param_t* params, size_t param_count,
+    dyninfer_iree_session_t** out_session) {
+  return session_create_common(device_uri, vmfb_path, /*parameters_path=*/NULL,
+                               params, param_count, out_session);
+}
+
 static iree_status_t allocate_i64_tensor(iree_runtime_session_t* session,
                                          iree_host_size_t rank,
                                          const iree_hal_dim_t* shape,
@@ -186,62 +338,6 @@ static iree_status_t invoke_named(iree_runtime_session_t* session,
   iree_hal_buffer_view_release(ret);
   iree_runtime_call_deinitialize(&call);
   return status;
-}
-
-int dyninfer_iree_session_create(const char* device_uri, const char* vmfb_path,
-                                 const char* parameters_path,
-                                 dyninfer_iree_session_t** out_session) {
-  *out_session = NULL;
-  g_last_error[0] = '\0';
-  if (!vmfb_path || !out_session) {
-    set_error_msg("vmfb_path and out_session are required");
-    return 1;
-  }
-
-  const char* driver =
-      (device_uri && device_uri[0] != '\0') ? device_uri : "local-task";
-
-  dyninfer_iree_session_t* s =
-      (dyninfer_iree_session_t*)calloc(1, sizeof(*s));
-  if (!s) {
-    set_error_msg("calloc session");
-    return 1;
-  }
-
-  iree_runtime_instance_options_t instance_options;
-  iree_runtime_instance_options_initialize(&instance_options);
-  iree_runtime_instance_options_use_all_available_drivers(&instance_options);
-  iree_status_t status = iree_runtime_instance_create(
-      &instance_options, iree_allocator_system(), &s->instance);
-
-  if (iree_status_is_ok(status)) {
-    status = iree_runtime_instance_try_create_default_device(
-        s->instance, iree_make_cstring_view(driver), &s->device);
-  }
-
-  iree_runtime_session_options_t session_options;
-  iree_runtime_session_options_initialize(&session_options);
-  if (iree_status_is_ok(status)) {
-    status = iree_runtime_session_create_with_device(
-        s->instance, &session_options, s->device,
-        iree_runtime_instance_host_allocator(s->instance), &s->session);
-  }
-
-  if (iree_status_is_ok(status)) {
-    status = append_parameters_module(s->session, parameters_path);
-  }
-  if (iree_status_is_ok(status)) {
-    status = iree_runtime_session_append_bytecode_module_from_file(s->session,
-                                                                   vmfb_path);
-  }
-
-  if (!iree_status_is_ok(status)) {
-    set_error_status(status);
-    dyninfer_iree_session_destroy(s);
-    return 1;
-  }
-  *out_session = s;
-  return 0;
 }
 
 void dyninfer_iree_session_destroy(dyninfer_iree_session_t* session) {

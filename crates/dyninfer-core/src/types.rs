@@ -273,14 +273,29 @@ impl TargetProfile {
         }
     }
 
-    pub fn vulkan_generic() -> Self {
+    /// Vulkan SPIR-V target. `chip` is an IREE Vulkan arch (e.g. `gfx1151`,
+    /// `rdna3`); empty uses [`Self::DEFAULT_ROCM_TARGET`] (same AMDGPU SKUs).
+    pub fn vulkan(chip: &str) -> Self {
+        let chip = if chip.is_empty() {
+            Self::DEFAULT_ROCM_TARGET
+        } else {
+            chip
+        };
         Self {
             driver: "vulkan".into(),
             device_id: Some(0),
-            triple: None,
-            features: vec!["spirv".into()],
-            capability_fingerprint: Digest::from_bytes(b"vulkan|generic"),
+            triple: Some(chip.to_string()),
+            features: vec!["spirv".into(), format!("vulkan-target={chip}")],
+            // Include promote-bf16 so cache keys diverge from pre-promote VMFBs.
+            capability_fingerprint: Digest::from_bytes(
+                format!("vulkan|{chip}|promote-bf16-f32").as_bytes(),
+            ),
         }
+    }
+
+    /// Vulkan with the default desktop AMDGPU arch (not Android baseline).
+    pub fn vulkan_generic() -> Self {
+        Self::vulkan(Self::DEFAULT_ROCM_TARGET)
     }
 
     /// Default NVPTX arch when `--target cuda` omits an explicit SM.
@@ -336,9 +351,20 @@ impl TargetProfile {
         }
     }
 
+    /// Vulkan GPU arch for `--iree-vulkan-target`, if this is a Vulkan profile.
+    pub fn vulkan_target(&self) -> Option<&str> {
+        if self.driver == "vulkan" {
+            self.triple.as_deref().or(Some(Self::DEFAULT_ROCM_TARGET))
+        } else {
+            None
+        }
+    }
+
     /// GPU arch string passed to IREE compile (`gfx*` / `sm_*`), if any.
     pub fn gpu_compile_arch(&self) -> Option<&str> {
-        self.rocm_target().or_else(|| self.cuda_target())
+        self.rocm_target()
+            .or_else(|| self.cuda_target())
+            .or_else(|| self.vulkan_target())
     }
 }
 

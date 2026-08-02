@@ -35,12 +35,88 @@ pub fn resolve_runtime_parameters(catalog: &CheckpointCatalog) -> Result<PathBuf
     Ok(path)
 }
 
+/// Host-side bf16/f16→f32 expansion for IREE parameter bind (no disk write).
+///
+/// Keys are the on-disk SafeTensors / storage-component keys (what
+/// `#stream.parameter.named<"weights"::…>` references), not canonical names.
+/// Each value is little-endian f32 bytes (`numel * 4`).
+///
+/// Used when the VMFB was compiled with `--iree-input-promote-bf16-to-f32`
+/// (Vulkan): the module expects f32 parameter blobs while the checkpoint file
+/// remains bf16/f16.
+pub fn decode_parameters_as_f32_host(catalog: &CheckpointCatalog) -> Result<HostF32Parameters> {
+    let mut entries = Vec::with_capacity(catalog.parameters.len());
+    let source_path = catalog
+        .source_files
+        .first()
+        .map(|f| f.path.as_path())
+        .ok_or_else(|| DynInferError::io("checkpoint has no source file for parameters"))?;
+    let source = FileSource::open(source_path)?;
+
+    for param in &catalog.parameters {
+        let comp = param.components.first().ok_or_else(|| {
+            DynInferError::io(format!(
+                "parameter {} has no storage component",
+                param.canonical_name
+            ))
+        })?;
+        let range = comp.byte_ranges.first().ok_or_else(|| {
+            DynInferError::io(format!(
+                "parameter {} has no byte range",
+                param.canonical_name
+            ))
+        })?;
+        let bytes = source.read_range(range.offset, range.length)?;
+        let ty = match &comp.storage_type {
+            dyninfer_core::StorageElementType::Scalar { ty } => *ty,
+            other => {
+                return Err(DynInferError::io(format!(
+                    "unsupported storage for {}: {other}",
+                    param.canonical_name
+                )));
+            }
+        };
+        let values = decode_to_f32(&bytes, ty)?;
+        let numel = param.logical_type.shape.numel().ok_or_else(|| {
+            DynInferError::io(format!(
+                "parameter {}: shape overflow",
+                param.canonical_name
+            ))
+        })? as usize;
+        if values.len() != numel {
+            return Err(DynInferError::io(format!(
+                "parameter {}: decoded {} values, expected {numel}",
+                param.canonical_name,
+                values.len()
+            )));
+        }
+        let mut le = Vec::with_capacity(values.len() * 4);
+        for v in values {
+            le.extend_from_slice(&v.to_le_bytes());
+        }
+        entries.push((comp.key.clone(), le));
+    }
+
+    info!(
+        tensors = entries.len(),
+        "decoded checkpoint parameters to host f32 (in-memory, no disk materialize)"
+    );
+    Ok(HostF32Parameters { entries })
+}
+
+/// Owned f32 parameter blobs keyed for IREE `#stream.parameter.named`.
+#[derive(Debug, Clone)]
+pub struct HostF32Parameters {
+    pub entries: Vec<(String, Vec<u8>)>,
+}
+
 /// Convert catalog parameters to an F32 SafeTensors file keyed by canonical names.
 ///
 /// Output is written under `cache_dir` (created if needed) with a content hash
 /// so repeated loads reuse the same file.
 ///
-/// Prefer [`resolve_runtime_parameters`] when the VMFB binds native dtypes/keys.
+/// Prefer [`resolve_runtime_parameters`] when the VMFB binds native dtypes/keys,
+/// or [`decode_parameters_as_f32_host`] when only an in-memory promote is needed.
 pub fn materialize_f32_safetensors(
     catalog: &CheckpointCatalog,
     cache_dir: impl AsRef<Path>,

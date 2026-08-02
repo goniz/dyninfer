@@ -13,6 +13,14 @@ extern "C" {
 
 typedef struct dyninfer_iree_session_t dyninfer_iree_session_t;
 
+// One host-owned parameter blob (e.g. bf16→f32 expanded weights).
+// |data| must remain valid for the lifetime of the session.
+typedef struct dyninfer_iree_host_param_t {
+  const char* key;
+  const void* data;
+  size_t length;
+} dyninfer_iree_host_param_t;
+
 // Create a persistent session: load VMFB (+ optional SafeTensors scope "weights").
 // |device_uri| is an IREE driver name: "hip", "local-task", "vulkan", …
 // Pass NULL / "" for local-task. |parameters_path| may be NULL.
@@ -20,6 +28,14 @@ typedef struct dyninfer_iree_session_t dyninfer_iree_session_t;
 int dyninfer_iree_session_create(const char* device_uri, const char* vmfb_path,
                                  const char* parameters_path,
                                  dyninfer_iree_session_t** out_session);
+
+// Like dyninfer_iree_session_create, but binds |params| as in-memory host
+// allocations under scope "weights" (no parameter file). Used when the VMFB
+// expects promoted f32 weights while the checkpoint on disk is still bf16.
+int dyninfer_iree_session_create_with_host_params(
+    const char* device_uri, const char* vmfb_path,
+    const dyninfer_iree_host_param_t* params, size_t param_count,
+    dyninfer_iree_session_t** out_session);
 
 void dyninfer_iree_session_destroy(dyninfer_iree_session_t* session);
 

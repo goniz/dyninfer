@@ -25,11 +25,25 @@ pub mod bindings {
         _private: [u8; 0],
     }
 
+    #[repr(C)]
+    pub struct dyninfer_iree_host_param_t {
+        pub key: *const c_char,
+        pub data: *const c_void,
+        pub length: usize,
+    }
+
     extern "C" {
         pub fn dyninfer_iree_session_create(
             device_uri: *const c_char,
             vmfb_path: *const c_char,
             parameters_path: *const c_char,
+            out_session: *mut *mut dyninfer_iree_session_t,
+        ) -> c_int;
+        pub fn dyninfer_iree_session_create_with_host_params(
+            device_uri: *const c_char,
+            vmfb_path: *const c_char,
+            params: *const dyninfer_iree_host_param_t,
+            param_count: usize,
             out_session: *mut *mut dyninfer_iree_session_t,
         ) -> c_int;
         pub fn dyninfer_iree_session_destroy(session: *mut dyninfer_iree_session_t);

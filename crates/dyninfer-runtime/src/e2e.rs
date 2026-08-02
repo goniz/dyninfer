@@ -2,7 +2,9 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::{max_abs_err, tiny_llama_prefill_logits, CausalLanguageModel, ModelLoader};
+    use crate::{
+        max_abs_err, tiny_llama_prefill_logits, CausalLanguageModel, ModelLoader,
+    };
     use dyninfer_checkpoint_safetensors::tiny_llama_dense_f32;
     use dyninfer_compiler::{compile_add_smoke, CompileOptions, IreeTools};
     use dyninfer_core::{ArchitectureId, SessionConfig, TargetProfile};
@@ -106,10 +108,172 @@ mod tests {
             &stepped.values[..8]
         );
 
+        // Non-pad decode: prefill([1,2,3])+decode(7) vs prefill([1,2,3,7]).
+        let mut s_full2 = model_full.create_session(SessionConfig::default()).unwrap();
+        let full2 = s_full2.prefill(&[1, 2, 3, 7]).unwrap();
+        let mut s_step2 = model_step.create_session(SessionConfig::default()).unwrap();
+        let _ = s_step2.prefill(&[1, 2, 3]).unwrap();
+        let stepped2 = s_step2.decode(7).unwrap();
+        let err2 = max_abs_err(&full2.values, &stepped2.values).unwrap();
+        eprintln!("tiny_llama non-pad decode max_abs_err={err2}");
+        assert!(
+            err2 < 1e-3,
+            "non-pad KV decode diverged: max_abs_err={err2}\nfull={:?}\nstep={:?}",
+            &full2.values[..8],
+            &stepped2.values[..8]
+        );
+
         let sum = model
             .context
             .invoke_add(&[1.0, 2.0, 3.0, 4.0], &[10.0, 20.0, 30.0, 40.0])
             .unwrap();
         assert_eq!(sum, vec![11.0, 22.0, 33.0, 44.0]);
     }
+
+    #[test]
+    fn tiny_gqa_rope_prefill_decode_parity() {
+        if !iree_available() {
+            eprintln!("skipping: IREE not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("tiny-gqa-rope.safetensors");
+        fs::write(&ckpt, dyninfer_checkpoint_safetensors::tiny_gqa_rope_f32()).unwrap();
+
+        let loader = ModelLoader::default();
+        let id = ArchitectureId::new("qwen3.decoder");
+        let bundle = dir.path().join("model.bundle");
+        loader
+            .compile_to_bundle(
+                &id,
+                &ckpt,
+                "cpu",
+                &bundle,
+                &CompileOptions {
+                    mode: "local-jit".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("compile tiny GQA+RoPE");
+
+        let model = loader.load_bundle(&bundle, &ckpt).unwrap();
+        assert_eq!(model.metadata().vocabulary_size, 48);
+        assert_eq!(model.manifest.prefill_window, 4);
+        assert_eq!(model.manifest.kv_cache.max_sequence_length, 8);
+        assert_eq!(model.manifest.kv_cache.kv_head_count, 2);
+
+        // Full prefill of 4 tokens vs prefill(3)+decode(4th).
+        // Use separate bundles/contexts (same as tiny_llama) to avoid shared KV globals.
+        let tokens = [1u32, 2, 3, 7];
+        let model_full = loader.load_bundle(&bundle, &ckpt).unwrap();
+        let mut s_full = model_full.create_session(SessionConfig::default()).unwrap();
+        let full = s_full.prefill(&tokens).unwrap();
+
+        let model_step = loader.load_bundle(&bundle, &ckpt).unwrap();
+        let mut s_step = model_step.create_session(SessionConfig::default()).unwrap();
+        let _ = s_step.prefill(&tokens[..3]).unwrap();
+        assert_eq!(s_step.position(), 3);
+        let stepped = s_step.decode(tokens[3]).unwrap();
+
+        let err = max_abs_err(&full.values, &stepped.values).unwrap();
+        eprintln!("tiny_gqa_rope parity max_abs_err={err}");
+        assert!(
+            err < 1e-2,
+            "GQA+RoPE KV decode diverged from full prefill: max_abs_err={err}\nfull={:?}\nstep={:?}",
+            &full.values[..8],
+            &stepped.values[..8]
+        );
+    }
+
+    fn parity_err_with(
+        arch: &str,
+        bytes: &[u8],
+        overrides: &dyninfer_core::MetadataMap,
+        label: &str,
+    ) -> f32 {
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("m.safetensors");
+        fs::write(&ckpt, bytes).unwrap();
+        let loader = ModelLoader::default();
+        let id = ArchitectureId::new(arch);
+        let bundle = dir.path().join("b");
+        loader
+            .compile_to_bundle_with_overrides(
+                &id,
+                &ckpt,
+                "cpu",
+                &bundle,
+                &CompileOptions {
+                    mode: "local-jit".into(),
+                    ..Default::default()
+                },
+                overrides,
+            )
+            .unwrap_or_else(|e| panic!("compile {label}: {e}"));
+        let model_full = loader.load_bundle(&bundle, &ckpt).unwrap();
+        let model_step = loader.load_bundle(&bundle, &ckpt).unwrap();
+        let tokens = [1u32, 2, 3, 7];
+        let mut s_full = model_full.create_session(SessionConfig::default()).unwrap();
+        let full = s_full.prefill(&tokens).unwrap();
+        let mut s_step = model_step.create_session(SessionConfig::default()).unwrap();
+        let _ = s_step.prefill(&tokens[..3]).unwrap();
+        let stepped = s_step.decode(tokens[3]).unwrap();
+        let err = max_abs_err(&full.values, &stepped.values).unwrap();
+        eprintln!("{label} max_abs_err={err}");
+        err
+    }
+
+    /// Regression: decode parity must hold when `max_kv > prefill_window` (the
+    /// Qwen shape) for MHA and GQA, with and without RoPE/qk_norm.
+    ///
+    /// Compiles several tiny models — enable with `DYNINFER_KV_PARITY=1`.
+    #[test]
+    fn decode_parity_max_kv_gt_window() {
+        if std::env::var_os("DYNINFER_KV_PARITY").is_none() {
+            eprintln!("skipping: set DYNINFER_KV_PARITY=1 for multi-config KV parity");
+            return;
+        }
+        if !iree_available() {
+            return;
+        }
+        let empty = dyninfer_core::MetadataMap::new();
+        let mut maxkv8 = dyninfer_core::MetadataMap::new();
+        maxkv8.insert("max_kv".into(), serde_json::json!(8));
+        maxkv8.insert("prefill_window".into(), serde_json::json!(4));
+
+        let cases: [(&str, &[u8], &dyninfer_core::MetadataMap, &str); 4] = [
+            (
+                "llama.decoder",
+                &tiny_llama_dense_f32(),
+                &maxkv8,
+                "mha+norope+maxkv8",
+            ),
+            (
+                "llama.decoder",
+                &dyninfer_checkpoint_safetensors::tiny_mha_rope_f32(),
+                &empty,
+                "mha+rope",
+            ),
+            (
+                "llama.decoder",
+                &dyninfer_checkpoint_safetensors::tiny_gqa_plain_f32(),
+                &empty,
+                "gqa+plain",
+            ),
+            (
+                "qwen3.decoder",
+                &dyninfer_checkpoint_safetensors::tiny_gqa_rope_f32(),
+                &empty,
+                "gqa+rope+qknorm",
+            ),
+        ];
+        for (arch, bytes, overrides, label) in cases {
+            let err = parity_err_with(arch, bytes, overrides, label);
+            assert!(
+                err < 1e-2,
+                "{label} KV decode diverged: max_abs_err={err}"
+            );
+        }
+    }
+
 }

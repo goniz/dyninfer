@@ -92,15 +92,32 @@ pub const DEFAULT_CUDA_TARGET: &str = "sm_80";
 
 /// HAL/device flags for the dyninfer target driver name.
 ///
-/// `gpu_arch` is `--iree-rocm-target` / `--iree-cuda-target` (e.g. `gfx1151`,
-/// `sm_80`). Defaults apply when omitted for HIP/CUDA.
+/// `gpu_arch` is `--iree-rocm-target` / `--iree-cuda-target` /
+/// `--iree-vulkan-target` (e.g. `gfx1151`, `sm_80`). Defaults apply when
+/// omitted for HIP/CUDA/Vulkan.
 ///
 /// For HIP, also sets `--iree-rocm-bc-dir` when platform bitcode can be found
 /// (required for in-process `libIREECompiler`; `iree-compile` finds it via
 /// `$ORIGIN`).
 pub fn flags_for_target(driver: &str, gpu_arch: Option<&str>) -> Vec<String> {
     match driver {
-        "vulkan" => vec!["--iree-hal-target-device=vulkan".into()],
+        "vulkan" => {
+            // Generic `--iree-hal-target-device=vulkan` alone uses Android
+            // baseline SPIR-V, which fails to legalize ops like `vector.step`
+            // on desktop matmul/attention. Always pin a GPU arch.
+            //
+            // SPIR-V has no portable bf16; promote weight/global bf16 to f32
+            // at compile time. Runtime binds host-expanded f32 parameter bytes
+            // (see `decode_parameters_as_f32_host`) — no on-disk twin file.
+            let arch = gpu_arch
+                .filter(|s| !s.is_empty())
+                .unwrap_or(DEFAULT_ROCM_TARGET);
+            vec![
+                "--iree-hal-target-device=vulkan".into(),
+                format!("--iree-vulkan-target={arch}"),
+                "--iree-input-promote-bf16-to-f32".into(),
+            ]
+        }
         "hip" | "rocm" => {
             let chip = gpu_arch
                 .filter(|s| !s.is_empty())

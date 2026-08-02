@@ -3,7 +3,8 @@
 #[cfg(test)]
 mod tests {
     use crate::{
-        generate_greedy, load_tokenizer, resolve_hf_snapshot, GenerateConfig, ModelLoader,
+        generate_greedy, load_tokenizer, resolve_hf_snapshot, CausalLanguageModel, GenerateConfig,
+        ModelLoader,
     };
     use crate::find_safetensors_checkpoint;
     use dyninfer_compiler::{CompileOptions, IreeTools};

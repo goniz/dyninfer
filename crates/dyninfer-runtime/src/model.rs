@@ -220,15 +220,25 @@ impl ModelLoader {
         }
 
         let _span = info_span!("parameters.open").entered();
-        let params_path =
-            dyninfer_checkpoint_safetensors::resolve_runtime_parameters(&catalog)?;
         let instance = Instance::new()?;
         let module = Module::from_path(&vmfb_path)?;
-        let context = Arc::new(
-            Context::create(instance, module)?
-                .with_parameters(params_path)
-                .with_device(manifest.target.driver.clone()),
-        );
+        let context = if needs_host_f32_params(&manifest.target.driver) {
+            let host = dyninfer_checkpoint_safetensors::decode_parameters_as_f32_host(&catalog)?;
+            let storage = iree_runtime::HostParameterStorage::from_f32_entries(host.entries)?;
+            Arc::new(
+                Context::create(instance, module)?
+                    .with_host_parameters(storage)
+                    .with_device(manifest.target.driver.clone()),
+            )
+        } else {
+            let params_path =
+                dyninfer_checkpoint_safetensors::resolve_runtime_parameters(&catalog)?;
+            Arc::new(
+                Context::create(instance, module)?
+                    .with_parameters(params_path)
+                    .with_device(manifest.target.driver.clone()),
+            )
+        };
 
         let metadata = ModelMetadata {
             architecture_id: manifest.architecture_id.clone(),
@@ -325,4 +335,10 @@ impl ModelLoader {
             vmfb: vmfb_path,
         })
     }
+}
+
+/// Vulkan VMFBs are compiled with `--iree-input-promote-bf16-to-f32`, so
+/// parameter blobs must be host-expanded f32 (checkpoint file stays bf16).
+fn needs_host_f32_params(driver: &str) -> bool {
+    matches!(driver, "vulkan")
 }

@@ -66,7 +66,8 @@ impl TargetDiscovery {
     /// Supported:
     /// - `auto` → probe IREE HAL devices; pick CUDA/HIP over Vulkan/CPU
     /// - `cpu` / `llvm-cpu` / `local*` → host CPU
-    /// - `vulkan` / `vulkan://…` → Vulkan
+    /// - `vulkan` / `vulkan://…` → Vulkan (default chip `gfx1151`, or `DYNINFER_VULKAN_TARGET` / `DYNINFER_ROCM_TARGET`)
+    /// - `vulkan:gfx1151` / `vulkan/rdna3` → Vulkan + arch for `--iree-vulkan-target`
     /// - `rocm` / `hip` → HIP (default chip `gfx1151`, or `DYNINFER_ROCM_TARGET`)
     /// - `rocm:gfx1151` / `hip:gfx1100` / `rocm/gfx1151` → HIP + chip
     /// - `cuda` / `cuda:sm_80` → CUDA (+ arch)
@@ -79,8 +80,8 @@ impl TargetDiscovery {
         if spec == "cpu" || spec == "llvm-cpu" || spec.starts_with("local") {
             return Ok(TargetProfile::llvm_cpu_host());
         }
-        if spec == "vulkan" || spec.starts_with("vulkan://") {
-            return Ok(TargetProfile::vulkan_generic());
+        if let Some(chip) = parse_vulkan_spec(spec) {
+            return Ok(TargetProfile::vulkan(&chip));
         }
         if let Some(arch) = parse_cuda_spec(spec) {
             return Ok(TargetProfile::cuda(&arch));
@@ -91,8 +92,8 @@ impl TargetDiscovery {
         Err(DynInferError::Config(ConfigError {
             message: format!(
                 "unknown target specification: {spec} \
-                 (expected auto|cpu|vulkan|rocm|hip|cuda|rocm:gfxXXXX|cuda:sm_XX; \
-                 default ROCm chip {}, default CUDA {})",
+                 (expected auto|cpu|vulkan|vulkan:gfxXXXX|rocm|hip|cuda|rocm:gfxXXXX|cuda:sm_XX; \
+                 default ROCm/Vulkan chip {}, default CUDA {})",
                 TargetProfile::DEFAULT_ROCM_TARGET,
                 TargetProfile::DEFAULT_CUDA_TARGET
             ),
@@ -141,11 +142,36 @@ fn default_rocm_chip() -> String {
         .unwrap_or_else(|| TargetProfile::DEFAULT_ROCM_TARGET.to_string())
 }
 
+fn default_vulkan_chip() -> String {
+    std::env::var("DYNINFER_VULKAN_TARGET")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(default_rocm_chip)
+}
+
 fn default_cuda_arch() -> String {
     std::env::var("DYNINFER_CUDA_TARGET")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| TargetProfile::DEFAULT_CUDA_TARGET.to_string())
+}
+
+fn parse_vulkan_spec(spec: &str) -> Option<String> {
+    let lower = spec.to_ascii_lowercase();
+    if lower == "vulkan" || lower.starts_with("vulkan://") {
+        return Some(default_vulkan_chip());
+    }
+    for sep in [':', '/'] {
+        let p = format!("vulkan{sep}");
+        if lower.strip_prefix(&p).is_some() {
+            let raw = spec["vulkan".len() + 1..].trim();
+            if raw.is_empty() {
+                return Some(default_vulkan_chip());
+            }
+            return Some(raw.to_string());
+        }
+    }
+    None
 }
 
 fn parse_rocm_spec(spec: &str) -> Option<String> {
@@ -336,14 +362,14 @@ fn pending_to_device(
         "vulkan" => {
             let id = *vulkan_index;
             *vulkan_index += 1;
-            let mut profile = TargetProfile::vulkan_generic();
+            let mut profile = TargetProfile::vulkan(&default_vulkan_chip());
             profile.device_id = Some(id);
             Some(DiscoveredDevice {
                 driver: "vulkan".into(),
                 device_id: id,
                 name: nonempty_name(&p.name, "vulkan"),
                 uri: p.uri,
-                arch: p.arch,
+                arch: Some(default_vulkan_chip()),
                 profile,
             })
         }

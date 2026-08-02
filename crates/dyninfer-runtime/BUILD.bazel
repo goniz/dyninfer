@@ -19,5 +19,6 @@ rust_test(
     data = [
         "//bazel/iree:tools",
     ],
+    timeout = "long",
     deps = all_crate_deps(normal_dev = True),
 )

@@ -145,10 +145,11 @@ impl DenseDecoderConfig {
         // Explicit overrides win (CLI `--prefill-window` / `--set prefill_window=`).
         let seq = u(&["prefill_window"], default_seq);
         let max_kv = u(&["max_kv"], default_max_kv);
-        let rope_theta = meta
+        let rope_theta = cfg
+            .values
             .get("rope_theta")
             .and_then(|v| v.as_f64())
-            .or_else(|| cfg.values.get("rope_theta").and_then(|v| v.as_f64()))
+            .or_else(|| meta.get("rope_theta").and_then(|v| v.as_f64()))
             .map(|v| v as f32);
         let has_qk_norm = catalog.parameters.iter().any(|p| {
             p.canonical_name
@@ -179,7 +180,10 @@ impl DenseDecoderConfig {
             seq,
             max_kv: max_kv.max(seq),
             rms_norm_eps: f(&["rms_norm_eps"], 1e-5),
+            // `rope_theta <= 0` in metadata/overrides disables RoPE (bisect / ablations).
             rope_theta: if is_synthetic {
+                None
+            } else if rope_theta.is_some_and(|t| t <= 0.0) {
                 None
             } else {
                 rope_theta.or(Some(10000.0))
@@ -762,7 +766,7 @@ fn emit_decode_helpers(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Re
 
     let (q_ssa, k_ssa) = if c.rope_theta.is_some() {
         f.op_asm(format!(
-            "  %qr = func.call @apply_rope_q_at(%{q_heads}, %pos) : (tensor<1x{nh}x{d}xf32>, index) -> tensor<1x{nh}x{d}xf32>\n",
+            "  %qr = func.call @apply_rope_q_at(%{q_heads}, %pos_t) : (tensor<1x{nh}x{d}xf32>, tensor<i64>) -> tensor<1x{nh}x{d}xf32>\n",
             q_heads = q_heads,
             nh = nh,
             d = d,
@@ -773,7 +777,7 @@ fn emit_decode_helpers(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Re
             "apply_rope_q_at"
         };
         f.op_asm(format!(
-            "  %kr = func.call @{rope_kv}(%{k_heads}, %pos) : (tensor<1x{nkv}x{d}xf32>, index) -> tensor<1x{nkv}x{d}xf32>\n",
+            "  %kr = func.call @{rope_kv}(%{k_heads}, %pos_t) : (tensor<1x{nkv}x{d}xf32>, tensor<i64>) -> tensor<1x{nkv}x{d}xf32>\n",
             rope_kv = rope_kv,
             k_heads = k_heads,
             nkv = nkv,
@@ -1052,12 +1056,21 @@ fn emit_prefill(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()
                 "  %{p}_ctx, %{p}_kc, %{p}_vc = func.call @attn(%{p}_q, %{p}_k, %{p}_v) : (tensor<{s}x{q}xf32>, tensor<{s}x{kv}xf32>, tensor<{s}x{kv}xf32>) -> (tensor<{s}x{q}xf32>, tensor<{s}x{nkv}x{d}xf32>, tensor<{s}x{nkv}x{d}xf32>)\n"
             ));
         }
-        // Seed mutable KV at positions [0, seq).
+        // Seed mutable KV at positions [0, seq). Always start from zeros so the
+        // [seq, max_kv) tail cannot retain garbage (mutable global zero-init is
+        // not reliable on the IREE CPU path once max_kv > prefill_window).
         f.op_asm(format!(
-            "  %{p}_k_old = util.global.load @kv_k{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
+            "  %{p}_k_z = tensor.empty() : tensor<{mk}x{nkv}x{d}xf32>\n"
         ));
         f.op_asm(format!(
-            "  %{p}_v_old = util.global.load @kv_v{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
+            "  %{p}_v_z = tensor.empty() : tensor<{mk}x{nkv}x{d}xf32>\n"
+        ));
+        f.op_asm(format!("  %{p}_k_f0 = arith.constant 0.0 : f32\n"));
+        f.op_asm(format!(
+            "  %{p}_k_old = linalg.fill ins(%{p}_k_f0 : f32) outs(%{p}_k_z : tensor<{mk}x{nkv}x{d}xf32>) -> tensor<{mk}x{nkv}x{d}xf32>\n"
+        ));
+        f.op_asm(format!(
+            "  %{p}_v_old = linalg.fill ins(%{p}_k_f0 : f32) outs(%{p}_v_z : tensor<{mk}x{nkv}x{d}xf32>) -> tensor<{mk}x{nkv}x{d}xf32>\n"
         ));
         f.op_asm(format!(
             "  %{p}_k_new = tensor.insert_slice %{p}_kc into %{p}_k_old[0, 0, 0] [{s}, {nkv}, {d}] [1, 1, 1] : tensor<{s}x{nkv}x{d}xf32> into tensor<{mk}x{nkv}x{d}xf32>\n"
@@ -1529,6 +1542,49 @@ mod tests {
         assert!(
             mlir.contains("@prefill") || mlir.contains("func.func @prefill"),
             "verified module missing prefill: {mlir}"
+        );
+    }
+
+    #[test]
+    fn tiny_gqa_rope_decode_mlir_indexes_pos() {
+        let c = DenseDecoderConfig {
+            vocab: 32,
+            hidden: 64,
+            intermediate: 128,
+            num_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 16,
+            num_layers: 1,
+            seq: 4,
+            max_kv: 8,
+            rms_norm_eps: 1e-5,
+            rope_theta: Some(10000.0),
+            has_qk_norm: true,
+            param_keys: BTreeMap::new(),
+            param_dtypes: BTreeMap::new(),
+        };
+        let mlir = emit_dense_decoder_cfg("test.gqa", &c).expect("emit");
+        assert!(mlir.contains("func.func private @attn_decode"));
+        assert!(mlir.contains("func.func private @apply_rope_kv_at"));
+        let rope = mlir
+            .split("func.func private @apply_rope_kv_at")
+            .nth(1)
+            .expect("apply_rope_kv_at");
+        let rope = rope.split("func.func").next().unwrap();
+        assert!(
+            rope.contains("pos_t") || rope.contains("%arg1"),
+            "rope_at must take tensor<i64> pos"
+        );
+        let dec = mlir
+            .split("func.func private @attn_decode")
+            .nth(1)
+            .expect("attn_decode");
+        let dec = dec.split("func.func").next().unwrap();
+        assert!(dec.contains("repeat_kv_mk") || dec.contains("@repeat_kv_mk"));
+        // Prefill must zero-fill KV before insert (avoids garbage when max_kv > seq).
+        assert!(
+            mlir.contains("linalg.fill") && mlir.contains("kv_k0"),
+            "prefill should zero-fill KV globals before seeding"
         );
     }
 }

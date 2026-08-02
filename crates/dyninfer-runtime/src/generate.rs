@@ -34,7 +34,8 @@ impl Default for GenerateConfig {
     fn default() -> Self {
         Self {
             max_new_tokens: 48,
-            eos_token_id: Some(2),
+            // Prefer tokenizer / model metadata; never hardcode Llama's 2.
+            eos_token_id: None,
         }
     }
 }

@@ -262,6 +262,8 @@ pub fn emit_rope(
 }
 
 /// RoPE at absolute position `pos` (decode path). Tables sized `[max_kv, D/2]`.
+///
+/// Takes `tensor<i64>` to match the `@decode` ABI (same as `pos_t` elsewhere).
 pub fn emit_rope_at(
     module: &mut ModuleBuilder,
     name: &str,
@@ -292,11 +294,13 @@ pub fn emit_rope_at(
 
     let mut f = module.func_private(name);
     let x = f.arg("x", &x_ty);
-    let pos = f.arg("pos", "index");
+    let _pos_t = f.arg("pos_t", "tensor<i64>");
     f.result_ty(&x_ty);
     f.op_asm(format!(
         r#"  %cos = arith.constant dense<[{cos_lit}]> : {half_ty}
   %sin = arith.constant dense<[{sin_lit}]> : {half_ty}
+  %pos_i64 = tensor.extract %pos_t[] : tensor<i64>
+  %pos = arith.index_cast %pos_i64 : i64 to index
   %init = tensor.empty() : {x_ty}
   %y = linalg.generic {{
       indexing_maps = [
@@ -315,8 +319,8 @@ pub fn emit_rope_at(
       %dim_hi = arith.addi %pair_lo, %half_i : index
       %x1 = tensor.extract {x}[%c0i, %hh, %pair_lo] : {x_ty}
       %x2 = tensor.extract {x}[%c0i, %hh, %dim_hi] : {x_ty}
-      %cv = tensor.extract %cos[{pos}, %pair_lo] : {half_ty}
-      %sv = tensor.extract %sin[{pos}, %pair_lo] : {half_ty}
+      %cv = tensor.extract %cos[%pos, %pair_lo] : {half_ty}
+      %sv = tensor.extract %sin[%pos, %pair_lo] : {half_ty}
       %x1c = arith.mulf %x1, %cv : f32
       %x2s = arith.mulf %x2, %sv : f32
       %x1s = arith.mulf %x1, %sv : f32

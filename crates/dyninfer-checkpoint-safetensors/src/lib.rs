@@ -11,9 +11,14 @@ mod materialize;
 
 pub use convention::DenseSafetensorsConvention;
 pub use container::SafeTensorsContainer;
-pub use fixture::{fill_f32, tiny_llama_dense_f32, write_safetensors};
+pub use fixture::{
+    fill_f32, tiny_gqa_plain_f32, tiny_gqa_rope_f32, tiny_llama_dense_f32, tiny_mha_rope_f32, write_safetensors,
+};
 pub use hf_names::{hf_to_canonical, looks_like_hf_llama};
-pub use materialize::{materialize_f32_safetensors, resolve_runtime_parameters};
+pub use materialize::{
+    decode_parameters_as_f32_host, materialize_f32_safetensors, resolve_runtime_parameters,
+    HostF32Parameters,
+};
 
 use dyninfer_checkpoint::BuiltinCheckpointSupport;
 

@@ -307,14 +307,15 @@ fn main() -> anyhow::Result<()> {
                 .extra
                 .get("eos_token_id")
                 .and_then(|v| v.as_u64())
-                .map(|v| v as u32);
+                .map(|v| v as u32)
+                .or_else(|| tokenizer.eos_id());
             let out = generate_greedy(
                 &model,
                 &tokenizer,
                 &prompt,
                 &GenerateConfig {
                     max_new_tokens,
-                    eos_token_id: eos.or(Some(2)),
+                    eos_token_id: eos,
                 },
                 SessionConfig::default(),
             )?;
@@ -376,14 +377,15 @@ fn main() -> anyhow::Result<()> {
                 .extra
                 .get("eos_token_id")
                 .and_then(|v| v.as_u64())
-                .map(|v| v as u32);
+                .map(|v| v as u32)
+                .or_else(|| tokenizer.eos_id());
             let out = generate_greedy(
                 &model,
                 &tokenizer,
                 &prompt,
                 &GenerateConfig {
                     max_new_tokens,
-                    eos_token_id: eos.or(Some(2)),
+                    eos_token_id: eos,
                 },
                 SessionConfig::default(),
             )?;

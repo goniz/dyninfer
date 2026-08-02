@@ -103,14 +103,38 @@ impl Drop for NativeSession {
     }
 }
 
-/// Execution context bound to a module (+ optional external parameter file).
+/// Execution context bound to a module (+ optional external parameters).
 pub struct Context {
     _instance: Instance,
     module: Module,
     parameters: Option<PathBuf>,
+    /// In-memory f32 parameter blobs (Vulkan bf16 promote). Kept alive for the
+    /// session; mutually exclusive with [`Self::parameters`].
+    host_parameters: Option<HostParameterStorage>,
     /// IREE HAL driver name (`hip`, `vulkan`, …). Empty → local-task.
     device: Option<String>,
     session: Mutex<Option<NativeSession>>,
+}
+
+/// Owns CString keys + f32 LE bytes for `dyninfer_iree_session_create_with_host_params`.
+pub struct HostParameterStorage {
+    entries: Vec<(CString, Vec<u8>)>,
+}
+
+impl HostParameterStorage {
+    pub fn from_f32_entries(entries: Vec<(String, Vec<u8>)>) -> Result<Self> {
+        let mut out = Vec::with_capacity(entries.len());
+        for (key, data) in entries {
+            let ckey = CString::new(key.as_str()).map_err(|e| {
+                DynInferError::IreeRuntime(IreeRuntimeError {
+                    message: format!("invalid parameter key {key:?}: {e}"),
+                    status_code: None,
+                })
+            })?;
+            out.push((ckey, data));
+        }
+        Ok(Self { entries: out })
+    }
 }
 
 impl Context {
@@ -119,6 +143,7 @@ impl Context {
             _instance: instance,
             module,
             parameters: None,
+            host_parameters: None,
             device: None,
             session: Mutex::new(None),
         })
@@ -126,6 +151,15 @@ impl Context {
 
     pub fn with_parameters(mut self, path: impl AsRef<Path>) -> Self {
         self.parameters = Some(path.as_ref().to_path_buf());
+        self.host_parameters = None;
+        self
+    }
+
+    /// Bind host-owned f32 parameter blobs (no parameter file). Used when the
+    /// VMFB expects promoted f32 weights.
+    pub fn with_host_parameters(mut self, storage: HostParameterStorage) -> Self {
+        self.host_parameters = Some(storage);
+        self.parameters = None;
         self
     }
 
@@ -181,22 +215,46 @@ impl Context {
                         status_code: None,
                     })
                 })?;
-            let params_c = self.parameters.as_deref().map(path_cstring).transpose()?;
 
             let mut ptr = ptr::null_mut();
-            let rc = unsafe {
-                sys::dyninfer_iree_session_create(
-                    device_c
-                        .as_ref()
-                        .map(|c| c.as_ptr())
-                        .unwrap_or(ptr::null()),
-                    vmfb_c.as_ptr(),
-                    params_c
-                        .as_ref()
-                        .map(|c| c.as_ptr())
-                        .unwrap_or(ptr::null()),
-                    &mut ptr,
-                )
+            let rc = if let Some(host) = self.host_parameters.as_ref() {
+                let c_params: Vec<sys::dyninfer_iree_host_param_t> = host
+                    .entries
+                    .iter()
+                    .map(|(key, data)| sys::dyninfer_iree_host_param_t {
+                        key: key.as_ptr(),
+                        data: data.as_ptr().cast(),
+                        length: data.len(),
+                    })
+                    .collect();
+                unsafe {
+                    sys::dyninfer_iree_session_create_with_host_params(
+                        device_c
+                            .as_ref()
+                            .map(|c| c.as_ptr())
+                            .unwrap_or(ptr::null()),
+                        vmfb_c.as_ptr(),
+                        c_params.as_ptr(),
+                        c_params.len(),
+                        &mut ptr,
+                    )
+                }
+            } else {
+                let params_c = self.parameters.as_deref().map(path_cstring).transpose()?;
+                unsafe {
+                    sys::dyninfer_iree_session_create(
+                        device_c
+                            .as_ref()
+                            .map(|c| c.as_ptr())
+                            .unwrap_or(ptr::null()),
+                        vmfb_c.as_ptr(),
+                        params_c
+                            .as_ref()
+                            .map(|c| c.as_ptr())
+                            .unwrap_or(ptr::null()),
+                        &mut ptr,
+                    )
+                }
             };
             if rc != 0 || ptr.is_null() {
                 return Err(native_error(rc));
