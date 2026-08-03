@@ -256,14 +256,14 @@ impl ModelLoader {
             let storage = HostParameterStorage::from_f32_entries(host.entries)?;
             (
                 RuntimeParameters::Host(Arc::new(storage)),
-                Some(manifest.target.driver.clone()),
+                Some(manifest.target.runtime_device().to_string()),
             )
         } else {
             let params_path =
                 dyninfer_checkpoint_safetensors::resolve_runtime_parameters(&catalog)?;
             (
                 RuntimeParameters::File(params_path),
-                Some(manifest.target.driver.clone()),
+                Some(manifest.target.runtime_device().to_string()),
             )
         };
 

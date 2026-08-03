@@ -175,7 +175,7 @@ static int session_create_common(const char* device_uri, const char* vmfb_path,
     return 1;
   }
 
-  const char* driver =
+  const char* driver_or_uri =
       (device_uri && device_uri[0] != '\0') ? device_uri : "local-task";
 
   dyninfer_iree_session_t* s =
@@ -192,8 +192,18 @@ static int session_create_common(const char* device_uri, const char* vmfb_path,
       &instance_options, iree_allocator_system(), &s->instance);
 
   if (iree_status_is_ok(status)) {
-    status = iree_runtime_instance_try_create_default_device(
-        s->instance, iree_make_cstring_view(driver), &s->device);
+    // Full HAL URIs (contain "://") select a specific device; bare driver
+    // names fall back to the driver's default device.
+    if (strstr(driver_or_uri, "://") != NULL) {
+      iree_hal_driver_registry_t* registry =
+          iree_runtime_instance_driver_registry(s->instance);
+      status = iree_hal_create_device(
+          registry, iree_make_cstring_view(driver_or_uri),
+          iree_runtime_instance_host_allocator(s->instance), &s->device);
+    } else {
+      status = iree_runtime_instance_try_create_default_device(
+          s->instance, iree_make_cstring_view(driver_or_uri), &s->device);
+    }
   }
 
   iree_runtime_session_options_t session_options;

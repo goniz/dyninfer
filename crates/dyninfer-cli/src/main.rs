@@ -402,7 +402,7 @@ fn main() -> anyhow::Result<()> {
             println!("compiled smoke VMFB ({} bytes)", vmfb.len());
             let instance = Instance::new()?;
             let module = Module::from_vmfb(vmfb)?;
-            let ctx = Context::create(instance, module)?.with_device(profile.driver.clone());
+            let ctx = Context::create(instance, module)?.with_device(profile.runtime_device());
             let out = ctx.invoke_add(&[1.0, 2.0, 3.0, 4.0], &[10.0, 20.0, 30.0, 40.0])?;
             println!("add([1,2,3,4],[10,20,30,40]) = {out:?}");
             if out == [11.0, 22.0, 33.0, 44.0] {

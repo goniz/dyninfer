@@ -329,11 +329,14 @@ fn pending_to_device(
                 driver: "cuda".into(),
                 device_id: id,
                 name: nonempty_name(&p.name, &format!("cuda-{arch}")),
-                uri: p.uri,
+                uri: p.uri.clone(),
                 arch: Some(arch.clone()),
                 profile: {
                     let mut profile = TargetProfile::cuda(&arch);
                     profile.device_id = Some(id);
+                    if !p.uri.is_empty() {
+                        profile.device_uri = Some(p.uri.clone());
+                    }
                     profile
                 },
             })
@@ -350,11 +353,14 @@ fn pending_to_device(
                 driver: "hip".into(),
                 device_id: id,
                 name: nonempty_name(&p.name, &format!("rocm-{arch}")),
-                uri: p.uri,
+                uri: p.uri.clone(),
                 arch: Some(arch.clone()),
                 profile: {
                     let mut profile = TargetProfile::hip_rocm(&arch);
                     profile.device_id = Some(id);
+                    if !p.uri.is_empty() {
+                        profile.device_uri = Some(p.uri.clone());
+                    }
                     profile
                 },
             })
@@ -362,14 +368,22 @@ fn pending_to_device(
         "vulkan" => {
             let id = *vulkan_index;
             *vulkan_index += 1;
-            let mut profile = TargetProfile::vulkan(&default_vulkan_chip());
+            let arch = p
+                .arch
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(default_vulkan_chip);
+            let mut profile = TargetProfile::vulkan(&arch);
             profile.device_id = Some(id);
+            if !p.uri.is_empty() {
+                profile.device_uri = Some(p.uri.clone());
+            }
             Some(DiscoveredDevice {
                 driver: "vulkan".into(),
                 device_id: id,
-                name: nonempty_name(&p.name, "vulkan"),
+                name: nonempty_name(&p.name, &format!("vulkan-{arch}")),
                 uri: p.uri,
-                arch: Some(default_vulkan_chip()),
+                arch: Some(arch),
                 profile,
             })
         }
@@ -445,6 +459,12 @@ mod tests {
         assert_eq!(devices[0].profile.rocm_target(), Some("gfx1151"));
         assert!(devices.iter().any(|d| d.driver == "vulkan"));
         assert!(devices.iter().any(|d| d.driver == "local-task"));
+        let vulkan = devices.iter().find(|d| d.driver == "vulkan").unwrap();
+        assert_eq!(
+            vulkan.uri,
+            "vulkan://00000000-f400-0000-0000-000000000000"
+        );
+        assert_eq!(vulkan.profile.device_uri.as_deref(), Some(vulkan.uri.as_str()));
     }
 
     #[test]

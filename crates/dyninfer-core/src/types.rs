@@ -267,6 +267,10 @@ pub struct TargetProfile {
     pub triple: Option<String>,
     pub features: Vec<String>,
     pub capability_fingerprint: Digest,
+    /// Full HAL device URI from discovery (`vulkan://GPU-…`, `hip://0`, …).
+    /// When set, the runtime MUST open this device instead of the driver default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_uri: Option<String>,
 }
 
 impl TargetProfile {
@@ -286,6 +290,7 @@ impl TargetProfile {
             triple,
             features,
             capability_fingerprint,
+            device_uri: None,
         }
     }
 
@@ -306,6 +311,7 @@ impl TargetProfile {
             capability_fingerprint: Digest::from_bytes(
                 format!("vulkan|{chip}|promote-bf16-f32").as_bytes(),
             ),
+            device_uri: None,
         }
     }
 
@@ -330,6 +336,7 @@ impl TargetProfile {
             triple: Some(chip.to_string()),
             features: vec![format!("rocm-target={chip}")],
             capability_fingerprint: Digest::from_bytes(format!("hip|{chip}").as_bytes()),
+            device_uri: None,
         }
     }
 
@@ -346,7 +353,16 @@ impl TargetProfile {
             triple: Some(arch.to_string()),
             features: vec![format!("cuda-target={arch}")],
             capability_fingerprint: Digest::from_bytes(format!("cuda|{arch}").as_bytes()),
+            device_uri: None,
         }
+    }
+
+    /// Preferred runtime device string: full URI when known, else driver name.
+    pub fn runtime_device(&self) -> &str {
+        self.device_uri
+            .as_deref()
+            .filter(|u| !u.is_empty())
+            .unwrap_or(self.driver.as_str())
     }
 
     /// ROCm chip / SKU for `--iree-rocm-target`, if this is a HIP profile.
