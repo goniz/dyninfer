@@ -52,6 +52,27 @@ bazel run //crates/dyninfer-cli:dyninfer -- generate \
   --max-new-tokens 16
 ```
 
+### Qwen3-0.6B Q4_0 GGUF (device-fused qkernel)
+
+Prefer a pure Q4_0 file. Good source:
+[`ggml-org/Qwen3-0.6B-GGUF`](https://huggingface.co/ggml-org/Qwen3-0.6B-GGUF)
+(`Qwen3-0.6B-Q4_0.gguf`). Pair with tokenizer/config from `Qwen/Qwen3-0.6B`.
+
+```bash
+hf download ggml-org/Qwen3-0.6B-GGUF Qwen3-0.6B-Q4_0.gguf --local-dir /tmp/qwen3-q4
+hf download Qwen/Qwen3-0.6B config.json tokenizer.json tokenizer_config.json \
+  vocab.json merges.txt --local-dir /tmp/qwen3-q4
+
+bazel run //crates/dyninfer-cli:dyninfer -- generate \
+  --model-dir /tmp/qwen3-q4 \
+  --checkpoint /tmp/qwen3-q4/Qwen3-0.6B-Q4_0.gguf \
+  --architecture qwen3.decoder \
+  --prefill-window 8 --max-kv 16 \
+  --prompt "Hello" --max-new-tokens 8 --target cpu
+```
+
+(`unsloth/Qwen3-0.6B-GGUF` Q4_0 mixes Q4_1 / Q6_K and is not supported yet.)
+
 ### TinyStories Llama example
 
 Uses ungated [Maykeye/TinyLLama-v0](https://huggingface.co/Maykeye/TinyLLama-v0)

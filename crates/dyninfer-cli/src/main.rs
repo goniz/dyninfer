@@ -7,7 +7,7 @@ use dyninfer_cache::ArtifactCache;
 use dyninfer_compiler::{CompileOptions, compile_add_smoke};
 use dyninfer_core::SessionConfig;
 use dyninfer_runtime::{
-    CausalLanguageModel, GenerateConfig, GenerateOutput, ModelLoader, find_safetensors_checkpoint,
+    CausalLanguageModel, GenerateConfig, GenerateOutput, ModelLoader, find_checkpoint,
     generate_greedy, load_tokenizer, resolve_hf_snapshot,
 };
 use dyninfer_target::TargetDiscovery;
@@ -79,7 +79,7 @@ enum Commands {
         /// Architecture id, or `auto` to detect from config.json.
         #[arg(long, default_value = "auto")]
         architecture: String,
-        /// Local model directory (config.json + *.safetensors + tokenizer.json).
+        /// Local model directory (config.json + weights + tokenizer.json).
         #[arg(long, conflicts_with = "hf")]
         model_dir: Option<PathBuf>,
         /// Hugging Face repo id resolved against the local Hub cache
@@ -89,6 +89,9 @@ enum Commands {
         /// Hub revision / branch / snapshot hash (default: main).
         #[arg(long, default_value = "main")]
         revision: String,
+        /// Explicit checkpoint path (`.safetensors` or `.gguf`). Overrides discovery.
+        #[arg(long)]
+        checkpoint: Option<PathBuf>,
         /// Execution target: `auto` (probe IREE HAL), `cpu`, `vulkan`, `rocm`/`hip`/`cuda`, or `rocm:gfxXXXX` / `cuda:sm_XX`.
         #[arg(long, default_value = "auto")]
         target: String,
@@ -326,6 +329,7 @@ fn main() -> anyhow::Result<()> {
             model_dir,
             hf,
             revision,
+            checkpoint,
             target,
             prompt,
             max_new_tokens,
@@ -343,7 +347,11 @@ fn main() -> anyhow::Result<()> {
                 (None, None) => anyhow::bail!("provide --hf ORG/NAME or --model-dir PATH"),
                 (Some(_), Some(_)) => unreachable!("clap conflicts_with"),
             };
-            let ckpt = find_safetensors_checkpoint(&model_dir)?;
+            let ckpt = match checkpoint {
+                Some(p) => p,
+                None => find_checkpoint(&model_dir)?,
+            };
+            eprintln!("checkpoint {}", ckpt.display());
             let default_bundle = std::env::temp_dir().join(format!(
                 "dyninfer-generate-{}/model.bundle",
                 std::process::id()

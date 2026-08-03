@@ -267,10 +267,10 @@ impl ModelLoader {
 
         let (parameters, device) =
             if needs_host_f32_params(&manifest.target.driver) || is_gguf || has_q4 {
-                // Vulkan promote and GGUF Q4_0 both bind host f32 blobs (qkernel
-                // dequant runs on the host for the portable Milestone-2 path).
+                // Vulkan promote, GGUF dense, and Q4: bind host blobs.
+                // Q4 layer weights stay packed; embd/output are host-dequantized.
                 let host_entries = if is_gguf || has_q4 {
-                    dyninfer_checkpoint_gguf::decode_parameters_as_f32_host(&catalog)?
+                    dyninfer_checkpoint_gguf::decode_parameters_as_host(&catalog)?
                 } else {
                     dyninfer_checkpoint_safetensors::decode_parameters_as_f32_host(&catalog)?
                         .entries
@@ -298,15 +298,28 @@ impl ModelLoader {
         };
         let _probe = executable.open_context()?;
 
+        let vocabulary_size = catalog
+            .metadata
+            .get("vocab_size")
+            .or_else(|| catalog.metadata.get("llama.vocab_size"))
+            .or_else(|| catalog.metadata.get("qwen3.vocab_size"))
+            .and_then(|v| v.as_u64())
+            .or_else(|| {
+                catalog
+                    .parameters
+                    .iter()
+                    .find(|p| {
+                        let n = p.canonical_name.as_str();
+                        n == "token_embd.weight" || n == "output.weight"
+                    })
+                    .and_then(|p| p.logical_type.shape.dims().first().copied())
+            })
+            .unwrap_or(32000) as u32;
+
         let metadata = ModelMetadata {
             architecture_id: manifest.architecture_id.clone(),
             architecture_revision: manifest.architecture_revision.clone(),
-            vocabulary_size: catalog
-                .metadata
-                .get("vocab_size")
-                .or_else(|| catalog.metadata.get("llama.vocab_size"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(32000) as u32,
+            vocabulary_size,
             context_length: manifest.kv_cache.max_sequence_length,
             num_layers: manifest.kv_cache.layer_count,
             num_heads: catalog

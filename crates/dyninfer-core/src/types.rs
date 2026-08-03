@@ -149,9 +149,9 @@ impl PhysicalEncoding {
 
     /// Encodings that can be bound and executed today.
     ///
-    /// GGUF Q4_0 uses the portable qkernel path: host-side block dequant into
-    /// f32 parameters for the dense decoder VMFB (device-fused SCF lowering in
-    /// `ops/qkernel.rs` is available for the next specialization step).
+    /// GGUF Q4_0 uses the portable qkernel path: layer weights bind as packed
+    /// i8 and lower to device-fused unpack+dot; embd/output are host-dequantized
+    /// to f32 for gather / vocab projection.
     pub fn is_supported_v1(&self) -> bool {
         match self {
             Self::Plain { .. } => true,

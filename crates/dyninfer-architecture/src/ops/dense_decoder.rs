@@ -25,7 +25,7 @@
 //! helpers (`attn`, `rope`, …), not switching IR frontends.
 
 use crate::ArchitecturePackage;
-use crate::ops::kernels;
+use crate::ops::{kernels, qkernel};
 use dyninfer_checkpoint::CheckpointCatalog;
 use dyninfer_core::{PhysicalEncoding, ScalarType, StorageElementType};
 use dyninfer_error::Result;
@@ -242,6 +242,28 @@ impl DenseDecoderConfig {
         })
     }
 
+    /// Q4 matrices used by matmul bind as packed i8 and use fused unpack+dot.
+    /// Embedding / lm_head tables stay host-dequantized f32 so gather and the
+    /// huge vocab projection remain dense (device path targets layer linears).
+    fn param_device_q4(&self, canonical: &str) -> bool {
+        self.param_is_q4_0(canonical)
+            && canonical != "token_embd.weight"
+            && canonical != "output.weight"
+    }
+
+    fn has_device_q4(&self) -> bool {
+        self.param_encodings
+            .keys()
+            .any(|k| self.param_device_q4(k))
+    }
+
+    fn param_packed_nbytes(&self, canonical: &str, rows: u32, cols: u32) -> u32 {
+        if let Some(&n) = self.param_nbytes.get(canonical) {
+            return n as u32;
+        }
+        qkernel::q4_0_packed_len(rows, cols)
+    }
+
     /// True for the synthetic Milestone-1 fixture (`tiny_llama_dense_f32`):
     /// vocab=32, hidden=64, 1 layer, seq=4, no RoPE — used by differential e2e.
     pub fn is_synthetic_fixture(&self) -> bool {
@@ -319,6 +341,16 @@ fn mlir_ty(ty: ScalarType) -> String {
     ty.to_string()
 }
 
+fn parse_matrix_shape(shape: &str) -> (u32, u32) {
+    let (rows, cols) = shape
+        .split_once('x')
+        .unwrap_or_else(|| panic!("expected RxC shape, got {shape}"));
+    (
+        rows.parse().unwrap_or_else(|_| panic!("bad rows in {shape}")),
+        cols.parse().unwrap_or_else(|_| panic!("bad cols in {shape}")),
+    )
+}
+
 fn emit_global(
     builder: &mut ModuleBuilder,
     c: &DenseDecoderConfig,
@@ -327,9 +359,12 @@ fn emit_global(
     shape: &str,
 ) -> Result<()> {
     let key = c.param_key(canonical);
-    // Q4_0 is host-dequantized to f32 before bind (portable qkernel decode);
-    // the VMFB sees dense f32 parameters. Device-side SCF dequant lives in
-    // `ops/qkernel.rs` for the fused lowering path.
+    if c.param_device_q4(canonical) {
+        let (rows, cols) = parse_matrix_shape(shape);
+        let nbytes = c.param_packed_nbytes(canonical, rows, cols);
+        return builder.util_global_parameter(sym, &key, &format!("tensor<{nbytes}xi8>"));
+    }
+    // Host-dequantized Q4 embd (and plain tensors) bind as dense f32 / catalog dtype.
     let wt = if c.param_is_q4_0(canonical) {
         mlir_ty(ScalarType::F32)
     } else {
@@ -347,6 +382,12 @@ fn emit_load_compute(
     canonical: &str,
     shape: &str,
 ) {
+    if c.param_device_q4(canonical) {
+        let (rows, cols) = parse_matrix_shape(shape);
+        let nbytes = c.param_packed_nbytes(canonical, rows, cols);
+        qkernel::load_q4_0_packed(f, ssa, sym, nbytes);
+        return;
+    }
     let storage = if c.param_is_q4_0(canonical) {
         ScalarType::F32
     } else {
@@ -365,6 +406,64 @@ fn emit_load_compute(
             "dense decoder: cannot cast checkpoint dtype {other} → compute {COMPUTE_DTYPE} for {canonical}"
         ),
     }
+}
+
+fn emit_linear_call(
+    f: &mut FuncBuilder,
+    c: &DenseDecoderConfig,
+    result: &str,
+    dense_fn: &str,
+    q4_fn: &str,
+    x: &str,
+    w: &str,
+    weight_canonical: &str,
+    s: u32,
+    in_dim: u32,
+    out_dim: u32,
+) {
+    if c.param_device_q4(weight_canonical) {
+        let nbytes = c.param_packed_nbytes(weight_canonical, out_dim, in_dim);
+        f.op_asm(format!(
+            "  %{result} = func.call @{q4_fn}(%{x}, %{w}) : (tensor<{s}x{in_dim}xf32>, tensor<{nbytes}xi8>) -> tensor<{s}x{out_dim}xf32>\n"
+        ));
+    } else {
+        f.op_asm(format!(
+            "  %{result} = func.call @{dense_fn}(%{x}, %{w}) : (tensor<{s}x{in_dim}xf32>, tensor<{out_dim}x{in_dim}xf32>) -> tensor<{s}x{out_dim}xf32>\n"
+        ));
+    }
+}
+
+/// Project hidden → vocab logits. Emits `%logits : tensor<{vocab}xf32>`.
+fn emit_output_proj(
+    f: &mut FuncBuilder,
+    c: &DenseDecoderConfig,
+    hidden_ssa: &str,
+    weight_ssa: &str,
+    q4_fn: &str,
+) {
+    let (h, v) = (c.hidden, c.vocab);
+    if c.param_device_q4("output.weight") {
+        let nbytes = c.param_packed_nbytes("output.weight", v, h);
+        f.op_asm(format!(
+            "  %y = func.call @{q4_fn}(%{hidden_ssa}, %{weight_ssa}) : (tensor<1x{h}xf32>, tensor<{nbytes}xi8>) -> tensor<1x{v}xf32>\n"
+        ));
+    } else {
+        f.op_asm("  %c0f = arith.constant 0.0 : f32\n");
+        f.op_asm(format!("  %wt_i = tensor.empty() : tensor<{h}x{v}xf32>\n"));
+        f.op_asm(format!(
+            "  %wt = linalg.transpose ins(%{weight_ssa} : tensor<{v}x{h}xf32>) outs(%wt_i : tensor<{h}x{v}xf32>) permutation = [1, 0]\n"
+        ));
+        f.op_asm(format!("  %yi = tensor.empty() : tensor<1x{v}xf32>\n"));
+        f.op_asm(format!(
+            "  %yz = linalg.fill ins(%c0f : f32) outs(%yi : tensor<1x{v}xf32>) -> tensor<1x{v}xf32>\n"
+        ));
+        f.op_asm(format!(
+            "  %y = linalg.matmul ins(%{hidden_ssa}, %wt : tensor<1x{h}xf32>, tensor<{h}x{v}xf32>) outs(%yz : tensor<1x{v}xf32>) -> tensor<1x{v}xf32>\n"
+        ));
+    }
+    f.op_asm(format!(
+        "  %logits = tensor.collapse_shape %y [[0, 1]] : tensor<1x{v}xf32> into tensor<{v}xf32>\n"
+    ));
 }
 
 fn emit_globals(builder: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()> {
@@ -507,6 +606,13 @@ fn emit_helpers(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()
     kernels::emit_linear(module, "linear_qh", s, q, h, true)?;
     kernels::emit_linear(module, "linear_hi", s, h, i, true)?;
     kernels::emit_linear(module, "linear_ih", s, i, h, true)?;
+    if c.has_device_q4() {
+        qkernel::emit_q4_0_linear(module, "q4_linear_hq", s, h, q)?;
+        qkernel::emit_q4_0_linear(module, "q4_linear_hkv", s, h, kv)?;
+        qkernel::emit_q4_0_linear(module, "q4_linear_qh", s, q, h)?;
+        qkernel::emit_q4_0_linear(module, "q4_linear_hi", s, h, i)?;
+        qkernel::emit_q4_0_linear(module, "q4_linear_ih", s, i, h)?;
+    }
 
     if c.has_qk_norm {
         kernels::emit_rms_norm_heads(module, "rms_norm_q_heads", s, nh, d, c.rms_norm_eps)?;
@@ -716,6 +822,17 @@ fn emit_decode_helpers(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Re
     kernels::emit_linear(module, "linear_qh_tok", 1, q, h, true)?;
     kernels::emit_linear(module, "linear_hi_tok", 1, h, i, true)?;
     kernels::emit_linear(module, "linear_ih_tok", 1, i, h, true)?;
+    if c.has_device_q4() {
+        qkernel::emit_q4_0_linear(module, "q4_linear_hq_tok", 1, h, q)?;
+        qkernel::emit_q4_0_linear(module, "q4_linear_hkv_tok", 1, h, kv)?;
+        qkernel::emit_q4_0_linear(module, "q4_linear_qh_tok", 1, q, h)?;
+        qkernel::emit_q4_0_linear(module, "q4_linear_hi_tok", 1, h, i)?;
+        qkernel::emit_q4_0_linear(module, "q4_linear_ih_tok", 1, i, h)?;
+        if c.param_device_q4("output.weight") {
+            qkernel::emit_q4_0_linear(module, "q4_linear_out", 1, h, c.vocab)?;
+            qkernel::emit_q4_0_linear(module, "q4_linear_out_tok", 1, h, c.vocab)?;
+        }
+    }
 
     if c.has_qk_norm {
         kernels::emit_rms_norm_heads(module, "rms_norm_q_heads_tok", 1, nh, d, c.rms_norm_eps)?;
@@ -1085,15 +1202,45 @@ fn emit_prefill(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()
         f.op_asm(format!(
             "  %{p}_xn = func.call @rms_norm(%{xin}, %{p}_attn_nw) : (tensor<{s}x{h}xf32>, tensor<{h}xf32>) -> tensor<{s}x{h}xf32>\n"
         ));
-        f.op_asm(format!(
-            "  %{p}_q = func.call @linear_hq(%{p}_xn, %{p}_wq) : (tensor<{s}x{h}xf32>, tensor<{q}x{h}xf32>) -> tensor<{s}x{q}xf32>\n"
-        ));
-        f.op_asm(format!(
-            "  %{p}_k = func.call @linear_hkv(%{p}_xn, %{p}_wk) : (tensor<{s}x{h}xf32>, tensor<{kv}x{h}xf32>) -> tensor<{s}x{kv}xf32>\n"
-        ));
-        f.op_asm(format!(
-            "  %{p}_v = func.call @linear_hkv(%{p}_xn, %{p}_wv) : (tensor<{s}x{h}xf32>, tensor<{kv}x{h}xf32>) -> tensor<{s}x{kv}xf32>\n"
-        ));
+        emit_linear_call(
+            &mut f,
+            c,
+            &format!("{p}_q"),
+            "linear_hq",
+            "q4_linear_hq",
+            &format!("{p}_xn"),
+            &format!("{p}_wq"),
+            &format!("{n}.attn_q.weight"),
+            s,
+            h,
+            q,
+        );
+        emit_linear_call(
+            &mut f,
+            c,
+            &format!("{p}_k"),
+            "linear_hkv",
+            "q4_linear_hkv",
+            &format!("{p}_xn"),
+            &format!("{p}_wk"),
+            &format!("{n}.attn_k.weight"),
+            s,
+            h,
+            kv,
+        );
+        emit_linear_call(
+            &mut f,
+            c,
+            &format!("{p}_v"),
+            "linear_hkv",
+            "q4_linear_hkv",
+            &format!("{p}_xn"),
+            &format!("{p}_wv"),
+            &format!("{n}.attn_v.weight"),
+            s,
+            h,
+            kv,
+        );
         let nkv = c.num_kv_heads;
         let mk = c.max_kv;
         if c.has_qk_norm {
@@ -1133,23 +1280,51 @@ fn emit_prefill(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()
         f.op_asm(format!(
             "  util.global.store %{p}_v_new, @kv_v{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
         ));
-        f.op_asm(format!(
-            "  %{p}_o = func.call @linear_qh(%{p}_ctx, %{p}_wo) : (tensor<{s}x{q}xf32>, tensor<{h}x{q}xf32>) -> tensor<{s}x{h}xf32>\n"
-        ));
+        emit_linear_call(
+            &mut f,
+            c,
+            &format!("{p}_o"),
+            "linear_qh",
+            "q4_linear_qh",
+            &format!("{p}_ctx"),
+            &format!("{p}_wo"),
+            &format!("{n}.attn_output.weight"),
+            s,
+            q,
+            h,
+        );
         f.op_asm(format!(
             "  %{p}_h2 = arith.addf %{xin}, %{p}_o : tensor<{s}x{h}xf32>\n"
         ));
         f.op_asm(format!(
             "  %{p}_fn = func.call @rms_norm(%{p}_h2, %{p}_ffn_nw) : (tensor<{s}x{h}xf32>, tensor<{h}xf32>) -> tensor<{s}x{h}xf32>\n"
         ));
-        f.op_asm(format!(
-            "  %{p}_gate = func.call @linear_hi(%{p}_fn, %{p}_wgate) : (tensor<{s}x{h}xf32>, tensor<{i}x{h}xf32>) -> tensor<{s}x{i}xf32>\n",
-            i = c.intermediate
-        ));
-        f.op_asm(format!(
-            "  %{p}_up = func.call @linear_hi(%{p}_fn, %{p}_wup) : (tensor<{s}x{h}xf32>, tensor<{i}x{h}xf32>) -> tensor<{s}x{i}xf32>\n",
-            i = c.intermediate
-        ));
+        emit_linear_call(
+            &mut f,
+            c,
+            &format!("{p}_gate"),
+            "linear_hi",
+            "q4_linear_hi",
+            &format!("{p}_fn"),
+            &format!("{p}_wgate"),
+            &format!("{n}.ffn_gate.weight"),
+            s,
+            h,
+            c.intermediate,
+        );
+        emit_linear_call(
+            &mut f,
+            c,
+            &format!("{p}_up"),
+            "linear_hi",
+            "q4_linear_hi",
+            &format!("{p}_fn"),
+            &format!("{p}_wup"),
+            &format!("{n}.ffn_up.weight"),
+            s,
+            h,
+            c.intermediate,
+        );
         f.op_asm(format!(
             r#"  %{p}_silu = linalg.generic {{
       indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>],
@@ -1170,10 +1345,19 @@ fn emit_prefill(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()
             "  %{p}_ff = arith.mulf %{p}_silu, %{p}_up : tensor<{s}x{i}xf32>\n",
             i = c.intermediate
         ));
-        f.op_asm(format!(
-            "  %{p}_down = func.call @linear_ih(%{p}_ff, %{p}_wdown) : (tensor<{s}x{i}xf32>, tensor<{h}x{i}xf32>) -> tensor<{s}x{h}xf32>\n",
-            i = c.intermediate
-        ));
+        emit_linear_call(
+            &mut f,
+            c,
+            &format!("{p}_down"),
+            "linear_ih",
+            "q4_linear_ih",
+            &format!("{p}_ff"),
+            &format!("{p}_wdown"),
+            &format!("{n}.ffn_down.weight"),
+            s,
+            c.intermediate,
+            h,
+        );
         f.op_asm(format!(
             "  %{p}_hout = arith.addf %{p}_h2, %{p}_down : tensor<{s}x{h}xf32>\n"
         ));
@@ -1214,21 +1398,7 @@ fn emit_prefill(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()
     f.op_asm(format!(
         "  %ln1 = tensor.extract_slice %ln[0, 0] [1, {h}] [1, 1] : tensor<{s}x{h}xf32> to tensor<1x{h}xf32>\n"
     ));
-    f.op_asm("  %c0f = arith.constant 0.0 : f32\n");
-    f.op_asm(format!("  %wt_i = tensor.empty() : tensor<{h}x{v}xf32>\n"));
-    f.op_asm(format!(
-        "  %wt = linalg.transpose ins(%wout : tensor<{v}x{h}xf32>) outs(%wt_i : tensor<{h}x{v}xf32>) permutation = [1, 0]\n"
-    ));
-    f.op_asm(format!("  %yi = tensor.empty() : tensor<1x{v}xf32>\n"));
-    f.op_asm(format!(
-        "  %yz = linalg.fill ins(%c0f : f32) outs(%yi : tensor<1x{v}xf32>) -> tensor<1x{v}xf32>\n"
-    ));
-    f.op_asm(format!(
-        "  %y = linalg.matmul ins(%ln1, %wt : tensor<1x{h}xf32>, tensor<{h}x{v}xf32>) outs(%yz : tensor<1x{v}xf32>) -> tensor<1x{v}xf32>\n"
-    ));
-    f.op_asm(format!(
-        "  %logits = tensor.collapse_shape %y [[0, 1]] : tensor<1x{v}xf32> into tensor<{v}xf32>\n"
-    ));
+    emit_output_proj(&mut f, c, "ln1", "wout", "q4_linear_out");
     f.op_asm(format!("  return %logits : tensor<{v}xf32>"));
 
     f.finish(module)
@@ -1357,15 +1527,45 @@ fn emit_decode(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()>
         f.op_asm(format!(
             "  %{p}_xn = func.call @rms_norm_tok(%{xin}, %{p}_attn_nw) : (tensor<1x{h}xf32>, tensor<{h}xf32>) -> tensor<1x{h}xf32>\n"
         ));
-        f.op_asm(format!(
-            "  %{p}_q = func.call @linear_hq_tok(%{p}_xn, %{p}_wq) : (tensor<1x{h}xf32>, tensor<{q}x{h}xf32>) -> tensor<1x{q}xf32>\n"
-        ));
-        f.op_asm(format!(
-            "  %{p}_k = func.call @linear_hkv_tok(%{p}_xn, %{p}_wk) : (tensor<1x{h}xf32>, tensor<{kv}x{h}xf32>) -> tensor<1x{kv}xf32>\n"
-        ));
-        f.op_asm(format!(
-            "  %{p}_v = func.call @linear_hkv_tok(%{p}_xn, %{p}_wv) : (tensor<1x{h}xf32>, tensor<{kv}x{h}xf32>) -> tensor<1x{kv}xf32>\n"
-        ));
+        emit_linear_call(
+            &mut f,
+            c,
+            &format!("{p}_q"),
+            "linear_hq_tok",
+            "q4_linear_hq_tok",
+            &format!("{p}_xn"),
+            &format!("{p}_wq"),
+            &format!("{n}.attn_q.weight"),
+            1,
+            h,
+            q,
+        );
+        emit_linear_call(
+            &mut f,
+            c,
+            &format!("{p}_k"),
+            "linear_hkv_tok",
+            "q4_linear_hkv_tok",
+            &format!("{p}_xn"),
+            &format!("{p}_wk"),
+            &format!("{n}.attn_k.weight"),
+            1,
+            h,
+            kv,
+        );
+        emit_linear_call(
+            &mut f,
+            c,
+            &format!("{p}_v"),
+            "linear_hkv_tok",
+            "q4_linear_hkv_tok",
+            &format!("{p}_xn"),
+            &format!("{p}_wv"),
+            &format!("{n}.attn_v.weight"),
+            1,
+            h,
+            kv,
+        );
         f.op_asm(format!(
             "  %{p}_k3 = tensor.expand_shape %{p}_k [[0], [1, 2]] output_shape [1, {nkv}, {d}] : tensor<1x{kv}xf32> into tensor<1x{nkv}x{d}xf32>\n"
         ));
@@ -1393,23 +1593,51 @@ fn emit_decode(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()>
         f.op_asm(format!(
             "  util.global.store %{p}_v_new, @kv_v{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
         ));
-        f.op_asm(format!(
-            "  %{p}_o = func.call @linear_qh_tok(%{p}_ctx, %{p}_wo) : (tensor<1x{q}xf32>, tensor<{h}x{q}xf32>) -> tensor<1x{h}xf32>\n"
-        ));
+        emit_linear_call(
+            &mut f,
+            c,
+            &format!("{p}_o"),
+            "linear_qh_tok",
+            "q4_linear_qh_tok",
+            &format!("{p}_ctx"),
+            &format!("{p}_wo"),
+            &format!("{n}.attn_output.weight"),
+            1,
+            q,
+            h,
+        );
         f.op_asm(format!(
             "  %{p}_h2 = arith.addf %{xin}, %{p}_o : tensor<1x{h}xf32>\n"
         ));
         f.op_asm(format!(
             "  %{p}_fn = func.call @rms_norm_tok(%{p}_h2, %{p}_ffn_nw) : (tensor<1x{h}xf32>, tensor<{h}xf32>) -> tensor<1x{h}xf32>\n"
         ));
-        f.op_asm(format!(
-            "  %{p}_gate = func.call @linear_hi_tok(%{p}_fn, %{p}_wgate) : (tensor<1x{h}xf32>, tensor<{i}x{h}xf32>) -> tensor<1x{i}xf32>\n",
-            i = c.intermediate
-        ));
-        f.op_asm(format!(
-            "  %{p}_up = func.call @linear_hi_tok(%{p}_fn, %{p}_wup) : (tensor<1x{h}xf32>, tensor<{i}x{h}xf32>) -> tensor<1x{i}xf32>\n",
-            i = c.intermediate
-        ));
+        emit_linear_call(
+            &mut f,
+            c,
+            &format!("{p}_gate"),
+            "linear_hi_tok",
+            "q4_linear_hi_tok",
+            &format!("{p}_fn"),
+            &format!("{p}_wgate"),
+            &format!("{n}.ffn_gate.weight"),
+            1,
+            h,
+            c.intermediate,
+        );
+        emit_linear_call(
+            &mut f,
+            c,
+            &format!("{p}_up"),
+            "linear_hi_tok",
+            "q4_linear_hi_tok",
+            &format!("{p}_fn"),
+            &format!("{p}_wup"),
+            &format!("{n}.ffn_up.weight"),
+            1,
+            h,
+            c.intermediate,
+        );
         f.op_asm(format!(
             r#"  %{p}_silu = linalg.generic {{
       indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>],
@@ -1430,10 +1658,19 @@ fn emit_decode(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()>
             "  %{p}_ff = arith.mulf %{p}_silu, %{p}_up : tensor<1x{i}xf32>\n",
             i = c.intermediate
         ));
-        f.op_asm(format!(
-            "  %{p}_down = func.call @linear_ih_tok(%{p}_ff, %{p}_wdown) : (tensor<1x{i}xf32>, tensor<{h}x{i}xf32>) -> tensor<1x{h}xf32>\n",
-            i = c.intermediate
-        ));
+        emit_linear_call(
+            &mut f,
+            c,
+            &format!("{p}_down"),
+            "linear_ih_tok",
+            "q4_linear_ih_tok",
+            &format!("{p}_ff"),
+            &format!("{p}_wdown"),
+            &format!("{n}.ffn_down.weight"),
+            1,
+            c.intermediate,
+            h,
+        );
         f.op_asm(format!(
             "  %{p}_hout = arith.addf %{p}_h2, %{p}_down : tensor<1x{h}xf32>\n"
         ));
@@ -1459,21 +1696,7 @@ fn emit_decode(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()>
     f.op_asm(format!(
         "  %ln = func.call @rms_norm_tok(%{h_name}, %out_nw) : (tensor<1x{h}xf32>, tensor<{h}xf32>) -> tensor<1x{h}xf32>\n"
     ));
-    f.op_asm("  %c0f = arith.constant 0.0 : f32\n");
-    f.op_asm(format!("  %wt_i = tensor.empty() : tensor<{h}x{v}xf32>\n"));
-    f.op_asm(format!(
-        "  %wt = linalg.transpose ins(%wout : tensor<{v}x{h}xf32>) outs(%wt_i : tensor<{h}x{v}xf32>) permutation = [1, 0]\n"
-    ));
-    f.op_asm(format!("  %yi = tensor.empty() : tensor<1x{v}xf32>\n"));
-    f.op_asm(format!(
-        "  %yz = linalg.fill ins(%c0f : f32) outs(%yi : tensor<1x{v}xf32>) -> tensor<1x{v}xf32>\n"
-    ));
-    f.op_asm(format!(
-        "  %y = linalg.matmul ins(%ln, %wt : tensor<1x{h}xf32>, tensor<{h}x{v}xf32>) outs(%yz : tensor<1x{v}xf32>) -> tensor<1x{v}xf32>\n"
-    ));
-    f.op_asm(format!(
-        "  %logits = tensor.collapse_shape %y [[0, 1]] : tensor<1x{v}xf32> into tensor<{v}xf32>\n"
-    ));
+    emit_output_proj(&mut f, c, "ln", "wout", "q4_linear_out_tok");
     f.op_asm(format!("  return %logits : tensor<{v}xf32>"));
 
     f.finish(module)

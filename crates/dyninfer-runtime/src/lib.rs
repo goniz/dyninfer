@@ -19,8 +19,8 @@ pub use generate::{
     GenerateConfig, GenerateOutput, GenerateStats, argmax, generate_greedy, load_tokenizer,
 };
 pub use hf_hub::{
-    DEFAULT_HF_REVISION, find_safetensors_checkpoint, hf_hub_cache_dir, hf_repo_folder_name,
-    resolve_hf_snapshot,
+    DEFAULT_HF_REVISION, find_checkpoint, find_gguf_checkpoint, find_safetensors_checkpoint,
+    hf_hub_cache_dir, hf_repo_folder_name, resolve_hf_snapshot,
 };
 pub use model::{LoadedModel, ModelLoader};
 pub use reference::{max_abs_err, tiny_llama_prefill_logits};

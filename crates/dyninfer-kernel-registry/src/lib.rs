@@ -47,7 +47,7 @@ pub struct KernelRegistry {
 
 impl KernelRegistry {
     /// Bump when candidate set / selection policy changes (feeds cache keys).
-    pub const VERSION: &'static str = "2";
+    pub const VERSION: &'static str = "3";
 
     pub fn version_1() -> Self {
         let mut reg = Self::default();
@@ -65,7 +65,7 @@ impl KernelRegistry {
             encoding: "gguf.q4_0".into(),
             backends: vec!["any".into()],
             priority: 90,
-            notes: "Portable qkernel Q4_0: host block dequant + dense linalg matmul".into(),
+            notes: "Portable qkernel Q4_0: device-fused unpack+dot for layer linears; host dequant for embd/output".into(),
         });
         reg.register(KernelCandidateDescriptor {
             id: "attention.decode.gqa".into(),

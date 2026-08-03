@@ -159,15 +159,23 @@ fn ensure_model_files(snap: &Path, repo_id: &str) -> Result<()> {
     }
     // Some repos use a single non-standard name; accept any *.safetensors.
     if let Ok(rd) = fs::read_dir(snap) {
-        if rd
-            .filter_map(|e| e.ok())
-            .any(|e| e.path().extension().is_some_and(|x| x == "safetensors"))
-        {
+        let mut has_st = false;
+        let mut has_gguf = false;
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "safetensors") {
+                has_st = true;
+            }
+            if p.extension().is_some_and(|x| x == "gguf") {
+                has_gguf = true;
+            }
+        }
+        if has_st || has_gguf {
             return Ok(());
         }
     }
     Err(DynInferError::io(format!(
-        "HF snapshot for `{repo_id}` at {} has no .safetensors weights",
+        "HF snapshot for `{repo_id}` at {} has no .safetensors or .gguf weights",
         snap.display()
     )))
 }
@@ -199,6 +207,52 @@ pub fn find_safetensors_checkpoint(model_dir: &Path) -> Result<PathBuf> {
             model_dir.display()
         ))
     })
+}
+
+/// Find a GGUF checkpoint, preferring `*Q4_0*.gguf` when several exist.
+pub fn find_gguf_checkpoint(model_dir: &Path) -> Result<PathBuf> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = fs::read_dir(model_dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "gguf") {
+                found.push(p);
+            }
+        }
+    }
+    if found.is_empty() {
+        return Err(DynInferError::io(format!(
+            "no .gguf checkpoint in {}",
+            model_dir.display()
+        )));
+    }
+    found.sort_by(|a, b| {
+        let score = |p: &Path| {
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            // Prefer exact Q4_0 over Q4_K / Q4_1.
+            if name.contains("q4_0") {
+                0
+            } else if name.contains("q4") {
+                1
+            } else {
+                2
+            }
+        };
+        score(a).cmp(&score(b)).then_with(|| a.cmp(b))
+    });
+    Ok(found.remove(0))
+}
+
+/// Prefer SafeTensors; fall back to GGUF.
+pub fn find_checkpoint(model_dir: &Path) -> Result<PathBuf> {
+    match find_safetensors_checkpoint(model_dir) {
+        Ok(p) => Ok(p),
+        Err(_) => find_gguf_checkpoint(model_dir),
+    }
 }
 
 #[cfg(test)]

@@ -24,7 +24,103 @@ pub fn register(support: &mut BuiltinCheckpointSupport) {
     support.register_convention(GgufDenseConvention::default());
 }
 
-/// Read GGUF parameters as host f32 blobs (Q4_0 dequantized via qkernel reference).
+/// Read GGUF parameters for IREE host binding.
+///
+/// - Layer Q4_0 matrices: packed bytes (device fused unpack+dot).
+/// - `token_embd.weight` / `output.weight` Q4_0: host-dequantized to f32
+///   (gather + vocab projection stay dense).
+/// - Plain tensors: promoted to f32.
+pub fn decode_parameters_as_host(
+    catalog: &dyninfer_checkpoint::CheckpointCatalog,
+) -> dyninfer_error::Result<Vec<(String, Vec<u8>)>> {
+    use dyninfer_checkpoint::{FileSource, RandomAccessSource};
+    use dyninfer_core::{PhysicalEncoding, StorageElementType};
+    use tracing::info;
+
+    let source_path = catalog
+        .source_files
+        .first()
+        .map(|f| f.path.as_path())
+        .ok_or_else(|| dyninfer_error::DynInferError::io("checkpoint has no source file"))?;
+    let source = FileSource::open(source_path)?;
+    let mut entries = Vec::with_capacity(catalog.parameters.len());
+    let mut packed_q4 = 0usize;
+    let mut host_dequant = 0usize;
+    for param in &catalog.parameters {
+        let comp = param.components.first().ok_or_else(|| {
+            dyninfer_error::DynInferError::io(format!(
+                "parameter {} has no storage component",
+                param.canonical_name
+            ))
+        })?;
+        let range = comp.byte_ranges.first().ok_or_else(|| {
+            dyninfer_error::DynInferError::io(format!(
+                "parameter {} has no byte range",
+                param.canonical_name
+            ))
+        })?;
+        let bytes = source.read_range(range.offset, range.length)?;
+        let numel = param.logical_type.shape.numel().ok_or_else(|| {
+            dyninfer_error::DynInferError::io(format!(
+                "parameter {}: shape overflow",
+                param.canonical_name
+            ))
+        })? as usize;
+
+        let name = param.canonical_name.as_str();
+        let host_dequant_q4 = name == "token_embd.weight" || name == "output.weight";
+
+        let data = match &param.encoding {
+            PhysicalEncoding::BlockQuantized { codec, .. } if codec.as_str() == "gguf.q4_0" => {
+                if host_dequant_q4 {
+                    host_dequant += 1;
+                    let values = dequant_q4_0(&bytes, numel)?;
+                    let mut le = Vec::with_capacity(values.len() * 4);
+                    for v in values {
+                        le.extend_from_slice(&v.to_le_bytes());
+                    }
+                    le
+                } else {
+                    packed_q4 += 1;
+                    bytes
+                }
+            }
+            PhysicalEncoding::Plain { .. } => {
+                let ty = match &comp.storage_type {
+                    StorageElementType::Scalar { ty } => *ty,
+                    other => {
+                        return Err(dyninfer_error::DynInferError::io(format!(
+                            "unsupported dense storage for {}: {other}",
+                            param.canonical_name
+                        )));
+                    }
+                };
+                let values = decode_dense_to_f32(&bytes, ty, numel)?;
+                let mut le = Vec::with_capacity(values.len() * 4);
+                for v in values {
+                    le.extend_from_slice(&v.to_le_bytes());
+                }
+                le
+            }
+            other => {
+                return Err(dyninfer_error::DynInferError::io(format!(
+                    "unsupported GGUF encoding for {}: {other:?}",
+                    param.canonical_name
+                )));
+            }
+        };
+        entries.push((comp.key.clone(), data));
+    }
+    info!(
+        params = entries.len(),
+        packed_q4,
+        host_dequant,
+        "GGUF host parameters ready (device Q4 packed + host dequant for embd/output)"
+    );
+    Ok(entries)
+}
+
+/// Read GGUF parameters as host f32 blobs (legacy: all Q4_0 dequantized).
 pub fn decode_parameters_as_f32_host(
     catalog: &dyninfer_checkpoint::CheckpointCatalog,
 ) -> dyninfer_error::Result<Vec<(String, Vec<u8>)>> {
@@ -91,7 +187,7 @@ pub fn decode_parameters_as_f32_host(
     }
     info!(
         params = entries.len(),
-        "GGUF host parameters ready (Q4_0 dequantized via qkernel)"
+        "GGUF host parameters ready (Q4_0 fully dequantized)"
     );
     Ok(entries)
 }
@@ -138,11 +234,4 @@ fn decode_dense_to_f32(
             "unsupported dense scalar {other}"
         ))),
     }
-}
-
-/// Read packed / dense parameter bytes for IREE host binding from a GGUF catalog.
-pub fn decode_parameters_as_host(
-    catalog: &dyninfer_checkpoint::CheckpointCatalog,
-) -> dyninfer_error::Result<Vec<(String, Vec<u8>)>> {
-    decode_parameters_as_f32_host(catalog)
 }
