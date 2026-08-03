@@ -50,6 +50,13 @@ impl IreeSession {
         }
     }
 
+    /// Effective sequence cap: session config ∩ compiled KV capacity.
+    fn max_seq(&self) -> u64 {
+        let cfg = self.config.max_sequence_length.max(1) as u64;
+        let kv = self.kv.max_sequence_length.max(1) as u64;
+        cfg.min(kv)
+    }
+
     /// Left-align tokens (right-pad). Returns `(window, last_real_index)`.
     fn window_from_tokens(&self, tokens: &[TokenId]) -> (Vec<i64>, i64) {
         let w = self.prefill_window;
@@ -68,6 +75,15 @@ impl IreeSession {
 impl ModelSession for IreeSession {
     fn prefill(&mut self, tokens: &[TokenId]) -> Result<Logits> {
         let _span = info_span!("runtime.prefill", tokens = tokens.len()).entered();
+        if self.config.batch_size != 1 {
+            return Err(DynInferError::IreeRuntime(IreeRuntimeError {
+                message: format!(
+                    "batch_size {} is not supported (only batch_size=1)",
+                    self.config.batch_size
+                ),
+                status_code: None,
+            }));
+        }
         if tokens.is_empty() {
             return Err(DynInferError::IreeRuntime(IreeRuntimeError {
                 message: "prefill requires a non-empty token list".into(),
@@ -84,13 +100,13 @@ impl ModelSession for IreeSession {
                 status_code: None,
             }));
         }
-        let max_kv = self.kv.max_sequence_length.max(1) as usize;
-        if tokens.len() > max_kv {
+        let max_seq = self.max_seq() as usize;
+        if tokens.len() > max_seq {
             return Err(DynInferError::IreeRuntime(IreeRuntimeError {
                 message: format!(
-                    "prefill length {} exceeds KV capacity {}",
+                    "prefill length {} exceeds session/KV limit {}",
                     tokens.len(),
-                    max_kv
+                    max_seq
                 ),
                 status_code: None,
             }));
@@ -115,12 +131,24 @@ impl ModelSession for IreeSession {
 
     fn decode(&mut self, token: TokenId) -> Result<Logits> {
         let _span = info_span!("runtime.decode", token, position = self.position).entered();
-        let max_kv = self.kv.max_sequence_length.max(1) as u64;
-        if self.position >= max_kv {
+        if self.config.batch_size != 1 {
             return Err(DynInferError::IreeRuntime(IreeRuntimeError {
                 message: format!(
-                    "decode position {} exceeds KV capacity {}",
-                    self.position, max_kv
+                    "batch_size {} is not supported (only batch_size=1)",
+                    self.config.batch_size
+                ),
+                status_code: None,
+            }));
+        }
+        let max_seq = self.max_seq();
+        let max_kv = self.kv.max_sequence_length.max(1) as usize;
+        // Position is the write index into KV; once it reaches the session or
+        // compiled limit, refuse rather than re-decoding at a stale position.
+        if self.position >= max_seq {
+            return Err(DynInferError::IreeRuntime(IreeRuntimeError {
+                message: format!(
+                    "decode position {} exceeds session/KV limit {}",
+                    self.position, max_seq
                 ),
                 status_code: None,
             }));
@@ -128,7 +156,7 @@ impl ModelSession for IreeSession {
         let values = self.context.invoke_decode_at(
             i64::from(token),
             self.position as i64,
-            max_kv as usize,
+            max_kv,
         )?;
         if values.len() != self.metadata.vocabulary_size as usize {
             return Err(DynInferError::IreeRuntime(IreeRuntimeError {
@@ -141,9 +169,7 @@ impl ModelSession for IreeSession {
             }));
         }
         self.history.push(token);
-        if self.position < self.config.max_sequence_length as u64 {
-            self.position += 1;
-        }
+        self.position += 1;
         Ok(Logits { values })
     }
 
