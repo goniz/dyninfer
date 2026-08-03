@@ -149,6 +149,40 @@ impl CheckpointContainerReader for SafeTensorsContainer {
                 }));
             }
             let length = info.data_offsets[1] - info.data_offsets[0];
+            let ty = parse_dtype(&info.dtype)?;
+            let elem_size = ty.size_bytes().ok_or_else(|| {
+                DynInferError::InvalidCheckpoint(CheckpointValidationError {
+                    message: format!("dtype {ty} has no fixed size"),
+                    key: Some(key.clone()),
+                    detail: None,
+                })
+            })? as u64;
+            let numel = info.shape.iter().try_fold(1u64, |acc, &d| acc.checked_mul(d));
+            let Some(numel) = numel else {
+                return Err(DynInferError::InvalidCheckpoint(CheckpointValidationError {
+                    message: "shape numel overflow".into(),
+                    key: Some(key.clone()),
+                    detail: None,
+                }));
+            };
+            let expected_len = numel
+                .checked_mul(elem_size)
+                .ok_or_else(|| {
+                    DynInferError::InvalidCheckpoint(CheckpointValidationError {
+                        message: "declared tensor byte length overflow".into(),
+                        key: Some(key.clone()),
+                        detail: None,
+                    })
+                })?;
+            if length != expected_len {
+                return Err(DynInferError::InvalidCheckpoint(CheckpointValidationError {
+                    message: format!(
+                        "tensor byte length {length} != numel {numel} * elem {elem_size} (= {expected_len})"
+                    ),
+                    key: Some(key.clone()),
+                    detail: None,
+                }));
+            }
             let abs_offset = data_base
                 .checked_add(info.data_offsets[0])
                 .ok_or_else(|| {
@@ -166,13 +200,12 @@ impl CheckpointContainerReader for SafeTensorsContainer {
                 }));
             }
 
-            let ty = parse_dtype(&info.dtype)?;
             entries.push(RawTensorEntry {
                 key: key.clone(),
                 shape: info.shape,
                 storage_type: StorageElementType::scalar(ty),
                 byte_ranges: vec![ByteRange::new(abs_offset, length)],
-                alignment: ty.size_bytes().unwrap_or(1) as u64,
+                alignment: elem_size.max(1),
                 endianness: Endianness::Little,
                 metadata: MetadataMap::new(),
             });
@@ -184,6 +217,47 @@ impl CheckpointContainerReader for SafeTensorsContainer {
                     "tensor count {} exceeds limit {}",
                     entries.len(),
                     limits.max_tensor_count
+                ),
+                key: None,
+                detail: None,
+            }));
+        }
+
+        // Reject overlapping absolute byte ranges in the data section.
+        {
+            let mut ranges: Vec<(u64, u64, &str)> = entries
+                .iter()
+                .filter_map(|e| {
+                    let r = e.byte_ranges.first()?;
+                    Some((r.offset, r.offset.saturating_add(r.length), e.key.as_str()))
+                })
+                .collect();
+            ranges.sort_by_key(|(start, _, _)| *start);
+            for w in ranges.windows(2) {
+                let (_a_start, a_end, a_key) = w[0];
+                let (b_start, _b_end, b_key) = w[1];
+                if b_start < a_end {
+                    return Err(DynInferError::InvalidCheckpoint(CheckpointValidationError {
+                        message: format!(
+                            "overlapping tensor byte ranges between `{a_key}` and `{b_key}`"
+                        ),
+                        key: Some(a_key.to_string()),
+                        detail: Some(b_key.to_string()),
+                    }));
+                }
+            }
+        }
+
+        let total_declared: u64 = entries
+            .iter()
+            .flat_map(|e| e.byte_ranges.iter())
+            .map(|r| r.length)
+            .fold(0u64, |a, b| a.saturating_add(b));
+        if total_declared > limits.max_total_declared_bytes {
+            return Err(DynInferError::InvalidCheckpoint(CheckpointValidationError {
+                message: format!(
+                    "total declared tensor bytes {total_declared} exceeds limit {}",
+                    limits.max_total_declared_bytes
                 ),
                 key: None,
                 detail: None,

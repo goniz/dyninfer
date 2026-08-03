@@ -6,10 +6,10 @@ use dyninfer_architecture::ArchitecturePackage;
 use dyninfer_checkpoint::{CheckpointCatalog, LogicalParameter};
 use dyninfer_core::{
     BindingPlan, BindingTransform, MaterializationPolicy, MaterializationRequest, ParameterBinding,
-    ParameterSlot, PhysicalEncoding,
+    ParameterRole, ParameterSlot, PhysicalEncoding, Shape,
 };
 use dyninfer_error::{BindingError, DynInferError, Result};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use tracing::info_span;
 
 pub struct Binder {
@@ -48,12 +48,31 @@ impl Binder {
         let mut bindings = Vec::new();
         let mut unresolved_optional = Vec::new();
         let mut materializations = Vec::new();
-        let mut used = BTreeSet::new();
+        let mut tied_shapes: BTreeMap<String, (String, Shape)> = BTreeMap::new();
 
         for slot in &architecture.parameter_slots {
             match self.bind_slot(slot, &by_name)? {
                 Some((binding, mat)) => {
-                    used.insert(binding.parameter_key.clone());
+                    if let Some(group) = &slot.tied_group {
+                        let group_key = group.to_string();
+                        let shape = binding.logical_shape.clone();
+                        if let Some((other_slot, other_shape)) = tied_shapes.get(&group_key) {
+                            if other_shape != &shape {
+                                return Err(DynInferError::Binding(BindingError {
+                                    message: format!(
+                                        "tied group `{group_key}` shape mismatch between `{other_slot}` and `{}`",
+                                        slot.id
+                                    ),
+                                    slot: Some(slot.id.to_string()),
+                                    checkpoint_key: Some(binding.parameter_key.clone()),
+                                    expected: Some(other_shape.to_string()),
+                                    actual: Some(shape.to_string()),
+                                }));
+                            }
+                        } else {
+                            tied_shapes.insert(group_key, (slot.id.to_string(), shape));
+                        }
+                    }
                     if let Some(m) = mat {
                         materializations.push(m);
                     }
@@ -108,6 +127,30 @@ impl Binder {
             }
         }
 
+        if let Some(expected_shape) = &slot.expected_type.shape {
+            if !param.logical_type.shape.is_compatible_with(expected_shape) {
+                return Err(DynInferError::Binding(BindingError {
+                    message: "parameter shape mismatch".into(),
+                    slot: Some(slot.id.to_string()),
+                    checkpoint_key: Some(param.canonical_name.to_string()),
+                    expected: Some(expected_shape.to_string()),
+                    actual: Some(param.logical_type.shape.to_string()),
+                }));
+            }
+        }
+
+        // Role mismatch is a hard error when the checkpoint declared a concrete role
+        // (not Other) that disagrees with the architecture slot.
+        if !roles_compatible(&slot.role, &param.role) {
+            return Err(DynInferError::Binding(BindingError {
+                message: "parameter role mismatch".into(),
+                slot: Some(slot.id.to_string()),
+                checkpoint_key: Some(param.canonical_name.to_string()),
+                expected: Some(slot.role.as_str().into()),
+                actual: Some(param.role.as_str().into()),
+            }));
+        }
+
         if !slot.expected_type.element_types.is_empty()
             && !slot
                 .expected_type
@@ -160,6 +203,57 @@ impl Binder {
             .map(|r| r.length)
             .fold(0u64, |a, b| a.saturating_add(b));
 
+        // For plain encodings with declared storage, bytes must match numel * elem size.
+        if let PhysicalEncoding::Plain { storage_type, .. } = &param.encoding {
+            if !param.components.is_empty() {
+                if let Some(elem) = storage_type.size_bytes() {
+                    let Some(numel) = param.logical_type.shape.numel() else {
+                        return Err(DynInferError::Binding(BindingError {
+                            message: "parameter shape numel overflow".into(),
+                            slot: Some(slot.id.to_string()),
+                            checkpoint_key: Some(param.canonical_name.to_string()),
+                            expected: None,
+                            actual: Some(param.logical_type.shape.to_string()),
+                        }));
+                    };
+                    let expected = numel.saturating_mul(u64::from(elem));
+                    if storage_bytes != expected {
+                        return Err(DynInferError::Binding(BindingError {
+                            message: "parameter storage byte length mismatch".into(),
+                            slot: Some(slot.id.to_string()),
+                            checkpoint_key: Some(param.canonical_name.to_string()),
+                            expected: Some(format!("{expected} bytes")),
+                            actual: Some(format!("{storage_bytes} bytes")),
+                        }));
+                    }
+                }
+            }
+        }
+
+        let alignment = param.components.first().map(|c| c.alignment).unwrap_or(1);
+        if alignment == 0 {
+            return Err(DynInferError::Binding(BindingError {
+                message: "parameter alignment must be non-zero".into(),
+                slot: Some(slot.id.to_string()),
+                checkpoint_key: Some(param.canonical_name.to_string()),
+                expected: Some("alignment >= 1".into()),
+                actual: Some("0".into()),
+            }));
+        }
+        for comp in &param.components {
+            for range in &comp.byte_ranges {
+                if range.offset % alignment != 0 {
+                    return Err(DynInferError::Binding(BindingError {
+                        message: "parameter byte range is misaligned".into(),
+                        slot: Some(slot.id.to_string()),
+                        checkpoint_key: Some(param.canonical_name.to_string()),
+                        expected: Some(format!("offset % {alignment} == 0")),
+                        actual: Some(format!("offset {}", range.offset)),
+                    }));
+                }
+            }
+        }
+
         let materialization = match &param.encoding {
             PhysicalEncoding::Plain { .. } => MaterializationPolicy::DirectView,
             PhysicalEncoding::BlockQuantized { .. } => MaterializationPolicy::DecodeOnTheFly,
@@ -194,9 +288,17 @@ impl Binder {
             scope: self.parameter_scope.clone(),
             parameter_key: key,
             storage_bytes,
-            alignment: param.components.first().map(|c| c.alignment).unwrap_or(1),
+            alignment,
         };
         Ok(Some((binding, mat_req)))
+    }
+}
+
+fn roles_compatible(slot: &ParameterRole, param: &ParameterRole) -> bool {
+    match (slot, param) {
+        (_, ParameterRole::Other(_)) => true,
+        (ParameterRole::Other(_), _) => true,
+        (a, b) => a == b,
     }
 }
 
