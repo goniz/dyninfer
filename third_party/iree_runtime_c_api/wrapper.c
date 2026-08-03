@@ -17,6 +17,13 @@ struct dyninfer_iree_session_t {
   iree_runtime_instance_t* instance;
   iree_hal_device_t* device;
   iree_runtime_session_t* session;
+  // Reused across decode steps to avoid per-token device/host allocs.
+  iree_hal_buffer_view_t* decode_token;
+  iree_hal_buffer_view_t* decode_pos;
+  iree_hal_buffer_view_t* decode_bias;
+  size_t decode_bias_len;
+  float* logits_host;
+  size_t logits_capacity;
 };
 
 static char g_last_error[2048] = {0};
@@ -41,7 +48,11 @@ static void set_error_msg(const char* msg) {
 
 const char* dyninfer_iree_last_error(void) { return g_last_error; }
 
-void dyninfer_iree_free(void* p) { free(p); }
+void dyninfer_iree_free(void* p) {
+  // Logits are returned from session-owned scratch and must not be freed here.
+  // Retained for ABI stability; callers still copy into owned Vecs immediately.
+  (void)p;
+}
 
 static iree_status_t append_parameters_module(iree_runtime_session_t* session,
                                              const char* parameters_path) {
@@ -295,6 +306,8 @@ static iree_status_t allocate_f32_tensor(iree_runtime_session_t* session,
 
 static iree_status_t copy_f32_view_to_host(iree_runtime_session_t* session,
                                            iree_hal_buffer_view_t* view,
+                                           float** logits_scratch,
+                                           size_t* logits_capacity,
                                            float** out_logits,
                                            size_t* out_count) {
   iree_device_size_t byte_length = iree_hal_buffer_view_byte_length(view);
@@ -303,28 +316,35 @@ static iree_status_t copy_f32_view_to_host(iree_runtime_session_t* session,
                             "expected f32 buffer view");
   }
   size_t count = (size_t)(byte_length / sizeof(float));
-  float* host = (float*)malloc(byte_length);
-  if (!host) {
-    return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED, "malloc logits");
+  if (*logits_capacity < count) {
+    float* grown = (float*)realloc(*logits_scratch, byte_length);
+    if (!grown) {
+      return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED, "realloc logits");
+    }
+    *logits_scratch = grown;
+    *logits_capacity = count;
   }
+  float* host = *logits_scratch;
   iree_status_t status = iree_hal_device_transfer_d2h(
       iree_runtime_session_device(session), iree_hal_buffer_view_buffer(view),
       0, host, byte_length, IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT,
       iree_infinite_timeout());
   if (!iree_status_is_ok(status)) {
-    free(host);
     return status;
   }
+  // Borrowed session scratch: valid until the next invoke on this session.
+  // Callers must copy immediately; dyninfer_iree_free is a no-op for these.
   *out_logits = host;
   *out_count = count;
   return iree_ok_status();
 }
 
-static iree_status_t invoke_named(iree_runtime_session_t* session,
+static iree_status_t invoke_named(dyninfer_iree_session_t* wrapper,
                                   const char* full_name,
                                   iree_hal_buffer_view_t** inputs,
                                   iree_host_size_t input_count,
                                   float** out_logits, size_t* out_count) {
+  iree_runtime_session_t* session = wrapper->session;
   iree_runtime_call_t call;
   IREE_RETURN_IF_ERROR(iree_runtime_call_initialize_by_name(
       session, iree_make_cstring_view(full_name), &call));
@@ -343,7 +363,9 @@ static iree_status_t invoke_named(iree_runtime_session_t* session,
     status = iree_runtime_call_outputs_pop_front_buffer_view(&call, &ret);
   }
   if (iree_status_is_ok(status)) {
-    status = copy_f32_view_to_host(session, ret, out_logits, out_count);
+    status = copy_f32_view_to_host(session, ret, &wrapper->logits_host,
+                                   &wrapper->logits_capacity, out_logits,
+                                   out_count);
   }
   iree_hal_buffer_view_release(ret);
   iree_runtime_call_deinitialize(&call);
@@ -352,6 +374,10 @@ static iree_status_t invoke_named(iree_runtime_session_t* session,
 
 void dyninfer_iree_session_destroy(dyninfer_iree_session_t* session) {
   if (!session) return;
+  iree_hal_buffer_view_release(session->decode_token);
+  iree_hal_buffer_view_release(session->decode_pos);
+  iree_hal_buffer_view_release(session->decode_bias);
+  free(session->logits_host);
   iree_runtime_session_release(session->session);
   iree_hal_device_release(session->device);
   iree_runtime_instance_release(session->instance);
@@ -377,7 +403,7 @@ int dyninfer_iree_session_invoke_add(dyninfer_iree_session_t* session,
   }
   iree_hal_buffer_view_t* inputs[2] = {va, vb};
   if (iree_status_is_ok(status)) {
-    status = invoke_named(session->session, "module.add", inputs, 2, out_logits,
+    status = invoke_named(session, "module.add", inputs, 2, out_logits,
                           out_count);
   }
   iree_hal_buffer_view_release(va);
@@ -410,8 +436,8 @@ int dyninfer_iree_session_invoke_prefill(dyninfer_iree_session_t* session,
   }
   iree_hal_buffer_view_t* inputs[2] = {v_tokens, v_last};
   if (iree_status_is_ok(status)) {
-    status = invoke_named(session->session, "module.prefill", inputs, 2,
-                          out_logits, out_count);
+    status = invoke_named(session, "module.prefill", inputs, 2, out_logits,
+                          out_count);
   }
   iree_hal_buffer_view_release(v_tokens);
   iree_hal_buffer_view_release(v_last);
@@ -420,6 +446,41 @@ int dyninfer_iree_session_invoke_prefill(dyninfer_iree_session_t* session,
     return 1;
   }
   return 0;
+}
+
+static iree_status_t ensure_i64_scalar_view(iree_runtime_session_t* session,
+                                            iree_hal_buffer_view_t** slot,
+                                            int64_t value) {
+  if (*slot == NULL) {
+    return allocate_i64_tensor(session, 0, NULL, &value, 1, slot);
+  }
+  return iree_hal_device_transfer_h2d(
+      iree_runtime_session_device(session), &value,
+      iree_hal_buffer_view_buffer(*slot), 0, sizeof(value),
+      IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT, iree_infinite_timeout());
+}
+
+static iree_status_t ensure_f32_bias_view(iree_runtime_session_t* session,
+                                          iree_hal_buffer_view_t** slot,
+                                          size_t* slot_len,
+                                          const float* attn_bias,
+                                          size_t bias_len) {
+  if (*slot == NULL || *slot_len != bias_len) {
+    iree_hal_buffer_view_release(*slot);
+    *slot = NULL;
+    *slot_len = 0;
+    iree_hal_dim_t bias_shape[1] = {(iree_hal_dim_t)bias_len};
+    iree_status_t status =
+        allocate_f32_tensor(session, 1, bias_shape, attn_bias, bias_len, slot);
+    if (iree_status_is_ok(status)) {
+      *slot_len = bias_len;
+    }
+    return status;
+  }
+  return iree_hal_device_transfer_h2d(
+      iree_runtime_session_device(session), attn_bias,
+      iree_hal_buffer_view_buffer(*slot), 0, bias_len * sizeof(float),
+      IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT, iree_infinite_timeout());
 }
 
 int dyninfer_iree_session_invoke_decode(dyninfer_iree_session_t* session,
@@ -432,27 +493,22 @@ int dyninfer_iree_session_invoke_decode(dyninfer_iree_session_t* session,
     set_error_msg("decode requires session + non-empty attn_bias");
     return 1;
   }
-  iree_hal_buffer_view_t* v_token = NULL;
-  iree_hal_buffer_view_t* v_pos = NULL;
-  iree_hal_buffer_view_t* v_bias = NULL;
   iree_status_t status =
-      allocate_i64_tensor(session->session, 0, NULL, &token, 1, &v_token);
+      ensure_i64_scalar_view(session->session, &session->decode_token, token);
   if (iree_status_is_ok(status)) {
-    status = allocate_i64_tensor(session->session, 0, NULL, &pos, 1, &v_pos);
+    status = ensure_i64_scalar_view(session->session, &session->decode_pos, pos);
   }
   if (iree_status_is_ok(status)) {
-    iree_hal_dim_t bias_shape[1] = {(iree_hal_dim_t)bias_len};
-    status = allocate_f32_tensor(session->session, 1, bias_shape, attn_bias,
-                                 bias_len, &v_bias);
+    status = ensure_f32_bias_view(session->session, &session->decode_bias,
+                                  &session->decode_bias_len, attn_bias,
+                                  bias_len);
   }
-  iree_hal_buffer_view_t* inputs[3] = {v_token, v_pos, v_bias};
+  iree_hal_buffer_view_t* inputs[3] = {session->decode_token, session->decode_pos,
+                                       session->decode_bias};
   if (iree_status_is_ok(status)) {
-    status = invoke_named(session->session, "module.decode", inputs, 3,
-                          out_logits, out_count);
+    status = invoke_named(session, "module.decode", inputs, 3, out_logits,
+                          out_count);
   }
-  iree_hal_buffer_view_release(v_token);
-  iree_hal_buffer_view_release(v_pos);
-  iree_hal_buffer_view_release(v_bias);
   if (!iree_status_is_ok(status)) {
     set_error_status(status);
     return 1;

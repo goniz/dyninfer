@@ -345,18 +345,28 @@ impl Context {
     }
 
     pub fn invoke_decode_at(&self, token: i64, pos: i64, max_kv: usize) -> Result<Vec<f32>> {
-        self.invoke_decode(token, pos, &causal_attn_bias(pos, max_kv))
+        let mut bias = Vec::new();
+        fill_causal_attn_bias(&mut bias, pos, max_kv);
+        self.invoke_decode(token, pos, &bias)
     }
 }
 
-/// `0` for `j <= pos`, else `-1e7`.
-pub fn causal_attn_bias(pos: i64, max_kv: usize) -> Vec<f32> {
-    let mut bias = vec![0.0f32; max_kv.max(1)];
+/// Fill `bias` in-place: `0` for `j <= pos`, else `-1e7`. Reuses capacity.
+pub fn fill_causal_attn_bias(bias: &mut Vec<f32>, pos: i64, max_kv: usize) {
+    let n = max_kv.max(1);
+    bias.clear();
+    bias.resize(n, 0.0);
     for (j, b) in bias.iter_mut().enumerate() {
         if (j as i64) > pos {
             *b = -1.0e7;
         }
     }
+}
+
+/// `0` for `j <= pos`, else `-1e7`.
+pub fn causal_attn_bias(pos: i64, max_kv: usize) -> Vec<f32> {
+    let mut bias = Vec::new();
+    fill_causal_attn_bias(&mut bias, pos, max_kv);
     bias
 }
 
@@ -388,9 +398,7 @@ fn native_error(code: i32) -> DynInferError {
 
 fn take_f32_buf(rc: i32, out: *mut f32, count: usize) -> Result<Vec<f32>> {
     if rc != 0 {
-        if !out.is_null() {
-            unsafe { sys::dyninfer_iree_free(out.cast()) };
-        }
+        // Scratch pointer must not be freed (session-owned); ignore on error too.
         return Err(native_error(rc));
     }
     if out.is_null() {
@@ -399,6 +407,7 @@ fn take_f32_buf(rc: i32, out: *mut f32, count: usize) -> Result<Vec<f32>> {
             status_code: None,
         }));
     }
+    // Copy immediately: pointer aliases session scratch invalidated by the next invoke.
     let values = unsafe { std::slice::from_raw_parts(out, count) }.to_vec();
     unsafe { sys::dyninfer_iree_free(out.cast()) };
     Ok(values)

@@ -21,6 +21,8 @@ pub struct IreeSession {
     position: u64,
     history: Vec<TokenId>,
     context: Arc<Context>,
+    /// Reused causal attention bias across decode steps.
+    attn_bias: Vec<f32>,
 }
 
 impl IreeSession {
@@ -47,6 +49,7 @@ impl IreeSession {
             position: 0,
             history: Vec::new(),
             context,
+            attn_bias: Vec::new(),
         }
     }
 
@@ -153,10 +156,11 @@ impl ModelSession for IreeSession {
                 status_code: None,
             }));
         }
-        let values = self.context.invoke_decode_at(
+        iree_runtime::fill_causal_attn_bias(&mut self.attn_bias, self.position as i64, max_kv);
+        let values = self.context.invoke_decode(
             i64::from(token),
             self.position as i64,
-            max_kv,
+            &self.attn_bias,
         )?;
         if values.len() != self.metadata.vocabulary_size as usize {
             return Err(DynInferError::IreeRuntime(IreeRuntimeError {

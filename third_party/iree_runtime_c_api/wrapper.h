@@ -43,6 +43,7 @@ void dyninfer_iree_session_destroy(dyninfer_iree_session_t* session);
 const char* dyninfer_iree_last_error(void);
 
 // Free a buffer returned by invoke helpers (logits).
+// No-op when the pointer is session scratch (current ABI); safe to call always.
 void dyninfer_iree_free(void* p);
 
 // module.add — smoke: two 4xf32 vectors → 4xf32.
