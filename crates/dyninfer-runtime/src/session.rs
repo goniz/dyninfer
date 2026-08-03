@@ -157,11 +157,9 @@ impl ModelSession for IreeSession {
             }));
         }
         iree_runtime::fill_causal_attn_bias(&mut self.attn_bias, self.position as i64, max_kv);
-        let values = self.context.invoke_decode(
-            i64::from(token),
-            self.position as i64,
-            &self.attn_bias,
-        )?;
+        let values =
+            self.context
+                .invoke_decode(i64::from(token), self.position as i64, &self.attn_bias)?;
         if values.len() != self.metadata.vocabulary_size as usize {
             return Err(DynInferError::IreeRuntime(IreeRuntimeError {
                 message: format!(

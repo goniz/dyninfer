@@ -281,8 +281,12 @@ impl TargetProfile {
         let triple = Some(host_triple().to_string());
         let features: Vec<String> = Vec::new();
         let capability_fingerprint = Digest::from_bytes(
-            format!("llvm-cpu|{}|{}", triple.as_deref().unwrap_or("unknown"), features.join(","))
-                .as_bytes(),
+            format!(
+                "llvm-cpu|{}|{}",
+                triple.as_deref().unwrap_or("unknown"),
+                features.join(",")
+            )
+            .as_bytes(),
         );
         Self {
             driver: "local-task".into(),

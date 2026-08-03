@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 use dyninfer_core::{
-    content_digest, BindingPlan, Digest, ExecutableManifest, ShapeProfile, TargetProfile,
+    BindingPlan, Digest, ExecutableManifest, ShapeProfile, TargetProfile, content_digest,
 };
 use dyninfer_error::{CacheError, DynInferError, Result};
 use serde::{Deserialize, Serialize};
@@ -234,7 +234,9 @@ impl ArtifactCache {
     }
 
     fn lock_path(&self, digest: &Digest) -> PathBuf {
-        self.root.join("locks").join(format!("{}.lock", digest.as_str()))
+        self.root
+            .join("locks")
+            .join(format!("{}.lock", digest.as_str()))
     }
 
     /// Exclusive create-new lock file with stale-PID recovery.
@@ -346,7 +348,8 @@ pub fn make_cache_key(inputs: &CacheKeyInputs<'_>) -> Result<CacheKey> {
 mod tests {
     use super::*;
     use dyninfer_core::{
-        ArchitectureId, KvCacheDescriptor, KvCacheLayout, ScalarType, SchemaFingerprint, ShapeProfile,
+        ArchitectureId, KvCacheDescriptor, KvCacheLayout, ScalarType, SchemaFingerprint,
+        ShapeProfile,
     };
 
     fn sample_key() -> CacheKey {

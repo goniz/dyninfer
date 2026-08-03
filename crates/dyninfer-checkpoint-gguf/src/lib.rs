@@ -2,12 +2,12 @@
 
 #![forbid(unsafe_code)]
 
-mod convention;
 mod container;
+mod convention;
 mod types;
 
-pub use convention::{GgufDenseConvention, GgufQ40Convention};
 pub use container::GgufContainer;
+pub use convention::{GgufDenseConvention, GgufQ40Convention};
 pub use types::GgufType;
 
 use dyninfer_checkpoint::BuiltinCheckpointSupport;

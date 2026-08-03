@@ -189,9 +189,8 @@ pub fn materialize_f32_safetensors(
         "params-f32-{digest}.{}.tmp",
         hex::encode(Sha256::digest(&blob))
     ));
-    fs::write(&tmp, &blob).map_err(|e| {
-        DynInferError::io_path(tmp.display().to_string(), format!("write: {e}"))
-    })?;
+    fs::write(&tmp, &blob)
+        .map_err(|e| DynInferError::io_path(tmp.display().to_string(), format!("write: {e}")))?;
     fs::rename(&tmp, &out_path).map_err(|e| {
         DynInferError::io_path(out_path.display().to_string(), format!("rename: {e}"))
     })?;

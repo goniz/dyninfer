@@ -144,13 +144,7 @@ impl IreeRunTools {
     ) -> Result<Vec<f32>> {
         let input = format!("i64={token}");
         let pos_input = format!("i64={pos}");
-        let stdout = self.invoke(
-            module,
-            "decode",
-            &[&input, &pos_input],
-            parameters,
-            device,
-        )?;
+        let stdout = self.invoke(module, "decode", &[&input, &pos_input], parameters, device)?;
         parse_f32_buffer_view(&stdout)
     }
 

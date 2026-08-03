@@ -1,7 +1,7 @@
 //! Schema fingerprint helpers for checkpoint catalogs.
 
 use crate::catalog::LogicalParameter;
-use dyninfer_core::{content_digest, SchemaFingerprint};
+use dyninfer_core::{SchemaFingerprint, content_digest};
 use dyninfer_error::Result;
 use serde::Serialize;
 
@@ -15,7 +15,9 @@ struct FingerprintEntry<'a> {
     keys: Vec<&'a str>,
 }
 
-pub fn schema_fingerprint_from_parameters(parameters: &[LogicalParameter]) -> Result<SchemaFingerprint> {
+pub fn schema_fingerprint_from_parameters(
+    parameters: &[LogicalParameter],
+) -> Result<SchemaFingerprint> {
     let mut entries: Vec<FingerprintEntry<'_>> = parameters
         .iter()
         .map(|p| FingerprintEntry {

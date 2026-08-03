@@ -70,9 +70,7 @@ fn main() {
         let root = manifest_dir.join("../..");
         if let Ok(lib_root) = std::fs::read_dir(root.join("third_party/iree-venv/lib")) {
             for entry in lib_root.flatten() {
-                let dir = entry
-                    .path()
-                    .join("site-packages/iree/compiler/_mlir_libs");
+                let dir = entry.path().join("site-packages/iree/compiler/_mlir_libs");
                 if dir.join("libIREECompiler.so").is_file() {
                     println!("cargo:rustc-link-search=native={}", dir.display());
                     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", dir.display());

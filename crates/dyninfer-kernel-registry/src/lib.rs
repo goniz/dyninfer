@@ -19,23 +19,18 @@ pub struct KernelCandidateDescriptor {
 }
 
 pub trait KernelCostModel: Send + Sync {
-    fn score(
-        &self,
-        candidate: &KernelCandidateDescriptor,
-        target: &TargetProfile,
-    ) -> Result<i64>;
+    fn score(&self, candidate: &KernelCandidateDescriptor, target: &TargetProfile) -> Result<i64>;
 }
 
 #[derive(Debug, Default)]
 pub struct StaticPriorityCostModel;
 
 impl KernelCostModel for StaticPriorityCostModel {
-    fn score(
-        &self,
-        candidate: &KernelCandidateDescriptor,
-        target: &TargetProfile,
-    ) -> Result<i64> {
-        let backend_bonus = if candidate.backends.iter().any(|b| b == &target.driver || b == "any")
+    fn score(&self, candidate: &KernelCandidateDescriptor, target: &TargetProfile) -> Result<i64> {
+        let backend_bonus = if candidate
+            .backends
+            .iter()
+            .any(|b| b == &target.driver || b == "any")
         {
             1000
         } else {

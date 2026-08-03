@@ -1,9 +1,9 @@
 //! Checkpoint catalog and raw index types.
 
 use dyninfer_core::{
-    ByteRange, CanonicalParameterName, ContainerFormatId, ConventionId, Endianness, LogicalTensorType,
-    MetadataMap, ParameterRole, PhysicalEncoding, SchemaFingerprint, SourceFile, StorageComponent,
-    StorageElementType,
+    ByteRange, CanonicalParameterName, ContainerFormatId, ConventionId, Endianness,
+    LogicalTensorType, MetadataMap, ParameterRole, PhysicalEncoding, SchemaFingerprint, SourceFile,
+    StorageComponent, StorageElementType,
 };
 use serde::{Deserialize, Serialize};
 

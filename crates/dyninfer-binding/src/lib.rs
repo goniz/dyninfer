@@ -313,7 +313,9 @@ fn encoding_allowed(slot: &ParameterSlot, encoding: &PhysicalEncoding) -> bool {
         PhysicalEncoding::Opaque { codec, .. } => codec.to_string(),
         PhysicalEncoding::Sparse { format, .. } => format.clone(),
     };
-    slot.supported_encodings.iter().any(|e| e == &name || e == "plain" && matches!(encoding, PhysicalEncoding::Plain { .. }))
+    slot.supported_encodings
+        .iter()
+        .any(|e| e == &name || e == "plain" && matches!(encoding, PhysicalEncoding::Plain { .. }))
 }
 
 #[cfg(test)]
@@ -322,9 +324,9 @@ mod tests {
     use dyninfer_architecture::{ArchitecturePackage, ResolvedModelConfig};
     use dyninfer_checkpoint::{CheckpointCatalog, ContainerIdentity, LogicalParameter};
     use dyninfer_core::{
-        ArchitectureId, CanonicalParameterName, Digest, LogicalTensorConstraint, LogicalTensorType,
-        ParameterRole, ParameterSlotId, PhysicalEncoding, ScalarType, SchemaFingerprint, Shape,
-        ContainerFormatId, ConventionId,
+        ArchitectureId, CanonicalParameterName, ContainerFormatId, ConventionId, Digest,
+        LogicalTensorConstraint, LogicalTensorType, ParameterRole, ParameterSlotId,
+        PhysicalEncoding, ScalarType, SchemaFingerprint, Shape,
     };
     use std::collections::BTreeMap;
 
@@ -348,7 +350,9 @@ mod tests {
             revision: "0.1.0".into(),
             mlir_text: String::new(),
             parameter_slots: vec![slot],
-            resolved_config: ResolvedModelConfig { values: BTreeMap::new() },
+            resolved_config: ResolvedModelConfig {
+                values: BTreeMap::new(),
+            },
         };
         let param = LogicalParameter {
             canonical_name: CanonicalParameterName::new("token_embd.weight"),

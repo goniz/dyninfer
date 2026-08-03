@@ -460,11 +460,11 @@ mod tests {
         assert!(devices.iter().any(|d| d.driver == "vulkan"));
         assert!(devices.iter().any(|d| d.driver == "local-task"));
         let vulkan = devices.iter().find(|d| d.driver == "vulkan").unwrap();
+        assert_eq!(vulkan.uri, "vulkan://00000000-f400-0000-0000-000000000000");
         assert_eq!(
-            vulkan.uri,
-            "vulkan://00000000-f400-0000-0000-000000000000"
+            vulkan.profile.device_uri.as_deref(),
+            Some(vulkan.uri.as_str())
         );
-        assert_eq!(vulkan.profile.device_uri.as_deref(), Some(vulkan.uri.as_str()));
     }
 
     #[test]

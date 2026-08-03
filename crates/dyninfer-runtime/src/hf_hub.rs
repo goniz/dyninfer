@@ -223,7 +223,9 @@ mod tests {
             eprintln!("skip: Maykeye/TinyLLama-v0 not in HF cache");
             return;
         };
-        assert!(snap.join("model.safetensors").is_file() || find_safetensors_checkpoint(&snap).is_ok());
+        assert!(
+            snap.join("model.safetensors").is_file() || find_safetensors_checkpoint(&snap).is_ok()
+        );
         assert!(snap.join("tokenizer.json").is_file());
     }
 }

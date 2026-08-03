@@ -2,17 +2,17 @@ use crate::session::IreeSession;
 use crate::{CausalLanguageModel, ModelSession};
 use dyninfer_architecture::{ArchitecturePackage, ArchitectureRegistry};
 use dyninfer_binding::Binder;
-use dyninfer_cache::{make_cache_key, ArtifactCache, CacheKeyInputs};
+use dyninfer_cache::{ArtifactCache, CacheKeyInputs, make_cache_key};
 use dyninfer_checkpoint::{
     BuiltinCheckpointSupport, CheckpointCatalog, DecodeContext, InspectionLimits,
 };
 use dyninfer_compiler::{
-    CompileOptions, CompileRequest, LocalCompiler, ModelCompiler, COMPILER_VERSION, IREE_REVISION,
-    KERNEL_REGISTRY_VERSION,
+    COMPILER_VERSION, CompileOptions, CompileRequest, IREE_REVISION, KERNEL_REGISTRY_VERSION,
+    LocalCompiler, ModelCompiler,
 };
 use dyninfer_core::{
-    content_digest, ArchitectureId, BindingPlan, ExecutableManifest, ModelMetadata, SessionConfig,
-    ShapeProfile,
+    ArchitectureId, BindingPlan, ExecutableManifest, ModelMetadata, SessionConfig, ShapeProfile,
+    content_digest,
 };
 use dyninfer_error::{CacheError, DynInferError, Result};
 use dyninfer_target::TargetDiscovery;
@@ -51,9 +51,7 @@ impl ExecutableHandle {
         let mut context = Context::create(instance, module)?;
         context = match &self.parameters {
             RuntimeParameters::File(path) => context.with_parameters(path),
-            RuntimeParameters::Host(host) => {
-                context.with_host_parameters_shared(Arc::clone(host))
-            }
+            RuntimeParameters::Host(host) => context.with_host_parameters_shared(Arc::clone(host)),
         };
         if let Some(device) = &self.device {
             context = context.with_device(device.clone());
@@ -196,7 +194,12 @@ impl ModelLoader {
         if let Some(cache) = &self.cache {
             let key = cache_key_for(&package, &catalog, &plan, &target, &shape, options)?;
             if let Some(hit) = cache.lookup(&key)? {
-                return self.materialize_bundle_from_cache(&hit.vmfb_path, &hit.manifest_path, &plan, output);
+                return self.materialize_bundle_from_cache(
+                    &hit.vmfb_path,
+                    &hit.manifest_path,
+                    &plan,
+                    output,
+                );
             }
         }
 
@@ -215,7 +218,11 @@ impl ModelLoader {
 
         if let Some(cache) = &self.cache {
             let key = cache_key_for(&package, &catalog, &plan, &target, &shape, options)?;
-            cache.publish(&key, &output_compile.executable.bytes, &output_compile.manifest)?;
+            cache.publish(
+                &key,
+                &output_compile.executable.bytes,
+                &output_compile.manifest,
+            )?;
         }
 
         self.write_bundle(

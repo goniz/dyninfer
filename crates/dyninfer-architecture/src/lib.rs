@@ -16,16 +16,16 @@ mod registry;
 mod remapping;
 mod slots;
 
-pub use builder::{verify_mlir, ArchitectureDefinition, ModelBuilder, ModelModule, Value};
+pub use builder::{ArchitectureDefinition, ModelBuilder, ModelModule, Value, verify_mlir};
 pub use config::{ConfigField, ConfigSchema, ResolvedModelConfig};
 pub use emit::EmitOutput;
 pub use models::{LlamaArchitecture, Qwen3Architecture};
 pub use ops::{
-    DenseDecoderConfig, COMPUTE_DTYPE, LARGE_PREFILL_WINDOW, PREFILL_WINDOW, TINY_PREFILL_WINDOW,
+    COMPUTE_DTYPE, DenseDecoderConfig, LARGE_PREFILL_WINDOW, PREFILL_WINDOW, TINY_PREFILL_WINDOW,
 };
 pub use package::ArchitecturePackage;
 pub use registry::ArchitectureRegistry;
-pub use remapping::{remap_model_type, MODEL_REMAPPING};
+pub use remapping::{MODEL_REMAPPING, remap_model_type};
 
 use dyninfer_core::{ArchitectureId, MetadataMap};
 use dyninfer_error::{ArchitectureMismatchError, DynInferError, Result};

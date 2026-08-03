@@ -112,7 +112,13 @@ pub unsafe fn dyninfer_compile_result_destroy(result: *mut dyninfer_compile_resu
     }
     if let Some(release) = r.metadata_json.release {
         if !r.metadata_json.data.is_null() {
-            unsafe { release(r.metadata_json.data, r.metadata_json.size, r.metadata_json.user_data) };
+            unsafe {
+                release(
+                    r.metadata_json.data,
+                    r.metadata_json.size,
+                    r.metadata_json.user_data,
+                )
+            };
         }
     }
     if let Some(release) = r.diagnostics_utf8.release {

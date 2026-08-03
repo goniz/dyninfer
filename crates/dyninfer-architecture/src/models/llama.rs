@@ -4,7 +4,7 @@
 //! Milestone-1 fixture. Q/K norms are optional (absent for classic Llama).
 
 use crate::naming::canonicalize_hf_family;
-use crate::ops::{emit_dense_decoder_cfg, DenseDecoderConfig};
+use crate::ops::{DenseDecoderConfig, emit_dense_decoder_cfg};
 use crate::slots::field;
 use crate::{
     ArchitectureDefinition, ArchitecturePackage, ConfigSchema, EmitOutput, ModelBuilder,
@@ -25,7 +25,12 @@ static CONFIG_SCHEMA: LazyLock<ConfigSchema> = LazyLock::new(|| ConfigSchema {
         field("num_kv_heads", "u32", true, Some(serde_json::json!(4))),
         field("head_dim", "u32", true, Some(serde_json::json!(64))),
         field("hidden_size", "u32", true, Some(serde_json::json!(256))),
-        field("intermediate_size", "u32", true, Some(serde_json::json!(512))),
+        field(
+            "intermediate_size",
+            "u32",
+            true,
+            Some(serde_json::json!(512)),
+        ),
         field("vocab_size", "u32", true, Some(serde_json::json!(32000))),
         field("context_length", "u32", true, Some(serde_json::json!(2048))),
         field("rms_norm_eps", "f64", false, Some(serde_json::json!(1e-5))),
@@ -58,19 +63,10 @@ impl ArchitectureDefinition for LlamaArchitecture {
     /// (`self_attn.*_proj`, SwiGLU `mlp.*`, same layernorm names), so it maps to
     /// this arch — same choice as mlx-lm / llama.cpp convert scripts.
     fn model_types(&self) -> &[&str] {
-        &[
-            "llama",
-            "mistral",
-            "LlamaForCausalLM",
-            "MistralForCausalLM",
-        ]
+        &["llama", "mistral", "LlamaForCausalLM", "MistralForCausalLM"]
     }
 
-    fn build(
-        &self,
-        config: &ResolvedModelConfig,
-        m: &mut ModelBuilder,
-    ) -> Result<ModelModule> {
+    fn build(&self, config: &ResolvedModelConfig, m: &mut ModelBuilder) -> Result<ModelModule> {
         let num_layers = config.num_layers()?;
         let _hidden = config.get_u32("hidden_size")?;
         let _vocab = config.get_u32("vocab_size")?;

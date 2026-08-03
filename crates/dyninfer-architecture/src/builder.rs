@@ -87,7 +87,13 @@ impl ModelBuilder {
         }
     }
 
-    fn push_slot(&mut self, name: &str, role: ParameterRole, rank: usize, optional: bool) -> Result<()> {
+    fn push_slot(
+        &mut self,
+        name: &str,
+        role: ParameterRole,
+        rank: usize,
+        optional: bool,
+    ) -> Result<()> {
         self.declare_parameter(ParameterSlot {
             id: ParameterSlotId::new(name),
             canonical_name: CanonicalParameterName::new(name),
@@ -157,10 +163,30 @@ impl ModelBuilder {
     /// Record a dense transformer block (declares layer parameter slots).
     pub fn dense_block(&mut self, x: Value, layer: u32, has_qk_norm: bool) -> Result<Value> {
         let prefix = format!("blk.{layer}");
-        self.push_slot(&format!("{prefix}.attn_norm.weight"), ParameterRole::Norm, 1, false)?;
-        self.push_slot(&format!("{prefix}.attn_q.weight"), ParameterRole::AttentionQ, 2, false)?;
-        self.push_slot(&format!("{prefix}.attn_k.weight"), ParameterRole::AttentionK, 2, false)?;
-        self.push_slot(&format!("{prefix}.attn_v.weight"), ParameterRole::AttentionV, 2, false)?;
+        self.push_slot(
+            &format!("{prefix}.attn_norm.weight"),
+            ParameterRole::Norm,
+            1,
+            false,
+        )?;
+        self.push_slot(
+            &format!("{prefix}.attn_q.weight"),
+            ParameterRole::AttentionQ,
+            2,
+            false,
+        )?;
+        self.push_slot(
+            &format!("{prefix}.attn_k.weight"),
+            ParameterRole::AttentionK,
+            2,
+            false,
+        )?;
+        self.push_slot(
+            &format!("{prefix}.attn_v.weight"),
+            ParameterRole::AttentionV,
+            2,
+            false,
+        )?;
         self.push_slot(
             &format!("{prefix}.attn_output.weight"),
             ParameterRole::AttentionO,
@@ -168,16 +194,56 @@ impl ModelBuilder {
             false,
         )?;
         if has_qk_norm {
-            self.push_slot(&format!("{prefix}.attn_q_norm.weight"), ParameterRole::Norm, 1, false)?;
-            self.push_slot(&format!("{prefix}.attn_k_norm.weight"), ParameterRole::Norm, 1, false)?;
+            self.push_slot(
+                &format!("{prefix}.attn_q_norm.weight"),
+                ParameterRole::Norm,
+                1,
+                false,
+            )?;
+            self.push_slot(
+                &format!("{prefix}.attn_k_norm.weight"),
+                ParameterRole::Norm,
+                1,
+                false,
+            )?;
         } else {
-            self.push_slot(&format!("{prefix}.attn_q_norm.weight"), ParameterRole::Norm, 1, true)?;
-            self.push_slot(&format!("{prefix}.attn_k_norm.weight"), ParameterRole::Norm, 1, true)?;
+            self.push_slot(
+                &format!("{prefix}.attn_q_norm.weight"),
+                ParameterRole::Norm,
+                1,
+                true,
+            )?;
+            self.push_slot(
+                &format!("{prefix}.attn_k_norm.weight"),
+                ParameterRole::Norm,
+                1,
+                true,
+            )?;
         }
-        self.push_slot(&format!("{prefix}.ffn_norm.weight"), ParameterRole::Norm, 1, false)?;
-        self.push_slot(&format!("{prefix}.ffn_gate.weight"), ParameterRole::FfnGate, 2, false)?;
-        self.push_slot(&format!("{prefix}.ffn_up.weight"), ParameterRole::FfnUp, 2, false)?;
-        self.push_slot(&format!("{prefix}.ffn_down.weight"), ParameterRole::FfnDown, 2, false)?;
+        self.push_slot(
+            &format!("{prefix}.ffn_norm.weight"),
+            ParameterRole::Norm,
+            1,
+            false,
+        )?;
+        self.push_slot(
+            &format!("{prefix}.ffn_gate.weight"),
+            ParameterRole::FfnGate,
+            2,
+            false,
+        )?;
+        self.push_slot(
+            &format!("{prefix}.ffn_up.weight"),
+            ParameterRole::FfnUp,
+            2,
+            false,
+        )?;
+        self.push_slot(
+            &format!("{prefix}.ffn_down.weight"),
+            ParameterRole::FfnDown,
+            2,
+            false,
+        )?;
         let out = self.alloc("blk");
         self.note_op(format!(
             "dense_block {} = block({}, layer={layer})",
@@ -207,19 +273,28 @@ impl ModelBuilder {
     }
 
     pub fn finish(&mut self) -> Result<ModelModule> {
-        let architecture_id = self.architecture_id.clone().ok_or_else(|| {
-            DynInferError::internal("ModelBuilder missing architecture_id")
-        })?;
+        let architecture_id = self
+            .architecture_id
+            .clone()
+            .ok_or_else(|| DynInferError::internal("ModelBuilder missing architecture_id"))?;
         let slots = std::mem::take(&mut self.slots);
-        let _notes = std::mem::take(&mut self.notes);
+        let notes = std::mem::take(&mut self.notes);
 
-        // Graph sketch lives in `notes` / slots; executable IR comes from
-        // `emit_executable`. Do not call verify_mlir here: that would try to
-        // create another ModuleBuilder while `self.mlir` still holds the
-        // process-wide MLIR lock.
+        // Graph sketch lives in `notes` / slots. Full Bound Model IR (architecture
+        // ops + bindings) is not yet the executable path — emit_executable still
+        // produces the VMFB MLIR — but we retain the sketch so packages are not
+        // empty and the Architecture IR → Bound IR boundary stays inspectable.
+        let mut mlir_text = String::from("module {\n");
+        for note in &notes {
+            mlir_text.push_str("  // graph: ");
+            mlir_text.push_str(note);
+            mlir_text.push('\n');
+        }
+        mlir_text.push_str("}\n");
+
         Ok(ModelModule {
             architecture_id,
-            mlir_text: "module {\n}\n".into(),
+            mlir_text,
             parameter_slots: slots,
         })
     }

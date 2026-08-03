@@ -2,14 +2,14 @@ use crate::attribute::Attribute;
 use crate::context::Context;
 use crate::location::Location;
 use crate::mlir_err;
-use crate::r#type::Type;
 use crate::string_ref;
+use crate::r#type::Type;
 use dyninfer_error::Result;
 use dyninfer_mlir_sys::bindings::{
-    mlirIdentifierGet, mlirNamedAttributeGet, mlirOperationCreate, mlirOperationCreateParse,
-    mlirOperationDestroy, mlirOperationStateAddAttributes, mlirOperationStateAddResults,
-    mlirOperationStateEnableResultTypeInference, mlirOperationStateGet, MlirNamedAttribute,
-    MlirOperation, MlirOperationState, MlirType,
+    MlirNamedAttribute, MlirOperation, MlirOperationState, MlirType, mlirIdentifierGet,
+    mlirNamedAttributeGet, mlirOperationCreate, mlirOperationCreateParse, mlirOperationDestroy,
+    mlirOperationStateAddAttributes, mlirOperationStateAddResults,
+    mlirOperationStateEnableResultTypeInference, mlirOperationStateGet,
 };
 
 /// Owned MLIR operation (not yet inserted, or detached).
@@ -90,9 +90,8 @@ impl<'c> OperationBuilder<'c> {
 
     pub fn add_attribute(mut self, name: &str, attr: Attribute) -> Self {
         let name_owned = name.to_string();
-        let id = unsafe {
-            mlirIdentifierGet(self.ctx.raw(), string_ref::from_str(name_owned.as_str()))
-        };
+        let id =
+            unsafe { mlirIdentifierGet(self.ctx.raw(), string_ref::from_str(name_owned.as_str())) };
         let named: MlirNamedAttribute = unsafe { mlirNamedAttributeGet(id, attr.raw()) };
         self.name_bufs.push(name_owned);
         unsafe {

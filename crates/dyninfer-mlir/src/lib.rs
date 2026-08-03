@@ -22,8 +22,8 @@ mod func_builder;
 mod location;
 mod module;
 mod operation;
-mod r#type;
 mod string_ref;
+mod r#type;
 mod value;
 
 pub use attribute::Attribute;

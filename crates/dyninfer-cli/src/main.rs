@@ -4,11 +4,11 @@
 
 use clap::{Parser, Subcommand};
 use dyninfer_cache::ArtifactCache;
-use dyninfer_compiler::{compile_add_smoke, CompileOptions};
+use dyninfer_compiler::{CompileOptions, compile_add_smoke};
 use dyninfer_core::SessionConfig;
 use dyninfer_runtime::{
-    find_safetensors_checkpoint, generate_greedy, load_tokenizer, resolve_hf_snapshot,
-    CausalLanguageModel, GenerateConfig, GenerateOutput, ModelLoader,
+    CausalLanguageModel, GenerateConfig, GenerateOutput, ModelLoader, find_safetensors_checkpoint,
+    generate_greedy, load_tokenizer, resolve_hf_snapshot,
 };
 use dyninfer_target::TargetDiscovery;
 use iree_runtime::{Context, Instance, Module};
@@ -471,11 +471,12 @@ fn main() -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
             }
-            CacheCommands::Prune { cache_dir, max_size } => {
+            CacheCommands::Prune {
+                cache_dir,
+                max_size,
+            } => {
                 let _ = ArtifactCache::open(cache_dir)?;
-                println!(
-                    "prune is a stub; requested max_size={max_size} (no eviction yet)"
-                );
+                println!("prune is a stub; requested max_size={max_size} (no eviction yet)");
             }
         },
     }
@@ -495,4 +496,3 @@ fn print_generate_result(out: &GenerateOutput) {
         s.decode_tps(),
     );
 }
-

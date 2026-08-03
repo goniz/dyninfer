@@ -4,10 +4,10 @@ use crate::operation::Operation;
 use crate::string_ref;
 use dyninfer_error::Result;
 use dyninfer_mlir_sys::bindings::{
-    mlirBlockAppendOwnedOperation, mlirBlockGetFirstOperation, mlirModuleCreateParse,
-    mlirModuleDestroy, mlirModuleGetBody, mlirModuleGetOperation, mlirOperationGetNextInBlock,
-    mlirOperationPrint, mlirOperationRemoveFromParent, mlirOperationVerify, MlirModule,
-    MlirOperation, MlirStringRef,
+    MlirModule, MlirOperation, MlirStringRef, mlirBlockAppendOwnedOperation,
+    mlirBlockGetFirstOperation, mlirModuleCreateParse, mlirModuleDestroy, mlirModuleGetBody,
+    mlirModuleGetOperation, mlirOperationGetNextInBlock, mlirOperationPrint,
+    mlirOperationRemoveFromParent, mlirOperationVerify,
 };
 use std::ffi::c_void;
 

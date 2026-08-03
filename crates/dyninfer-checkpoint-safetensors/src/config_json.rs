@@ -23,7 +23,10 @@ pub fn load_hf_config_metadata(checkpoint: &Path) -> MetadataMap {
     let u = |k: &str| obj.get(k).and_then(|v| v.as_u64());
     let f = |k: &str| obj.get(k).and_then(|v| v.as_f64());
 
-    if let Some(v) = u("num_hidden_layers").or_else(|| u("n_layer")).or_else(|| u("num_layers")) {
+    if let Some(v) = u("num_hidden_layers")
+        .or_else(|| u("n_layer"))
+        .or_else(|| u("num_layers"))
+    {
         out.insert("num_layers".into(), Value::from(v));
         out.insert("n_layer".into(), Value::from(v));
         out.insert("block_count".into(), Value::from(v));
@@ -36,7 +39,9 @@ pub fn load_hf_config_metadata(checkpoint: &Path) -> MetadataMap {
     if let Some(v) = u("intermediate_size") {
         out.insert("intermediate_size".into(), Value::from(v));
     }
-    if let Some(v) = u("num_attention_heads").or_else(|| u("n_head")).or_else(|| u("num_heads"))
+    if let Some(v) = u("num_attention_heads")
+        .or_else(|| u("n_head"))
+        .or_else(|| u("num_heads"))
     {
         out.insert("num_heads".into(), Value::from(v));
         out.insert("llama.attention.head_count".into(), Value::from(v));

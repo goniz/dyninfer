@@ -1,10 +1,10 @@
 use crate::attribute::Attribute;
 use crate::context::Context;
 use crate::dialect::{Arith, Func, Linalg, Tensor, Util};
+use crate::func_builder::FuncBuilder;
 use crate::location::Location;
 use crate::mlir_err;
 use crate::module::Module;
-use crate::func_builder::FuncBuilder;
 use crate::operation::{Operation, OperationBuilder};
 use crate::r#type::Type;
 use dyninfer_error::Result;
@@ -157,9 +157,7 @@ impl ModuleBuilder {
         if let Some(text) = &self.verified_text {
             return text.clone();
         }
-        self.materialize()
-            .map(|m| m.print())
-            .unwrap_or_default()
+        self.materialize().map(|m| m.print()).unwrap_or_default()
     }
 
     /// Verify (if needed) and return the serialized module.

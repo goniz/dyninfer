@@ -37,7 +37,13 @@ pub fn emit_linear(
     f.finish(module)
 }
 
-pub fn emit_rms_norm(module: &mut ModuleBuilder, name: &str, s: u32, h: u32, eps: f32) -> Result<()> {
+pub fn emit_rms_norm(
+    module: &mut ModuleBuilder,
+    name: &str,
+    s: u32,
+    h: u32,
+    eps: f32,
+) -> Result<()> {
     let x_ty = format!("tensor<{s}x{h}xf32>");
     let w_ty = format!("tensor<{h}xf32>");
     let red_ty = format!("tensor<{s}xf32>");

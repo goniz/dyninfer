@@ -5,14 +5,14 @@
 
 use crate::config_json::load_hf_config_metadata;
 use dyninfer_checkpoint::{
-    infer_role, CheckpointConventionDecoder, DecodeContext, LogicalParameter, MatchScore,
-    ParameterCatalog, RawCheckpointIndex,
+    CheckpointConventionDecoder, DecodeContext, LogicalParameter, MatchScore, ParameterCatalog,
+    RawCheckpointIndex, infer_role,
 };
 use dyninfer_core::{
-    CanonicalParameterName, ConventionId, Endianness, LogicalTensorType, PhysicalEncoding, ScalarType,
-    Shape, StorageComponent, StorageElementType,
+    CanonicalParameterName, ConventionId, Endianness, LogicalTensorType, PhysicalEncoding,
+    ScalarType, Shape, StorageComponent, StorageElementType,
 };
-use dyninfer_error::{DynInferError, UnsupportedEncodingError, Result};
+use dyninfer_error::{DynInferError, Result, UnsupportedEncodingError};
 
 #[derive(Debug, Default)]
 pub struct DenseSafetensorsConvention;
@@ -58,25 +58,29 @@ impl CheckpointConventionDecoder for DenseSafetensorsConvention {
         let mut parameters = Vec::with_capacity(index.entries.len());
         for entry in &index.entries {
             let StorageElementType::Scalar { ty } = &entry.storage_type else {
-                return Err(DynInferError::UnsupportedEncoding(UnsupportedEncodingError {
-                    message: "non-scalar SafeTensors entry not supported by dense convention"
-                        .into(),
-                    key: Some(entry.key.clone()),
-                    codec: None,
-                    codec_version: None,
-                    expected: Some("scalar dense".into()),
-                    actual: Some(entry.storage_type.to_string()),
-                }));
+                return Err(DynInferError::UnsupportedEncoding(
+                    UnsupportedEncodingError {
+                        message: "non-scalar SafeTensors entry not supported by dense convention"
+                            .into(),
+                        key: Some(entry.key.clone()),
+                        codec: None,
+                        codec_version: None,
+                        expected: Some("scalar dense".into()),
+                        actual: Some(entry.storage_type.to_string()),
+                    },
+                ));
             };
             if !matches!(ty, ScalarType::Bf16 | ScalarType::F16 | ScalarType::F32) {
-                return Err(DynInferError::UnsupportedEncoding(UnsupportedEncodingError {
-                    message: format!("dense SafeTensors dtype {ty} not in version-1 path"),
-                    key: Some(entry.key.clone()),
-                    codec: None,
-                    codec_version: None,
-                    expected: Some("bf16|f16|f32".into()),
-                    actual: Some(ty.to_string()),
-                }));
+                return Err(DynInferError::UnsupportedEncoding(
+                    UnsupportedEncodingError {
+                        message: format!("dense SafeTensors dtype {ty} not in version-1 path"),
+                        key: Some(entry.key.clone()),
+                        codec: None,
+                        codec_version: None,
+                        expected: Some("bf16|f16|f32".into()),
+                        actual: Some(ty.to_string()),
+                    },
+                ));
             }
 
             // Skip obvious non-weight caches; arch remappers also filter these.

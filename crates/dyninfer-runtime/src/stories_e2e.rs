@@ -2,11 +2,11 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        generate_greedy, load_tokenizer, resolve_hf_snapshot, CausalLanguageModel, GenerateConfig,
-        ModelLoader,
-    };
     use crate::find_safetensors_checkpoint;
+    use crate::{
+        CausalLanguageModel, GenerateConfig, ModelLoader, generate_greedy, load_tokenizer,
+        resolve_hf_snapshot,
+    };
     use dyninfer_compiler::{CompileOptions, IreeTools};
     use dyninfer_core::{ArchitectureId, SessionConfig};
     use std::path::PathBuf;
@@ -50,7 +50,10 @@ mod tests {
         let (package, catalog, plan) = loader.bind(&id, &ckpt, &Default::default()).unwrap();
         assert_eq!(package.resolved_config.num_layers().unwrap(), 8);
         assert_eq!(package.resolved_config.get_u32("hidden_size").unwrap(), 64);
-        assert_eq!(package.resolved_config.get_u32("vocab_size").unwrap(), 32000);
+        assert_eq!(
+            package.resolved_config.get_u32("vocab_size").unwrap(),
+            32000
+        );
         assert_eq!(
             plan.bindings.len() + plan.unresolved_optional_slots.len(),
             package.parameter_slots.len()
@@ -101,9 +104,11 @@ mod tests {
             out.text
         );
         let lower = out.text.to_ascii_lowercase();
-        let storyish = ["once", "there", "was", "little", "girl", "boy", "said", "day"]
-            .iter()
-            .any(|w| lower.contains(w));
+        let storyish = [
+            "once", "there", "was", "little", "girl", "boy", "said", "day",
+        ]
+        .iter()
+        .any(|w| lower.contains(w));
         assert!(
             storyish,
             "expected TinyStories-like English, got {:?}",

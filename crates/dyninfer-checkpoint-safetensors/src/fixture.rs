@@ -1,10 +1,13 @@
 //! Tiny SafeTensors fixture helpers for tests and local demos.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 /// Build an in-memory SafeTensors blob with dense F32 tensors.
-pub fn write_safetensors(tensors: &BTreeMap<String, (Vec<u64>, Vec<f32>)>, metadata: Value) -> Vec<u8> {
+pub fn write_safetensors(
+    tensors: &BTreeMap<String, (Vec<u64>, Vec<f32>)>,
+    metadata: Value,
+) -> Vec<u8> {
     let mut header = serde_json::Map::new();
     if !metadata.is_null() {
         header.insert("__metadata__".into(), metadata);
@@ -84,19 +87,31 @@ pub fn tiny_llama_dense_f32() -> Vec<u8> {
     );
     tensors.insert(
         "blk.0.attn_q.weight".into(),
-        (vec![hidden, hidden], fill_f32((hidden * hidden) as usize, 2)),
+        (
+            vec![hidden, hidden],
+            fill_f32((hidden * hidden) as usize, 2),
+        ),
     );
     tensors.insert(
         "blk.0.attn_k.weight".into(),
-        (vec![hidden, hidden], fill_f32((hidden * hidden) as usize, 3)),
+        (
+            vec![hidden, hidden],
+            fill_f32((hidden * hidden) as usize, 3),
+        ),
     );
     tensors.insert(
         "blk.0.attn_v.weight".into(),
-        (vec![hidden, hidden], fill_f32((hidden * hidden) as usize, 4)),
+        (
+            vec![hidden, hidden],
+            fill_f32((hidden * hidden) as usize, 4),
+        ),
     );
     tensors.insert(
         "blk.0.attn_output.weight".into(),
-        (vec![hidden, hidden], fill_f32((hidden * hidden) as usize, 5)),
+        (
+            vec![hidden, hidden],
+            fill_f32((hidden * hidden) as usize, 5),
+        ),
     );
     tensors.insert(
         "blk.0.ffn_norm.weight".into(),
@@ -188,11 +203,17 @@ pub fn tiny_gqa_rope_f32() -> Vec<u8> {
     );
     tensors.insert(
         "blk.0.attn_k.weight".into(),
-        (vec![kv_dim, hidden], fill_f32((kv_dim * hidden) as usize, 3)),
+        (
+            vec![kv_dim, hidden],
+            fill_f32((kv_dim * hidden) as usize, 3),
+        ),
     );
     tensors.insert(
         "blk.0.attn_v.weight".into(),
-        (vec![kv_dim, hidden], fill_f32((kv_dim * hidden) as usize, 4)),
+        (
+            vec![kv_dim, hidden],
+            fill_f32((kv_dim * hidden) as usize, 4),
+        ),
     );
     tensors.insert(
         "blk.0.attn_output.weight".into(),
@@ -244,7 +265,6 @@ pub fn tiny_gqa_rope_f32() -> Vec<u8> {
     write_safetensors(&tensors, meta)
 }
 
-
 /// GQA like [`tiny_gqa_rope_f32`] but no RoPE metadata and no Q/K-norm (llama path).
 pub fn tiny_gqa_plain_f32() -> Vec<u8> {
     let vocab = 48u64;
@@ -279,18 +299,69 @@ pub fn tiny_gqa_plain_f32() -> Vec<u8> {
     });
 
     let mut tensors = BTreeMap::new();
-    tensors.insert("token_embd.weight".into(), (vec![vocab, hidden], fill_f32((vocab * hidden) as usize, 1)));
-    tensors.insert("blk.0.attn_norm.weight".into(), (vec![hidden], vec![1.0f32; hidden as usize]));
-    tensors.insert("blk.0.attn_q.weight".into(), (vec![q_dim, hidden], fill_f32((q_dim * hidden) as usize, 2)));
-    tensors.insert("blk.0.attn_k.weight".into(), (vec![kv_dim, hidden], fill_f32((kv_dim * hidden) as usize, 3)));
-    tensors.insert("blk.0.attn_v.weight".into(), (vec![kv_dim, hidden], fill_f32((kv_dim * hidden) as usize, 4)));
-    tensors.insert("blk.0.attn_output.weight".into(), (vec![hidden, q_dim], fill_f32((hidden * q_dim) as usize, 5)));
-    tensors.insert("blk.0.ffn_norm.weight".into(), (vec![hidden], vec![1.0f32; hidden as usize]));
-    tensors.insert("blk.0.ffn_gate.weight".into(), (vec![intermediate, hidden], fill_f32((intermediate * hidden) as usize, 6)));
-    tensors.insert("blk.0.ffn_up.weight".into(), (vec![intermediate, hidden], fill_f32((intermediate * hidden) as usize, 7)));
-    tensors.insert("blk.0.ffn_down.weight".into(), (vec![hidden, intermediate], fill_f32((hidden * intermediate) as usize, 8)));
-    tensors.insert("output_norm.weight".into(), (vec![hidden], vec![1.0f32; hidden as usize]));
-    tensors.insert("output.weight".into(), (vec![vocab, hidden], fill_f32((vocab * hidden) as usize, 9)));
+    tensors.insert(
+        "token_embd.weight".into(),
+        (vec![vocab, hidden], fill_f32((vocab * hidden) as usize, 1)),
+    );
+    tensors.insert(
+        "blk.0.attn_norm.weight".into(),
+        (vec![hidden], vec![1.0f32; hidden as usize]),
+    );
+    tensors.insert(
+        "blk.0.attn_q.weight".into(),
+        (vec![q_dim, hidden], fill_f32((q_dim * hidden) as usize, 2)),
+    );
+    tensors.insert(
+        "blk.0.attn_k.weight".into(),
+        (
+            vec![kv_dim, hidden],
+            fill_f32((kv_dim * hidden) as usize, 3),
+        ),
+    );
+    tensors.insert(
+        "blk.0.attn_v.weight".into(),
+        (
+            vec![kv_dim, hidden],
+            fill_f32((kv_dim * hidden) as usize, 4),
+        ),
+    );
+    tensors.insert(
+        "blk.0.attn_output.weight".into(),
+        (vec![hidden, q_dim], fill_f32((hidden * q_dim) as usize, 5)),
+    );
+    tensors.insert(
+        "blk.0.ffn_norm.weight".into(),
+        (vec![hidden], vec![1.0f32; hidden as usize]),
+    );
+    tensors.insert(
+        "blk.0.ffn_gate.weight".into(),
+        (
+            vec![intermediate, hidden],
+            fill_f32((intermediate * hidden) as usize, 6),
+        ),
+    );
+    tensors.insert(
+        "blk.0.ffn_up.weight".into(),
+        (
+            vec![intermediate, hidden],
+            fill_f32((intermediate * hidden) as usize, 7),
+        ),
+    );
+    tensors.insert(
+        "blk.0.ffn_down.weight".into(),
+        (
+            vec![hidden, intermediate],
+            fill_f32((hidden * intermediate) as usize, 8),
+        ),
+    );
+    tensors.insert(
+        "output_norm.weight".into(),
+        (vec![hidden], vec![1.0f32; hidden as usize]),
+    );
+    tensors.insert(
+        "output.weight".into(),
+        (vec![vocab, hidden], fill_f32((vocab * hidden) as usize, 9)),
+    );
     write_safetensors(&tensors, meta)
 }
 

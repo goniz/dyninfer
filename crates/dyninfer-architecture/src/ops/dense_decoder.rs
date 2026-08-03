@@ -24,8 +24,8 @@
 //! melior bindings, **not** a zml-like tensor DSL. Follow-up is higher-level
 //! helpers (`attn`, `rope`, …), not switching IR frontends.
 
-use crate::ops::kernels;
 use crate::ArchitecturePackage;
+use crate::ops::kernels;
 use dyninfer_checkpoint::CheckpointCatalog;
 use dyninfer_core::{ScalarType, StorageElementType};
 use dyninfer_error::Result;
@@ -151,11 +151,10 @@ impl DenseDecoderConfig {
             .and_then(|v| v.as_f64())
             .or_else(|| meta.get("rope_theta").and_then(|v| v.as_f64()))
             .map(|v| v as f32);
-        let has_qk_norm = catalog.parameters.iter().any(|p| {
-            p.canonical_name
-                .as_str()
-                .contains("attn_q_norm.weight")
-        });
+        let has_qk_norm = catalog
+            .parameters
+            .iter()
+            .any(|p| p.canonical_name.as_str().contains("attn_q_norm.weight"));
         let mut param_keys = BTreeMap::new();
         let mut param_dtypes = BTreeMap::new();
         for p in &catalog.parameters {
@@ -323,7 +322,6 @@ fn emit_load_compute(
         ),
     }
 }
-
 
 fn emit_globals(builder: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()> {
     let (v, h, i) = (c.vocab, c.hidden, c.intermediate);
@@ -678,7 +676,14 @@ fn emit_decode_helpers(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Re
     if c.has_qk_norm {
         kernels::emit_rms_norm_heads(module, "rms_norm_q_heads_tok", 1, nh, d, c.rms_norm_eps)?;
         if nkv != nh {
-            kernels::emit_rms_norm_heads(module, "rms_norm_kv_heads_tok", 1, nkv, d, c.rms_norm_eps)?;
+            kernels::emit_rms_norm_heads(
+                module,
+                "rms_norm_kv_heads_tok",
+                1,
+                nkv,
+                d,
+                c.rms_norm_eps,
+            )?;
         }
     }
 
@@ -1166,15 +1171,11 @@ fn emit_prefill(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()
         "  %ln1 = tensor.extract_slice %ln[0, 0] [1, {h}] [1, 1] : tensor<{s}x{h}xf32> to tensor<1x{h}xf32>\n"
     ));
     f.op_asm("  %c0f = arith.constant 0.0 : f32\n");
-    f.op_asm(format!(
-        "  %wt_i = tensor.empty() : tensor<{h}x{v}xf32>\n"
-    ));
+    f.op_asm(format!("  %wt_i = tensor.empty() : tensor<{h}x{v}xf32>\n"));
     f.op_asm(format!(
         "  %wt = linalg.transpose ins(%wout : tensor<{v}x{h}xf32>) outs(%wt_i : tensor<{h}x{v}xf32>) permutation = [1, 0]\n"
     ));
-    f.op_asm(format!(
-        "  %yi = tensor.empty() : tensor<1x{v}xf32>\n"
-    ));
+    f.op_asm(format!("  %yi = tensor.empty() : tensor<1x{v}xf32>\n"));
     f.op_asm(format!(
         "  %yz = linalg.fill ins(%c0f : f32) outs(%yi : tensor<1x{v}xf32>) -> tensor<1x{v}xf32>\n"
     ));
@@ -1190,7 +1191,6 @@ fn emit_prefill(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()
 }
 
 fn emit_decode(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()> {
-
     let (h, v, mk) = (c.hidden, c.vocab, c.max_kv);
     let (q, kv) = (c.q_dim(), c.kv_dim());
     let d = c.head_dim;
@@ -1435,7 +1435,6 @@ fn emit_decode(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()>
     f.finish(module)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1456,10 +1455,7 @@ mod tests {
             rope_theta: Some(1_000_000.0),
             has_qk_norm: true,
             param_keys: BTreeMap::new(),
-            param_dtypes: BTreeMap::from([(
-                "token_embd.weight".into(),
-                ScalarType::Bf16,
-            )]),
+            param_dtypes: BTreeMap::from([("token_embd.weight".into(), ScalarType::Bf16)]),
         };
         assert!(c.supports_dense_emit());
         assert_eq!(c.q_dim(), 2048);

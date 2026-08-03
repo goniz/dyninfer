@@ -3,8 +3,8 @@
 #[cfg(test)]
 mod tests {
     use crate::{
-        find_safetensors_checkpoint, generate_greedy, load_tokenizer, resolve_hf_snapshot,
-        CausalLanguageModel, GenerateConfig, ModelLoader,
+        CausalLanguageModel, GenerateConfig, ModelLoader, find_safetensors_checkpoint,
+        generate_greedy, load_tokenizer, resolve_hf_snapshot,
     };
     use dyninfer_architecture::LARGE_PREFILL_WINDOW;
     use dyninfer_compiler::{CompileOptions, IreeTools};
@@ -53,7 +53,10 @@ mod tests {
         let (package, catalog, plan) = loader.bind(&id, &ckpt, &Default::default()).unwrap();
 
         assert_eq!(package.resolved_config.num_layers().unwrap(), 28);
-        assert_eq!(package.resolved_config.get_u32("hidden_size").unwrap(), 1024);
+        assert_eq!(
+            package.resolved_config.get_u32("hidden_size").unwrap(),
+            1024
+        );
         assert_eq!(package.resolved_config.get_u32("num_heads").unwrap(), 16);
         assert_eq!(package.resolved_config.get_u32("num_kv_heads").unwrap(), 8);
         assert_eq!(package.resolved_config.get_u32("head_dim").unwrap(), 128);

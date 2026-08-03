@@ -1,14 +1,14 @@
 //! In-process MLIR → VMFB via the bindgen'd embedding API.
 
 use crate::bindings::{
-    ireeCompilerErrorDestroy, ireeCompilerErrorGetMessage, ireeCompilerGetAPIVersion,
-    ireeCompilerGetRevision, ireeCompilerGlobalInitialize, ireeCompilerInvocationCreate,
-    ireeCompilerInvocationDestroy, ireeCompilerInvocationEnableConsoleDiagnostics,
-    ireeCompilerInvocationOutputVMBytecode, ireeCompilerInvocationParseSource,
-    ireeCompilerInvocationPipeline, ireeCompilerOutputDestroy, ireeCompilerOutputMapMemory,
-    ireeCompilerOutputOpenMembuffer, ireeCompilerSessionCreate, ireeCompilerSessionDestroy,
-    ireeCompilerSessionSetFlags, ireeCompilerSourceDestroy, ireeCompilerSourceWrapBuffer,
-    iree_compiler_pipeline_t,
+    iree_compiler_pipeline_t, ireeCompilerErrorDestroy, ireeCompilerErrorGetMessage,
+    ireeCompilerGetAPIVersion, ireeCompilerGetRevision, ireeCompilerGlobalInitialize,
+    ireeCompilerInvocationCreate, ireeCompilerInvocationDestroy,
+    ireeCompilerInvocationEnableConsoleDiagnostics, ireeCompilerInvocationOutputVMBytecode,
+    ireeCompilerInvocationParseSource, ireeCompilerInvocationPipeline, ireeCompilerOutputDestroy,
+    ireeCompilerOutputMapMemory, ireeCompilerOutputOpenMembuffer, ireeCompilerSessionCreate,
+    ireeCompilerSessionDestroy, ireeCompilerSessionSetFlags, ireeCompilerSourceDestroy,
+    ireeCompilerSourceWrapBuffer,
 };
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
@@ -82,7 +82,9 @@ pub fn revision() -> Result<String, ApiError> {
     if ptr.is_null() {
         return Ok(String::new());
     }
-    Ok(unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
+    Ok(unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned())
 }
 
 /// Default AMDGPU chip when compiling for HIP/ROCm without an explicit target.
@@ -257,8 +259,7 @@ unsafe fn compile_inner(mlir: &str, flags: &[&str]) -> Result<Vec<u8>, ApiError>
     })?;
     let ptrs: Vec<*const i8> = c_flags.iter().map(|s| s.as_ptr()).collect();
     if !ptrs.is_empty() {
-        let err =
-            unsafe { ireeCompilerSessionSetFlags(session, ptrs.len() as i32, ptrs.as_ptr()) };
+        let err = unsafe { ireeCompilerSessionSetFlags(session, ptrs.len() as i32, ptrs.as_ptr()) };
         if let Some(msg) = unsafe { take_error(err) } {
             unsafe { ireeCompilerSessionDestroy(session) };
             return Err(ApiError {
@@ -311,8 +312,9 @@ unsafe fn compile_inner(mlir: &str, flags: &[&str]) -> Result<Vec<u8>, ApiError>
         });
     }
 
-    if !unsafe { ireeCompilerInvocationPipeline(inv, iree_compiler_pipeline_t::IREE_COMPILER_PIPELINE_STD) }
-    {
+    if !unsafe {
+        ireeCompilerInvocationPipeline(inv, iree_compiler_pipeline_t::IREE_COMPILER_PIPELINE_STD)
+    } {
         unsafe {
             ireeCompilerInvocationDestroy(inv);
             ireeCompilerSourceDestroy(source);

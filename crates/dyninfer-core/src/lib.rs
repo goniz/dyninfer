@@ -10,7 +10,7 @@ mod scalar;
 mod shape;
 mod types;
 
-pub use fingerprint::{content_digest, Digest, SchemaFingerprint};
+pub use fingerprint::{Digest, SchemaFingerprint, content_digest};
 pub use ids::{
     ArchitectureId, CanonicalParameterName, CodecId, ContainerFormatId, ConventionId,
     ParameterSlotId, TiedParameterGroup,

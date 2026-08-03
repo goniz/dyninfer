@@ -43,9 +43,12 @@ impl FileSource {
         let file = File::open(&path).map_err(|e| {
             DynInferError::io_path(path.display().to_string(), format!("open failed: {e}"))
         })?;
-        let len = file.metadata().map_err(|e| {
-            DynInferError::io_path(path.display().to_string(), format!("metadata failed: {e}"))
-        })?.len();
+        let len = file
+            .metadata()
+            .map_err(|e| {
+                DynInferError::io_path(path.display().to_string(), format!("metadata failed: {e}"))
+            })?
+            .len();
         Ok(Self {
             path,
             len,

@@ -1,7 +1,8 @@
 //! Container reader and convention decoder traits.
 
 use crate::catalog::{
-    DecodeContext, MatchScore, ParameterCatalog, ProbeScore, RawCheckpointIndex, RuntimeProviderPlan,
+    DecodeContext, MatchScore, ParameterCatalog, ProbeScore, RawCheckpointIndex,
+    RuntimeProviderPlan,
 };
 use crate::limits::InspectionLimits;
 use crate::source::RandomAccessSource;

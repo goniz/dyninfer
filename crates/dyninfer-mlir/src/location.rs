@@ -1,5 +1,5 @@
 use crate::context::Context;
-use dyninfer_mlir_sys::bindings::{mlirLocationUnknownGet, MlirLocation};
+use dyninfer_mlir_sys::bindings::{MlirLocation, mlirLocationUnknownGet};
 
 /// MLIR source location.
 #[derive(Clone, Copy)]

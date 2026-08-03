@@ -5,7 +5,7 @@
 
 mod tools;
 
-pub use tools::{discover_run_module, IreeRunTools};
+pub use tools::{IreeRunTools, discover_run_module};
 
 use dyninfer_error::{DynInferError, IreeRuntimeError, Result};
 use iree_runtime_sys as sys;
@@ -179,18 +179,15 @@ impl Context {
     /// `rocm` aliases to `hip`. Bare driver names still select the default device.
     pub fn with_device(mut self, device: impl Into<String>) -> Self {
         let d = device.into();
-        self.device = if d.is_empty()
-            || d == "local-task"
-            || d == "local-sync"
-            || d == "local"
-            || d == "cpu"
-        {
-            None
-        } else if d == "rocm" {
-            Some("hip".into())
-        } else {
-            Some(d)
-        };
+        self.device =
+            if d.is_empty() || d == "local-task" || d == "local-sync" || d == "local" || d == "cpu"
+            {
+                None
+            } else if d == "rocm" {
+                Some("hip".into())
+            } else {
+                Some(d)
+            };
         self
     }
 
@@ -207,7 +204,10 @@ impl Context {
         })
     }
 
-    fn with_session<R>(&self, f: impl FnOnce(*mut sys::dyninfer_iree_session_t) -> Result<R>) -> Result<R> {
+    fn with_session<R>(
+        &self,
+        f: impl FnOnce(*mut sys::dyninfer_iree_session_t) -> Result<R>,
+    ) -> Result<R> {
         let mut guard = self.session.lock().map_err(|_| {
             DynInferError::IreeRuntime(IreeRuntimeError {
                 message: "IREE session mutex poisoned".into(),
@@ -242,10 +242,7 @@ impl Context {
                     .collect();
                 unsafe {
                     sys::dyninfer_iree_session_create_with_host_params(
-                        device_c
-                            .as_ref()
-                            .map(|c| c.as_ptr())
-                            .unwrap_or(ptr::null()),
+                        device_c.as_ref().map(|c| c.as_ptr()).unwrap_or(ptr::null()),
                         vmfb_c.as_ptr(),
                         c_params.as_ptr(),
                         c_params.len(),
@@ -256,15 +253,9 @@ impl Context {
                 let params_c = self.parameters.as_deref().map(path_cstring).transpose()?;
                 unsafe {
                     sys::dyninfer_iree_session_create(
-                        device_c
-                            .as_ref()
-                            .map(|c| c.as_ptr())
-                            .unwrap_or(ptr::null()),
+                        device_c.as_ref().map(|c| c.as_ptr()).unwrap_or(ptr::null()),
                         vmfb_c.as_ptr(),
-                        params_c
-                            .as_ref()
-                            .map(|c| c.as_ptr())
-                            .unwrap_or(ptr::null()),
+                        params_c.as_ref().map(|c| c.as_ptr()).unwrap_or(ptr::null()),
                         &mut ptr,
                     )
                 }

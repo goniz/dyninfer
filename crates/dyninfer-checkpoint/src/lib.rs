@@ -21,5 +21,5 @@ pub use fingerprint::schema_fingerprint_from_parameters;
 pub use limits::InspectionLimits;
 pub use role::infer_role;
 pub use source::{BytesSource, FileSource, RandomAccessSource};
-pub use support::{empty_support, BuiltinCheckpointSupport};
+pub use support::{BuiltinCheckpointSupport, empty_support};
 pub use traits::{CheckpointContainerReader, CheckpointConventionDecoder, ParameterMaterializer};

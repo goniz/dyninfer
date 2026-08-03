@@ -2,7 +2,7 @@ use crate::context::Context;
 use crate::mlir_err;
 use crate::string_ref;
 use dyninfer_error::Result;
-use dyninfer_mlir_sys::bindings::{mlirAttributeParseGet, MlirAttribute};
+use dyninfer_mlir_sys::bindings::{MlirAttribute, mlirAttributeParseGet};
 
 /// Parsed MLIR attribute.
 #[derive(Clone, Copy)]

@@ -159,10 +159,8 @@ impl ModelCompiler for LocalCompiler {
             .compile_mlir(&mlir, request.target)
             .map_err(|err| match err {
                 DynInferError::Compilation(mut c) => {
-                    c.diagnostics.push(Diagnostic::error(
-                        "E_IREE_COMPILE",
-                        c.message.clone(),
-                    ));
+                    c.diagnostics
+                        .push(Diagnostic::error("E_IREE_COMPILE", c.message.clone()));
                     DynInferError::Compilation(c)
                 }
                 other => other,

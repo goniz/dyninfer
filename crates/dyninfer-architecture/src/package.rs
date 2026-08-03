@@ -15,7 +15,11 @@ pub struct ArchitecturePackage {
 }
 
 impl ArchitecturePackage {
-    pub fn from_module(module: ModelModule, resolved_config: ResolvedModelConfig, revision: String) -> Self {
+    pub fn from_module(
+        module: ModelModule,
+        resolved_config: ResolvedModelConfig,
+        revision: String,
+    ) -> Self {
         Self {
             id: module.architecture_id,
             revision,

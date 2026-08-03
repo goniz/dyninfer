@@ -24,11 +24,7 @@ impl Digest {
 
     pub fn short(&self) -> &str {
         let s = self.as_str();
-        if s.len() >= 12 {
-            &s[..12]
-        } else {
-            s
-        }
+        if s.len() >= 12 { &s[..12] } else { s }
     }
 }
 

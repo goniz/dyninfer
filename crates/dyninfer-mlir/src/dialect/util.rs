@@ -20,11 +20,7 @@ impl Util {
     }
 
     /// Mutable zero-init global: `util.global private mutable @sym = dense<0.0> : ty`
-    pub fn global_mutable_zero(
-        builder: &mut ModuleBuilder,
-        sym: &str,
-        ty_asm: &str,
-    ) -> Result<()> {
+    pub fn global_mutable_zero(builder: &mut ModuleBuilder, sym: &str, ty_asm: &str) -> Result<()> {
         let asm = format!("util.global private mutable @{sym} = dense<0.0> : {ty_asm}");
         builder.append_toplevel_asm(&asm)
     }

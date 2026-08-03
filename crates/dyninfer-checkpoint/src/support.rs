@@ -1,15 +1,13 @@
 //! Builtin statically-selected checkpoint support registry.
 
-use crate::catalog::{
-    CheckpointCatalog, DecodeContext, ParameterCatalog, RawCheckpointIndex,
-};
+use crate::catalog::{CheckpointCatalog, DecodeContext, ParameterCatalog, RawCheckpointIndex};
 use crate::fingerprint::schema_fingerprint_from_parameters;
 use crate::limits::InspectionLimits;
 use crate::source::{FileSource, RandomAccessSource};
-use crate::traits::{CheckpointContainerReader, CheckpointConventionDecoder, ParameterMaterializer};
-use dyninfer_error::{
-    CheckpointValidationError, DynInferError, UnsupportedContainerError, Result,
+use crate::traits::{
+    CheckpointContainerReader, CheckpointConventionDecoder, ParameterMaterializer,
 };
+use dyninfer_error::{CheckpointValidationError, DynInferError, Result, UnsupportedContainerError};
 use std::path::Path;
 use std::sync::Arc;
 use tracing::{debug, info_span};
@@ -95,11 +93,13 @@ impl BuiltinCheckpointSupport {
 
         probed.sort_by(|a, b| b.0.cmp(&a.0));
         let Some((_, reader)) = probed.into_iter().next() else {
-            return Err(DynInferError::UnsupportedContainer(UnsupportedContainerError {
-                message: "no registered container matched the checkpoint".into(),
-                path: source.path().map(|p| p.display().to_string()),
-                probed_formats,
-            }));
+            return Err(DynInferError::UnsupportedContainer(
+                UnsupportedContainerError {
+                    message: "no registered container matched the checkpoint".into(),
+                    path: source.path().map(|p| p.display().to_string()),
+                    probed_formats,
+                },
+            ));
         };
 
         let _span = info_span!("checkpoint.index", format = %reader.format_id()).entered();
@@ -123,11 +123,13 @@ impl BuiltinCheckpointSupport {
         scored.sort_by(|a, b| b.0.cmp(&a.0));
 
         let Some((_, decoder)) = scored.into_iter().next() else {
-            return Err(DynInferError::InvalidCheckpoint(CheckpointValidationError {
-                message: "no convention decoder matched the checkpoint index".into(),
-                key: None,
-                detail: Some(format!("container={}", index.container.format_id)),
-            }));
+            return Err(DynInferError::InvalidCheckpoint(
+                CheckpointValidationError {
+                    message: "no convention decoder matched the checkpoint index".into(),
+                    key: None,
+                    detail: Some(format!("container={}", index.container.format_id)),
+                },
+            ));
         };
 
         let ParameterCatalog {

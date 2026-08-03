@@ -113,9 +113,8 @@ impl BpeTokenizer {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let tf: TokenizerFile = serde_json::from_slice(bytes).map_err(|e| {
-            DynInferError::io(format!("tokenizer.json parse failed: {e}"))
-        })?;
+        let tf: TokenizerFile = serde_json::from_slice(bytes)
+            .map_err(|e| DynInferError::io(format!("tokenizer.json parse failed: {e}")))?;
         if tf.model.vocab.is_empty() {
             return Err(DynInferError::io("tokenizer vocab is empty"));
         }
@@ -260,10 +259,7 @@ impl BpeTokenizer {
 
     fn initial_pieces_byte_level(&self, text: &str) -> Vec<String> {
         let enc = &gpt2_bytes_to_unicode().0;
-        text.as_bytes()
-            .iter()
-            .map(|b| enc[b].to_string())
-            .collect()
+        text.as_bytes().iter().map(|b| enc[b].to_string()).collect()
     }
 
     fn bpe_merge(&self, mut pieces: Vec<String>) -> Vec<String> {
@@ -297,9 +293,7 @@ impl BpeTokenizer {
                 let normalized = self.normalize_sp(text);
                 self.bpe_merge(self.initial_pieces_sp(&normalized))
             }
-            TokenizerKind::ByteLevel => {
-                self.bpe_merge(self.initial_pieces_byte_level(text))
-            }
+            TokenizerKind::ByteLevel => self.bpe_merge(self.initial_pieces_byte_level(text)),
         };
         let mut ids = Vec::with_capacity(pieces.len() + 1);
         if add_special_tokens {
@@ -325,9 +319,7 @@ impl BpeTokenizer {
     }
 
     fn is_special(&self, id: u32) -> bool {
-        Some(id) == self.bos_id
-            || Some(id) == self.eos_id
-            || self.special_ids.contains(&id)
+        Some(id) == self.bos_id || Some(id) == self.eos_id || self.special_ids.contains(&id)
     }
 
     fn decode_sp(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String> {

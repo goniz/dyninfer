@@ -140,13 +140,17 @@ impl FuncBuilder {
 
     pub fn index_cast(&mut self, src: &Value, from_ty: &str, to_ty: &str) -> Value {
         let v = self.alloc("ic");
-        self.push(format!("  {v} = arith.index_cast {src} : {from_ty} to {to_ty}"));
+        self.push(format!(
+            "  {v} = arith.index_cast {src} : {from_ty} to {to_ty}"
+        ));
         v
     }
 
     pub fn index_cast_as(&mut self, ssa: &str, src: &Value, from_ty: &str, to_ty: &str) -> Value {
         let v = Value::new(ssa);
-        self.push(format!("  {v} = arith.index_cast {src} : {from_ty} to {to_ty}"));
+        self.push(format!(
+            "  {v} = arith.index_cast {src} : {from_ty} to {to_ty}"
+        ));
         v
     }
 
@@ -275,7 +279,13 @@ impl FuncBuilder {
         v
     }
 
-    pub fn expand_shape(&mut self, src: &Value, reassoc: &str, from_ty: &str, to_ty: &str) -> Value {
+    pub fn expand_shape(
+        &mut self,
+        src: &Value,
+        reassoc: &str,
+        from_ty: &str,
+        to_ty: &str,
+    ) -> Value {
         let v = self.alloc("exp");
         self.push(format!(
             "  {v} = tensor.expand_shape {src} {reassoc} : {from_ty} into {to_ty}"
@@ -354,13 +364,7 @@ impl FuncBuilder {
         v
     }
 
-    pub fn linalg_softmax(
-        &mut self,
-        src: &Value,
-        init: &Value,
-        dimension: u32,
-        ty: &str,
-    ) -> Value {
+    pub fn linalg_softmax(&mut self, src: &Value, init: &Value, dimension: u32, ty: &str) -> Value {
         let v = self.alloc("sm");
         self.push(format!(
             "  {v} = linalg.softmax dimension({dimension}) ins({src} : {ty}) outs({init} : {ty}) -> {ty}"
@@ -372,32 +376,20 @@ impl FuncBuilder {
 
     pub fn call_ty(&mut self, callee: &str, args: &[&Value], func_ty: &str) -> Value {
         let v = self.alloc("call");
-        let args_s = args
-            .iter()
-            .map(|a| a.ssa())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let args_s = args.iter().map(|a| a.ssa()).collect::<Vec<_>>().join(", ");
         self.push(format!("  {v} = func.call @{callee}({args_s}) : {func_ty}"));
         v
     }
 
     pub fn call_ty_as(&mut self, ssa: &str, callee: &str, args: &[&Value], func_ty: &str) -> Value {
         let v = Value::new(ssa);
-        let args_s = args
-            .iter()
-            .map(|a| a.ssa())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let args_s = args.iter().map(|a| a.ssa()).collect::<Vec<_>>().join(", ");
         self.push(format!("  {v} = func.call @{callee}({args_s}) : {func_ty}"));
         v
     }
 
     pub fn ret_ty(&mut self, vals: &[&Value], tys: &str) {
-        let vs = vals
-            .iter()
-            .map(|v| v.ssa())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let vs = vals.iter().map(|v| v.ssa()).collect::<Vec<_>>().join(", ");
         self.push(format!("  return {vs} : {tys}"));
     }
 

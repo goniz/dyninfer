@@ -30,15 +30,19 @@ impl CheckpointContainerReader for TensorflowContainer {
         _source: Arc<dyn RandomAccessSource>,
         _limits: &InspectionLimits,
     ) -> Result<RawCheckpointIndex> {
-        Err(DynInferError::UnsupportedContainer(UnsupportedContainerError {
-            message: "TensorFlow/NPZ containers are deferred past version 1".into(),
-            path: None,
-            probed_formats: vec!["tensorflow-npz".into()],
-        }))
+        Err(DynInferError::UnsupportedContainer(
+            UnsupportedContainerError {
+                message: "TensorFlow/NPZ containers are deferred past version 1".into(),
+                path: None,
+                probed_formats: vec!["tensorflow-npz".into()],
+            },
+        ))
     }
 
     fn runtime_provider_plan(&self, _index: &RawCheckpointIndex) -> Result<RuntimeProviderPlan> {
-        Err(DynInferError::internal("tensorflow provider not implemented"))
+        Err(DynInferError::internal(
+            "tensorflow provider not implemented",
+        ))
     }
 }
 

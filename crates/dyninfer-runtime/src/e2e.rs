@@ -2,11 +2,9 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        max_abs_err, tiny_llama_prefill_logits, CausalLanguageModel, ModelLoader,
-    };
+    use crate::{CausalLanguageModel, ModelLoader, max_abs_err, tiny_llama_prefill_logits};
     use dyninfer_checkpoint_safetensors::tiny_llama_dense_f32;
-    use dyninfer_compiler::{compile_add_smoke, CompileOptions, IreeTools};
+    use dyninfer_compiler::{CompileOptions, IreeTools, compile_add_smoke};
     use dyninfer_core::{ArchitectureId, SessionConfig, TargetProfile};
     use iree_runtime::{Context, Instance, Module};
     use std::fs;
@@ -270,11 +268,7 @@ mod tests {
         ];
         for (arch, bytes, overrides, label) in cases {
             let err = parity_err_with(arch, bytes, overrides, label);
-            assert!(
-                err < 1e-2,
-                "{label} KV decode diverged: max_abs_err={err}"
-            );
+            assert!(err < 1e-2, "{label} KV decode diverged: max_abs_err={err}");
         }
     }
-
 }

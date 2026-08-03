@@ -12,15 +12,24 @@ pub fn infer_role(name: &str) -> ParameterRole {
     if n.contains("q_norm") || n.contains("k_norm") {
         return ParameterRole::Norm;
     }
-    if n.contains("attn_q") || n.contains("attention.wq") || n.contains("q_proj") || n.ends_with(".q.weight")
+    if n.contains("attn_q")
+        || n.contains("attention.wq")
+        || n.contains("q_proj")
+        || n.ends_with(".q.weight")
     {
         return ParameterRole::AttentionQ;
     }
-    if n.contains("attn_k") || n.contains("attention.wk") || n.contains("k_proj") || n.ends_with(".k.weight")
+    if n.contains("attn_k")
+        || n.contains("attention.wk")
+        || n.contains("k_proj")
+        || n.ends_with(".k.weight")
     {
         return ParameterRole::AttentionK;
     }
-    if n.contains("attn_v") || n.contains("attention.wv") || n.contains("v_proj") || n.ends_with(".v.weight")
+    if n.contains("attn_v")
+        || n.contains("attention.wv")
+        || n.contains("v_proj")
+        || n.ends_with(".v.weight")
     {
         return ParameterRole::AttentionV;
     }

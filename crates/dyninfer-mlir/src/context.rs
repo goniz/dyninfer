@@ -1,12 +1,12 @@
 use crate::mlir_err;
 use dyninfer_error::Result;
 use dyninfer_mlir_sys::bindings::{
-    ireeCompilerInitializeContext, ireeCompilerRegisterDialects, mlirContextAttachDiagnosticHandler,
-    mlirContextCreateWithRegistry, mlirContextDestroy, mlirContextDetachDiagnosticHandler,
-    mlirContextLoadAllAvailableDialects, mlirContextSetAllowUnregisteredDialects,
-    mlirDiagnosticGetSeverity, mlirDiagnosticPrint, mlirDialectRegistryCreate,
-    mlirDialectRegistryDestroy, MlirContext, MlirDiagnostic, MlirDiagnosticHandlerID,
-    MlirLogicalResult,
+    MlirContext, MlirDiagnostic, MlirDiagnosticHandlerID, MlirLogicalResult,
+    ireeCompilerInitializeContext, ireeCompilerRegisterDialects,
+    mlirContextAttachDiagnosticHandler, mlirContextCreateWithRegistry, mlirContextDestroy,
+    mlirContextDetachDiagnosticHandler, mlirContextLoadAllAvailableDialects,
+    mlirContextSetAllowUnregisteredDialects, mlirDiagnosticGetSeverity, mlirDiagnosticPrint,
+    mlirDialectRegistryCreate, mlirDialectRegistryDestroy,
 };
 use dyninfer_mlir_sys::ensure_initialized;
 use std::cell::RefCell;

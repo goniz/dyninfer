@@ -54,11 +54,13 @@ impl GgufType {
             28 => Self::F64,
             30 => Self::BF16,
             other => {
-                return Err(DynInferError::InvalidCheckpoint(CheckpointValidationError {
-                    message: format!("unknown GGUF tensor type code {other}"),
-                    key: None,
-                    detail: None,
-                }))
+                return Err(DynInferError::InvalidCheckpoint(
+                    CheckpointValidationError {
+                        message: format!("unknown GGUF tensor type code {other}"),
+                        key: None,
+                        detail: None,
+                    },
+                ));
             }
         })
     }
@@ -152,11 +154,13 @@ impl GgufType {
                 let block = self.block_size().unwrap();
                 let type_size = self.type_size().unwrap();
                 if !numel.is_multiple_of(block) {
-                    return Err(DynInferError::InvalidCheckpoint(CheckpointValidationError {
-                        message: format!("Q4_0 numel {numel} not divisible by block {block}"),
-                        key: None,
-                        detail: None,
-                    }));
+                    return Err(DynInferError::InvalidCheckpoint(
+                        CheckpointValidationError {
+                            message: format!("Q4_0 numel {numel} not divisible by block {block}"),
+                            key: None,
+                            detail: None,
+                        },
+                    ));
                 }
                 Ok((numel / block).saturating_mul(type_size))
             }

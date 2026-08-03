@@ -2,14 +2,14 @@
 
 use crate::types::GgufType;
 use dyninfer_checkpoint::{
-    infer_role, CheckpointConventionDecoder, DecodeContext, LogicalParameter, MatchScore,
-    ParameterCatalog, RawCheckpointIndex,
+    CheckpointConventionDecoder, DecodeContext, LogicalParameter, MatchScore, ParameterCatalog,
+    RawCheckpointIndex, infer_role,
 };
 use dyninfer_core::{
     CanonicalParameterName, ConventionId, Endianness, LogicalTensorType, PhysicalEncoding,
     ScalarType, Shape, StorageComponent,
 };
-use dyninfer_error::{DynInferError, UnsupportedEncodingError, Result};
+use dyninfer_error::{DynInferError, Result, UnsupportedEncodingError};
 
 fn entry_gguf_type(entry: &dyninfer_checkpoint::RawTensorEntry) -> Option<GgufType> {
     entry
@@ -57,14 +57,16 @@ impl CheckpointConventionDecoder for GgufQ40Convention {
         let mut parameters = Vec::new();
         for entry in &index.entries {
             let Some(gguf_type) = entry_gguf_type(entry) else {
-                return Err(DynInferError::UnsupportedEncoding(UnsupportedEncodingError {
-                    message: "missing gguf.type_code on tensor entry".into(),
-                    key: Some(entry.key.clone()),
-                    codec: None,
-                    codec_version: None,
-                    expected: None,
-                    actual: None,
-                }));
+                return Err(DynInferError::UnsupportedEncoding(
+                    UnsupportedEncodingError {
+                        message: "missing gguf.type_code on tensor entry".into(),
+                        key: Some(entry.key.clone()),
+                        codec: None,
+                        codec_version: None,
+                        expected: None,
+                        actual: None,
+                    },
+                ));
             };
 
             let (encoding, logical_ty) = if gguf_type.is_q4_0() {
@@ -78,17 +80,19 @@ impl CheckpointConventionDecoder for GgufQ40Convention {
                 };
                 (PhysicalEncoding::plain(ty), ty)
             } else {
-                return Err(DynInferError::UnsupportedEncoding(UnsupportedEncodingError {
-                    message: format!(
-                        "GGUF encoding {} not supported in version-1 Q4_0 path",
-                        gguf_type.name()
-                    ),
-                    key: Some(entry.key.clone()),
-                    codec: Some(format!("gguf.{}", gguf_type.name())),
-                    codec_version: Some(1),
-                    expected: Some("gguf.q4_0 or dense f16/bf16/f32".into()),
-                    actual: Some(gguf_type.name().into()),
-                }));
+                return Err(DynInferError::UnsupportedEncoding(
+                    UnsupportedEncodingError {
+                        message: format!(
+                            "GGUF encoding {} not supported in version-1 Q4_0 path",
+                            gguf_type.name()
+                        ),
+                        key: Some(entry.key.clone()),
+                        codec: Some(format!("gguf.{}", gguf_type.name())),
+                        codec_version: Some(1),
+                        expected: Some("gguf.q4_0 or dense f16/bf16/f32".into()),
+                        actual: Some(gguf_type.name().into()),
+                    },
+                ));
             };
 
             let shape = Shape::new(entry.shape.clone());
@@ -145,9 +149,7 @@ impl CheckpointConventionDecoder for GgufDenseConvention {
         let quantized = index
             .entries
             .iter()
-            .filter(|e| {
-                entry_gguf_type(e).is_some_and(|t| !t.is_dense_v1())
-            })
+            .filter(|e| entry_gguf_type(e).is_some_and(|t| !t.is_dense_v1()))
             .count();
         if dense == 0 || quantized > 0 {
             return Ok(MatchScore::NONE);

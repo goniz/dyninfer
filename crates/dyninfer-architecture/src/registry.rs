@@ -2,10 +2,10 @@ use crate::builder::{ArchitectureDefinition, ModelBuilder};
 use crate::config::ResolvedModelConfig;
 use crate::emit::EmitOutput;
 use crate::package::ArchitecturePackage;
-use dyninfer_checkpoint::{
-    schema_fingerprint_from_parameters, CheckpointCatalog, ParameterCatalog,
-};
 use dyninfer_checkpoint::infer_role;
+use dyninfer_checkpoint::{
+    CheckpointCatalog, ParameterCatalog, schema_fingerprint_from_parameters,
+};
 use dyninfer_core::{ArchitectureId, CanonicalParameterName, MetadataMap};
 use dyninfer_error::{ArchitectureMismatchError, DynInferError, Result};
 use std::collections::HashMap;
@@ -81,11 +81,7 @@ impl ArchitectureRegistry {
     }
 
     /// Apply architecture naming (canonicalize + sanitize) and refresh schema fingerprint.
-    pub fn apply_naming(
-        &self,
-        id: &ArchitectureId,
-        catalog: &mut CheckpointCatalog,
-    ) -> Result<()> {
+    pub fn apply_naming(&self, id: &ArchitectureId, catalog: &mut CheckpointCatalog) -> Result<()> {
         let def = self.require(id)?;
 
         let mut remapped = Vec::with_capacity(catalog.parameters.len());
@@ -100,14 +96,13 @@ impl ArchitectureRegistry {
                 continue;
             };
             // Also try canonical_name itself when aliases empty / already remapped.
-            let canonical = if canonical == source_key
-                && param.canonical_name.as_str() != source_key
-            {
-                def.canonicalize_param(param.canonical_name.as_str())
-                    .unwrap_or(canonical)
-            } else {
-                canonical
-            };
+            let canonical =
+                if canonical == source_key && param.canonical_name.as_str() != source_key {
+                    def.canonicalize_param(param.canonical_name.as_str())
+                        .unwrap_or(canonical)
+                } else {
+                    canonical
+                };
             let mut p = param.clone();
             p.role = infer_role(&canonical);
             p.canonical_name = CanonicalParameterName::new(canonical.clone());

@@ -3,7 +3,7 @@
 //! GQA, independent `head_dim`, per-head Q/K RMSNorm, often tied embeddings.
 
 use crate::naming::{canonicalize_hf_family, tie_output_to_embed};
-use crate::ops::{emit_dense_decoder_cfg, DenseDecoderConfig};
+use crate::ops::{DenseDecoderConfig, emit_dense_decoder_cfg};
 use crate::slots::field;
 use crate::{
     ArchitectureDefinition, ArchitecturePackage, ConfigSchema, EmitOutput, ModelBuilder,
@@ -21,11 +21,26 @@ static CONFIG_SCHEMA: LazyLock<ConfigSchema> = LazyLock::new(|| ConfigSchema {
         field("num_kv_heads", "u32", true, Some(serde_json::json!(8))),
         field("head_dim", "u32", true, Some(serde_json::json!(128))),
         field("hidden_size", "u32", true, Some(serde_json::json!(1024))),
-        field("intermediate_size", "u32", true, Some(serde_json::json!(3072))),
+        field(
+            "intermediate_size",
+            "u32",
+            true,
+            Some(serde_json::json!(3072)),
+        ),
         field("vocab_size", "u32", true, Some(serde_json::json!(151936))),
-        field("context_length", "u32", true, Some(serde_json::json!(40960))),
+        field(
+            "context_length",
+            "u32",
+            true,
+            Some(serde_json::json!(40960)),
+        ),
         field("rms_norm_eps", "f64", false, Some(serde_json::json!(1e-6))),
-        field("rope_theta", "f64", false, Some(serde_json::json!(1_000_000.0))),
+        field(
+            "rope_theta",
+            "f64",
+            false,
+            Some(serde_json::json!(1_000_000.0)),
+        ),
         field("prefill_window", "u32", false, None),
         field("max_kv", "u32", false, None),
     ],
@@ -51,11 +66,7 @@ impl ArchitectureDefinition for Qwen3Architecture {
         &["qwen3", "Qwen3ForCausalLM"]
     }
 
-    fn build(
-        &self,
-        config: &ResolvedModelConfig,
-        m: &mut ModelBuilder,
-    ) -> Result<ModelModule> {
+    fn build(&self, config: &ResolvedModelConfig, m: &mut ModelBuilder) -> Result<ModelModule> {
         let num_layers = config.num_layers()?;
         let _hidden = config.get_u32("hidden_size")?;
         let _vocab = config.get_u32("vocab_size")?;

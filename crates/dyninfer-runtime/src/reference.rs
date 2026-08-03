@@ -117,10 +117,7 @@ fn rmsnorm_2d(x: &[f32], w: &[f32], rows: usize) -> Vec<f32> {
 fn rmsnorm_1d(x: &[f32], w: &[f32]) -> Vec<f32> {
     let ms = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
     let inv = 1.0 / (ms + EPS).sqrt();
-    x.iter()
-        .zip(w.iter())
-        .map(|(a, ww)| a * inv * ww)
-        .collect()
+    x.iter().zip(w.iter()).map(|(a, ww)| a * inv * ww).collect()
 }
 
 fn silu(x: f32) -> f32 {

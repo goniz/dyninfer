@@ -18,6 +18,6 @@ pub mod bindings {
 mod api;
 
 pub use api::{
-    compile_mlir_to_vmfb, discover_rocm_bc_dir, ensure_initialized, flags_for_driver,
-    flags_for_target, revision, ApiError, DEFAULT_CUDA_TARGET, DEFAULT_ROCM_TARGET,
+    ApiError, DEFAULT_CUDA_TARGET, DEFAULT_ROCM_TARGET, compile_mlir_to_vmfb, discover_rocm_bc_dir,
+    ensure_initialized, flags_for_driver, flags_for_target, revision,
 };

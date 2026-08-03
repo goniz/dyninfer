@@ -62,11 +62,13 @@ impl<'a> Cursor<'a> {
     fn read_string(&mut self) -> Result<String> {
         let len = self.read_u64()?;
         if len > self.limits.max_key_len as u64 {
-            return Err(DynInferError::InvalidCheckpoint(CheckpointValidationError {
-                message: format!("GGUF string length {len} exceeds limit"),
-                key: None,
-                detail: None,
-            }));
+            return Err(DynInferError::InvalidCheckpoint(
+                CheckpointValidationError {
+                    message: format!("GGUF string length {len} exceeds limit"),
+                    key: None,
+                    detail: None,
+                },
+            ));
         }
         let bytes = self.read_exact(len as usize)?;
         String::from_utf8(bytes).map_err(|e| {
@@ -90,18 +92,20 @@ impl<'a> Cursor<'a> {
             6 => serde_json::Number::from_f64(self.read_f32()? as f64)
                 .map(serde_json::Value::Number)
                 .unwrap_or(serde_json::Value::Null), // FLOAT32
-            7 => serde_json::Value::Bool(self.read_bool()?), // BOOL
-            8 => serde_json::Value::String(self.read_string()?), // STRING
+            7 => serde_json::Value::Bool(self.read_bool()?),        // BOOL
+            8 => serde_json::Value::String(self.read_string()?),    // STRING
             9 => {
                 // ARRAY
                 let elem_type = self.read_u32()?;
                 let count = self.read_u64()?;
                 if count > self.limits.max_metadata_entries {
-                    return Err(DynInferError::InvalidCheckpoint(CheckpointValidationError {
-                        message: format!("GGUF array length {count} exceeds limit"),
-                        key: None,
-                        detail: None,
-                    }));
+                    return Err(DynInferError::InvalidCheckpoint(
+                        CheckpointValidationError {
+                            message: format!("GGUF array length {count} exceeds limit"),
+                            key: None,
+                            detail: None,
+                        },
+                    ));
                 }
                 let mut arr = Vec::with_capacity(count as usize);
                 for _ in 0..count {
@@ -121,11 +125,13 @@ impl<'a> Cursor<'a> {
                     .unwrap_or(serde_json::Value::Null)
             } // FLOAT64
             other => {
-                return Err(DynInferError::InvalidCheckpoint(CheckpointValidationError {
-                    message: format!("unsupported GGUF metadata value type {other}"),
-                    key: None,
-                    detail: None,
-                }))
+                return Err(DynInferError::InvalidCheckpoint(
+                    CheckpointValidationError {
+                        message: format!("unsupported GGUF metadata value type {other}"),
+                        key: None,
+                        detail: None,
+                    },
+                ));
             }
         })
     }
@@ -182,30 +188,36 @@ impl CheckpointContainerReader for GgufContainer {
         };
         let magic = cur.read_exact(4)?;
         if magic.as_slice() != GGUF_MAGIC {
-            return Err(DynInferError::InvalidCheckpoint(CheckpointValidationError {
-                message: "not a GGUF file".into(),
-                key: None,
-                detail: None,
-            }));
+            return Err(DynInferError::InvalidCheckpoint(
+                CheckpointValidationError {
+                    message: "not a GGUF file".into(),
+                    key: None,
+                    detail: None,
+                },
+            ));
         }
         let version = cur.read_u32()?;
         if version < 2 || version > 3 {
-            return Err(DynInferError::InvalidCheckpoint(CheckpointValidationError {
-                message: format!("unsupported GGUF version {version}"),
-                key: None,
-                detail: Some("supported: 2, 3".into()),
-            }));
+            return Err(DynInferError::InvalidCheckpoint(
+                CheckpointValidationError {
+                    message: format!("unsupported GGUF version {version}"),
+                    key: None,
+                    detail: Some("supported: 2, 3".into()),
+                },
+            ));
         }
         let tensor_count = cur.read_u64()?;
         let kv_count = cur.read_u64()?;
         if tensor_count > limits.max_tensor_count || kv_count > limits.max_metadata_entries {
-            return Err(DynInferError::InvalidCheckpoint(CheckpointValidationError {
-                message: format!(
-                    "GGUF counts exceed limits: tensors={tensor_count} kv={kv_count}"
-                ),
-                key: None,
-                detail: None,
-            }));
+            return Err(DynInferError::InvalidCheckpoint(
+                CheckpointValidationError {
+                    message: format!(
+                        "GGUF counts exceed limits: tensors={tensor_count} kv={kv_count}"
+                    ),
+                    key: None,
+                    detail: None,
+                },
+            ));
         }
 
         let mut metadata: MetadataMap = BTreeMap::new();
@@ -236,11 +248,13 @@ impl CheckpointContainerReader for GgufContainer {
             limits.validate_key(&name)?;
             let n_dims = cur.read_u32()? as usize;
             if n_dims > limits.max_shape_rank {
-                return Err(DynInferError::InvalidCheckpoint(CheckpointValidationError {
-                    message: format!("GGUF tensor rank {n_dims} exceeds limit"),
-                    key: Some(name),
-                    detail: None,
-                }));
+                return Err(DynInferError::InvalidCheckpoint(
+                    CheckpointValidationError {
+                        message: format!("GGUF tensor rank {n_dims} exceeds limit"),
+                        key: Some(name),
+                        detail: None,
+                    },
+                ));
             }
             let mut shape = Vec::with_capacity(n_dims);
             for _ in 0..n_dims {
@@ -264,21 +278,21 @@ impl CheckpointContainerReader for GgufContainer {
         let mut entries = Vec::with_capacity(dirs.len());
         for dir in dirs {
             let nbytes = dir.gguf_type.nbytes_for_shape(&dir.shape)?;
-            let abs = data_offset
-                .checked_add(dir.offset)
-                .ok_or_else(|| {
-                    DynInferError::InvalidCheckpoint(CheckpointValidationError {
-                        message: "tensor absolute offset overflow".into(),
-                        key: Some(dir.name.clone()),
-                        detail: None,
-                    })
-                })?;
-            if abs.checked_add(nbytes).unwrap_or(u64::MAX) > source.len() {
-                return Err(DynInferError::InvalidCheckpoint(CheckpointValidationError {
-                    message: "tensor data extends past end of file".into(),
+            let abs = data_offset.checked_add(dir.offset).ok_or_else(|| {
+                DynInferError::InvalidCheckpoint(CheckpointValidationError {
+                    message: "tensor absolute offset overflow".into(),
                     key: Some(dir.name.clone()),
                     detail: None,
-                }));
+                })
+            })?;
+            if abs.checked_add(nbytes).unwrap_or(u64::MAX) > source.len() {
+                return Err(DynInferError::InvalidCheckpoint(
+                    CheckpointValidationError {
+                        message: "tensor data extends past end of file".into(),
+                        key: Some(dir.name.clone()),
+                        detail: None,
+                    },
+                ));
             }
             let mut meta = MetadataMap::new();
             meta.insert(
