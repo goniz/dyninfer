@@ -12,7 +12,7 @@ use iree_runtime_sys as sys;
 use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tracing::info_span;
 
 /// Process-wide IREE instance (tool discovery + native session factory).
@@ -104,14 +104,19 @@ impl Drop for NativeSession {
 }
 
 /// Execution context bound to a module (+ optional external parameters).
+///
+/// Each [`Context`] owns one native IREE session (and therefore one mutable KV
+/// cache). Do not share a single context across concurrent model sessions.
 pub struct Context {
     _instance: Instance,
     module: Module,
     parameters: Option<PathBuf>,
     /// In-memory f32 parameter blobs (Vulkan bf16 promote). Kept alive for the
-    /// session; mutually exclusive with [`Self::parameters`].
-    host_parameters: Option<HostParameterStorage>,
-    /// IREE HAL driver name (`hip`, `vulkan`, …). Empty → local-task.
+    /// session; mutually exclusive with [`Self::parameters`]. Shared via [`Arc`]
+    /// so multiple sessions can reuse the same host weight staging.
+    host_parameters: Option<Arc<HostParameterStorage>>,
+    /// IREE HAL driver name or full device URI (`hip`, `vulkan://…`, …).
+    /// Empty → local-task.
     device: Option<String>,
     session: Mutex<Option<NativeSession>>,
 }
@@ -158,12 +163,20 @@ impl Context {
     /// Bind host-owned f32 parameter blobs (no parameter file). Used when the
     /// VMFB expects promoted f32 weights.
     pub fn with_host_parameters(mut self, storage: HostParameterStorage) -> Self {
+        self.host_parameters = Some(Arc::new(storage));
+        self.parameters = None;
+        self
+    }
+
+    /// Share an existing host parameter staging across contexts.
+    pub fn with_host_parameters_shared(mut self, storage: Arc<HostParameterStorage>) -> Self {
         self.host_parameters = Some(storage);
         self.parameters = None;
         self
     }
 
-    /// Set HAL device/driver (e.g. `hip`, `vulkan`). `rocm` aliases to `hip`.
+    /// Set HAL device/driver or full device URI (e.g. `hip`, `vulkan://GPU-…`).
+    /// `rocm` aliases to `hip`. Bare driver names still select the default device.
     pub fn with_device(mut self, device: impl Into<String>) -> Self {
         let d = device.into();
         self.device = if d.is_empty()

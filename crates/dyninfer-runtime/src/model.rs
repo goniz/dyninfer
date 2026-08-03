@@ -12,7 +12,7 @@ use dyninfer_core::{
 };
 use dyninfer_error::{CacheError, DynInferError, Result};
 use dyninfer_target::TargetDiscovery;
-use iree_runtime::{Context, Instance, Module};
+use iree_runtime::{Context, HostParameterStorage, Instance, Module};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,13 +27,51 @@ pub struct BundlePaths {
     pub vmfb: PathBuf,
 }
 
+/// Immutable ingredients needed to open an independent IREE context (own KV).
+enum RuntimeParameters {
+    File(PathBuf),
+    Host(Arc<HostParameterStorage>),
+}
+
+struct ExecutableHandle {
+    vmfb_path: PathBuf,
+    parameters: RuntimeParameters,
+    /// Driver name or full HAL device URI.
+    device: Option<String>,
+}
+
+impl ExecutableHandle {
+    fn open_context(&self) -> Result<Context> {
+        let instance = Instance::new()?;
+        let module = Module::from_path(&self.vmfb_path)?;
+        let mut context = Context::create(instance, module)?;
+        context = match &self.parameters {
+            RuntimeParameters::File(path) => context.with_parameters(path),
+            RuntimeParameters::Host(host) => {
+                context.with_host_parameters_shared(Arc::clone(host))
+            }
+        };
+        if let Some(device) = &self.device {
+            context = context.with_device(device.clone());
+        }
+        Ok(context)
+    }
+}
+
 pub struct LoadedModel {
     pub metadata: ModelMetadata,
     pub manifest: ExecutableManifest,
     pub binding: BindingPlan,
     pub catalog: CheckpointCatalog,
-    pub context: Arc<Context>,
     pub bundle: BundlePaths,
+    executable: ExecutableHandle,
+}
+
+impl LoadedModel {
+    /// Open a fresh IREE context (own native session / KV cache).
+    pub fn open_context(&self) -> Result<Context> {
+        self.executable.open_context()
+    }
 }
 
 impl CausalLanguageModel for LoadedModel {
@@ -42,12 +80,15 @@ impl CausalLanguageModel for LoadedModel {
     }
 
     fn create_session(&self, config: SessionConfig) -> Result<Box<dyn ModelSession>> {
+        // Each session must own its own context: the VMFB keeps mutable KV in
+        // util.global state inside a single native IREE session.
+        let context = Arc::new(self.executable.open_context()?);
         Ok(Box::new(IreeSession::new(
             self.metadata.clone(),
             config,
             self.manifest.kv_cache.clone(),
             self.manifest.prefill_window,
-            Arc::clone(&self.context),
+            context,
         )))
     }
 }
@@ -220,25 +261,30 @@ impl ModelLoader {
         }
 
         let _span = info_span!("parameters.open").entered();
-        let instance = Instance::new()?;
-        let module = Module::from_path(&vmfb_path)?;
-        let context = if needs_host_f32_params(&manifest.target.driver) {
+        let (parameters, device) = if needs_host_f32_params(&manifest.target.driver) {
             let host = dyninfer_checkpoint_safetensors::decode_parameters_as_f32_host(&catalog)?;
-            let storage = iree_runtime::HostParameterStorage::from_f32_entries(host.entries)?;
-            Arc::new(
-                Context::create(instance, module)?
-                    .with_host_parameters(storage)
-                    .with_device(manifest.target.driver.clone()),
+            let storage = HostParameterStorage::from_f32_entries(host.entries)?;
+            (
+                RuntimeParameters::Host(Arc::new(storage)),
+                Some(manifest.target.driver.clone()),
             )
         } else {
             let params_path =
                 dyninfer_checkpoint_safetensors::resolve_runtime_parameters(&catalog)?;
-            Arc::new(
-                Context::create(instance, module)?
-                    .with_parameters(params_path)
-                    .with_device(manifest.target.driver.clone()),
+            (
+                RuntimeParameters::File(params_path),
+                Some(manifest.target.driver.clone()),
             )
         };
+
+        // Eagerly validate that the VMFB + parameters can open; discard the
+        // probe context so create_session still gets an independent KV.
+        let executable = ExecutableHandle {
+            vmfb_path: vmfb_path.clone(),
+            parameters,
+            device,
+        };
+        let _probe = executable.open_context()?;
 
         let metadata = ModelMetadata {
             architecture_id: manifest.architecture_id.clone(),
@@ -273,13 +319,13 @@ impl ModelLoader {
             manifest,
             binding,
             catalog,
-            context,
             bundle: BundlePaths {
                 root: bundle.to_path_buf(),
                 manifest: manifest_path,
                 bindings: bindings_path,
                 vmfb: vmfb_path,
             },
+            executable,
         })
     }
 

@@ -124,7 +124,8 @@ mod tests {
         );
 
         let sum = model
-            .context
+            .open_context()
+            .unwrap()
             .invoke_add(&[1.0, 2.0, 3.0, 4.0], &[10.0, 20.0, 30.0, 40.0])
             .unwrap();
         assert_eq!(sum, vec![11.0, 22.0, 33.0, 44.0]);
