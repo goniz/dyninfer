@@ -147,12 +147,28 @@ impl PhysicalEncoding {
         }
     }
 
+    /// Encodings that can be bound and executed today.
+    ///
+    /// GGUF Q4_0 is recognized in catalogs and architecture slot lists, but
+    /// rejected at bind time until the Milestone 2 qkernel lowering exists.
+    /// Accepting `DecodeOnTheFly` without that path would silently emit dense
+    /// f32 parameters and produce incorrect executables.
     pub fn is_supported_v1(&self) -> bool {
         match self {
             Self::Plain { .. } => true,
-            Self::BlockQuantized { codec, .. } => codec.as_str() == "gguf.q4_0",
-            Self::Opaque { .. } | Self::GroupQuantized { .. } | Self::Sparse { .. } => false,
+            Self::BlockQuantized { .. }
+            | Self::Opaque { .. }
+            | Self::GroupQuantized { .. }
+            | Self::Sparse { .. } => false,
         }
+    }
+
+    /// True when this encoding is a known future v1 target (not yet executable).
+    pub fn is_planned_v1(&self) -> bool {
+        matches!(
+            self,
+            Self::BlockQuantized { codec, .. } if codec.as_str() == "gguf.q4_0"
+        )
     }
 }
 
@@ -468,8 +484,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn physical_encoding_q4_0_is_supported() {
-        assert!(PhysicalEncoding::gguf_q4_0().is_supported_v1());
+    fn physical_encoding_q4_0_is_planned_not_executable() {
+        assert!(!PhysicalEncoding::gguf_q4_0().is_supported_v1());
+        assert!(PhysicalEncoding::gguf_q4_0().is_planned_v1());
         assert!(PhysicalEncoding::plain(ScalarType::Bf16).is_supported_v1());
     }
 

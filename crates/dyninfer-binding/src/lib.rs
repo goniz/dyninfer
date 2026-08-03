@@ -137,11 +137,18 @@ impl Binder {
         }
 
         if !param.encoding.is_supported_v1() {
+            let message = if param.encoding.is_planned_v1() {
+                "encoding gguf.q4_0 requires qkernel lowering (Milestone 2); \
+                 refuse to bind rather than silently emit dense f32"
+                    .into()
+            } else {
+                "encoding is not supported in version 1".into()
+            };
             return Err(DynInferError::Binding(BindingError {
-                message: "encoding is not supported in version 1".into(),
+                message,
                 slot: Some(slot.id.to_string()),
                 checkpoint_key: Some(param.canonical_name.to_string()),
-                expected: Some("plain or gguf.q4_0".into()),
+                expected: Some("plain".into()),
                 actual: Some(format!("{:?}", param.encoding)),
             }));
         }
@@ -271,5 +278,65 @@ mod tests {
         };
         let plan = Binder::default().bind(&arch, &catalog).unwrap();
         assert_eq!(plan.bindings.len(), 1);
+    }
+
+    #[test]
+    fn rejects_q4_0_until_qkernel() {
+        let slot = ParameterSlot {
+            id: ParameterSlotId::new("tok"),
+            canonical_name: CanonicalParameterName::new("token_embd.weight"),
+            role: ParameterRole::Embedding,
+            expected_type: LogicalTensorConstraint {
+                rank: Some(2),
+                shape: None,
+                element_types: vec![ScalarType::F16],
+            },
+            supported_encodings: vec!["plain".into(), "gguf.q4_0".into()],
+            optional: false,
+            tied_group: None,
+        };
+        let arch = ArchitecturePackage {
+            id: ArchitectureId::new("llama.decoder"),
+            revision: "0.1.0".into(),
+            mlir_text: String::new(),
+            parameter_slots: vec![slot],
+            resolved_config: ResolvedModelConfig {
+                values: BTreeMap::new(),
+            },
+        };
+        let param = LogicalParameter {
+            canonical_name: CanonicalParameterName::new("token_embd.weight"),
+            role: ParameterRole::Embedding,
+            logical_type: LogicalTensorType {
+                shape: Shape::new(vec![32, 16]),
+                element_type: ScalarType::F16,
+            },
+            encoding: PhysicalEncoding::gguf_q4_0(),
+            components: vec![],
+            aliases: vec!["token_embd.weight".into()],
+        };
+        let catalog = CheckpointCatalog {
+            container: ContainerIdentity {
+                format_id: ContainerFormatId::new("gguf"),
+                version: Some(3),
+                magic: None,
+            },
+            convention_id: ConventionId::new("gguf.q4_0"),
+            source_files: vec![],
+            metadata: Default::default(),
+            raw_entries: vec![],
+            parameters: vec![param],
+            schema_fingerprint: SchemaFingerprint {
+                digest: Digest::from_bytes(b"x"),
+                entry_count: 1,
+                total_bytes: 0,
+            },
+        };
+        let err = Binder::default().bind(&arch, &catalog).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("qkernel") || msg.contains("gguf.q4_0"),
+            "unexpected error: {msg}"
+        );
     }
 }

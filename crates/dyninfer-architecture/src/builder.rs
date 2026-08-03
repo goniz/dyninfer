@@ -97,7 +97,7 @@ impl ModelBuilder {
                 shape: None,
                 element_types: vec![ScalarType::Bf16, ScalarType::F16, ScalarType::F32],
             },
-            supported_encodings: vec!["plain".into(), "gguf.q4_0".into()],
+            supported_encodings: vec!["plain".into(), "gguf.q4_0".into()], // q4 listed; binder gates via is_supported_v1
             optional,
             tied_group: None,
         })

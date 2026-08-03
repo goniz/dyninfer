@@ -15,8 +15,8 @@ pub use mlir_emit::{emit_add_smoke_module, emit_bridge_module};
 use dyninfer_architecture::ArchitecturePackage;
 use dyninfer_checkpoint::CheckpointCatalog;
 use dyninfer_core::{
-    BindingPlan, ExecutableManifest, KvCacheDescriptor, KvCacheLayout, ScalarType, ShapeProfile,
-    TargetProfile,
+    BindingPlan, ExecutableManifest, KvCacheDescriptor, KvCacheLayout, MaterializationPolicy,
+    ScalarType, ShapeProfile, TargetProfile,
 };
 use dyninfer_error::{CompilationError, Diagnostic, DynInferError, Result, Severity};
 use serde::{Deserialize, Serialize};
@@ -199,7 +199,7 @@ impl ModelCompiler for LocalCompiler {
         } else {
             request.prefill_window.max(1)
         };
-        let _ = request.binding;
+        validate_binding_for_compile(request.binding)?;
         let _ = request.checkpoint;
         let manifest = ExecutableManifest {
             format: "dyninfer.bundle".into(),
@@ -257,6 +257,34 @@ impl ModelCompiler for LocalCompiler {
             mlir_text: mlir,
         })
     }
+}
+
+/// Refuse encodings that advertise DecodeOnTheFly / qkernel without a lowering.
+fn validate_binding_for_compile(plan: &BindingPlan) -> Result<()> {
+    for b in &plan.bindings {
+        if !b.encoding.is_supported_v1() {
+            return Err(DynInferError::Compilation(CompilationError {
+                message: format!(
+                    "binding for `{}` uses unsupported encoding {:?}; \
+                     Q4_0 / DecodeOnTheFly requires qkernel lowering",
+                    b.canonical_name, b.encoding
+                ),
+                pass: Some("binding.validate".into()),
+                diagnostics: vec![],
+            }));
+        }
+        if matches!(b.materialization, MaterializationPolicy::DecodeOnTheFly) {
+            return Err(DynInferError::Compilation(CompilationError {
+                message: format!(
+                    "binding for `{}` requests DecodeOnTheFly but no qkernel path exists",
+                    b.canonical_name
+                ),
+                pass: Some("binding.validate".into()),
+                diagnostics: vec![],
+            }));
+        }
+    }
+    Ok(())
 }
 
 /// Compile the built-in add smoke module (no architecture required).
