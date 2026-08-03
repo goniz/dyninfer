@@ -222,7 +222,6 @@ dependencies = [
  "dyninfer-checkpoint",
  "dyninfer-core",
  "dyninfer-error",
- "dyninfer-mlir",
  "serde",
  "serde_json",
  "tracing",
@@ -296,11 +295,8 @@ dependencies = [
  "dyninfer-checkpoint",
  "dyninfer-core",
  "dyninfer-error",
- "half",
- "hex",
  "serde",
  "serde_json",
- "sha2",
  "tempfile",
  "tracing",
 ]
@@ -334,6 +330,9 @@ dependencies = [
  "dyninfer-checkpoint",
  "dyninfer-core",
  "dyninfer-error",
+ "dyninfer-kernel-registry",
+ "dyninfer-mlir",
+ "dyninfer-quantization",
  "iree-compiler-sys",
  "serde",
  "serde_json",
@@ -394,6 +393,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dyninfer-quantization"
+version = "0.1.0"
+dependencies = [
+ "dyninfer-checkpoint",
+ "dyninfer-core",
+ "dyninfer-error",
+ "dyninfer-kernel-registry",
+ "dyninfer-mlir",
+ "serde",
+]
+
+[[package]]
 name = "dyninfer-runtime"
 version = "0.1.0"
 dependencies = [
@@ -406,7 +417,10 @@ dependencies = [
  "dyninfer-compiler",
  "dyninfer-core",
  "dyninfer-error",
+ "dyninfer-kernel-registry",
+ "dyninfer-quantization",
  "dyninfer-target",
+ "half",
  "iree-runtime",
  "serde",
  "serde_json",

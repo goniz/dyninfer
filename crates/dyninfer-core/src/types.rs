@@ -6,6 +6,7 @@ use crate::ids::{
 };
 use crate::scalar::{Endianness, ScalarType, StorageElementType, TensorOrder};
 use crate::shape::{ByteRange, Range64, Shape, ShapeProfile};
+use crate::{PrecisionPolicy, SelectedKernel};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -92,6 +93,15 @@ pub enum ZeroPointMode {
     Constant { value: i32 },
 }
 
+/// One byte-addressed field inside a block-quantized storage block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockLayoutField {
+    pub name: String,
+    pub byte_offset: u32,
+    pub byte_length: u32,
+    pub storage_type: StorageElementType,
+}
+
 /// Physical storage encoding for a logical parameter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -103,19 +113,28 @@ pub enum PhysicalEncoding {
     GroupQuantized {
         logical_type: ScalarType,
         storage_bits: u8,
+        storage_container: ScalarType,
         signed: bool,
         axis: i32,
         group_size: u32,
         scale_type: ScalarType,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bias_type: Option<ScalarType>,
         zero_point: ZeroPointMode,
         packing: String,
+        order: TensorOrder,
+        components: Vec<String>,
     },
     BlockQuantized {
         logical_type: ScalarType,
         block_shape: Vec<u32>,
+        bytes_per_block: u32,
         codec: CodecId,
         codec_version: u32,
         components: Vec<String>,
+        layout: Vec<BlockLayoutField>,
+        order: TensorOrder,
+        endianness: Endianness,
     },
     Sparse {
         logical_type: ScalarType,
@@ -136,34 +155,6 @@ impl PhysicalEncoding {
             order: TensorOrder::RowMajor,
         }
     }
-
-    pub fn gguf_q4_0() -> Self {
-        Self::BlockQuantized {
-            logical_type: ScalarType::F16,
-            block_shape: vec![32],
-            codec: CodecId::new("gguf.q4_0"),
-            codec_version: 1,
-            components: vec!["scale_f16".into(), "qs_u4".into()],
-        }
-    }
-
-    /// Encodings that can be bound and executed today.
-    ///
-    /// GGUF Q4_0 uses the portable qkernel path: layer weights bind as packed
-    /// i8 and lower to device-fused unpack+dot; embd/output are host-dequantized
-    /// to f32 for gather / vocab projection.
-    pub fn is_supported_v1(&self) -> bool {
-        match self {
-            Self::Plain { .. } => true,
-            Self::BlockQuantized { codec, .. } => codec.as_str() == "gguf.q4_0",
-            Self::Opaque { .. } | Self::GroupQuantized { .. } | Self::Sparse { .. } => false,
-        }
-    }
-
-    /// True when this encoding is a known future v1 target beyond current support.
-    pub fn is_planned_v1(&self) -> bool {
-        false
-    }
 }
 
 /// One storage component of a logical parameter (weights, scales, …).
@@ -171,6 +162,8 @@ impl PhysicalEncoding {
 pub struct StorageComponent {
     pub name: String,
     pub key: String,
+    #[serde(default)]
+    pub source_file_index: u32,
     pub shape: Shape,
     pub storage_type: StorageElementType,
     pub byte_ranges: Vec<ByteRange>,
@@ -185,8 +178,6 @@ pub struct ParameterSlot {
     pub canonical_name: CanonicalParameterName,
     pub role: ParameterRole,
     pub expected_type: LogicalTensorConstraint,
-    #[serde(default)]
-    pub supported_encodings: Vec<String>,
     pub optional: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tied_group: Option<TiedParameterGroup>,
@@ -205,17 +196,22 @@ pub enum BindingTransform {
     Split { axis: u32, segments: Vec<u64> },
     Permute { permutation: Vec<u32> },
     Alias,
-    Repack { target_encoding: PhysicalEncoding },
 }
 
-/// Materialization policy for bound parameters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MaterializationPolicy {
-    DirectView,
-    CopyAligned,
-    DecodeOnTheFly,
-    PrepackToCache,
+/// One bound physical component addressed by a stable external parameter key.
+/// Checkpoint paths and byte offsets remain in the associated catalog/runtime
+/// provider plan rather than entering compiler IR.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParameterComponentBinding {
+    pub component_name: String,
+    pub external_key: String,
+    pub checkpoint_key: String,
+    pub source_file_index: u32,
+    pub shape: Shape,
+    pub storage_type: StorageElementType,
+    pub byte_lengths: Vec<u64>,
+    pub alignment: u64,
+    pub endianness: Endianness,
 }
 
 /// One bound parameter association.
@@ -227,20 +223,13 @@ pub struct ParameterBinding {
     pub encoding: PhysicalEncoding,
     pub logical_shape: Shape,
     pub logical_type: ScalarType,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<ParameterComponentBinding>,
     pub transform: BindingTransform,
-    pub materialization: MaterializationPolicy,
     pub scope: String,
     pub parameter_key: String,
     pub storage_bytes: u64,
     pub alignment: u64,
-}
-
-/// Request to materialize derived parameter bytes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MaterializationRequest {
-    pub slot_id: ParameterSlotId,
-    pub policy: MaterializationPolicy,
-    pub reason: String,
 }
 
 /// Complete binding plan produced by the binder.
@@ -250,7 +239,6 @@ pub struct BindingPlan {
     pub checkpoint_schema: SchemaFingerprint,
     pub bindings: Vec<ParameterBinding>,
     pub unresolved_optional_slots: Vec<ParameterSlotId>,
-    pub materializations: Vec<MaterializationRequest>,
 }
 
 /// Hardware / execution target profile.
@@ -258,101 +246,208 @@ pub struct BindingPlan {
 pub struct TargetProfile {
     pub driver: String,
     pub device_id: Option<u32>,
+    /// Host CPU triple. GPU architecture is recorded separately.
     pub triple: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<String>,
     pub features: Vec<String>,
     pub capability_fingerprint: Digest,
     /// Full HAL device URI from discovery (`vulkan://GPU-…`, `hip://0`, …).
     /// When set, the runtime MUST open this device instead of the driver default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subgroup_size: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_workgroup_invocations: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub executable_target_flags: Vec<String>,
+    /// True only when all facts required for local compilation were detected
+    /// or, for host CPU, queried from the running process.
+    #[serde(default)]
+    pub verified: bool,
 }
 
 impl TargetProfile {
-    /// Default AMDGPU arch when `--target rocm` / `hip` omits an explicit chip.
-    pub const DEFAULT_ROCM_TARGET: &'static str = "gfx1151";
-
     pub fn llvm_cpu_host() -> Self {
         let triple = Some(host_triple().to_string());
-        let features: Vec<String> = Vec::new();
-        let capability_fingerprint = Digest::from_bytes(
-            format!(
-                "llvm-cpu|{}|{}",
-                triple.as_deref().unwrap_or("unknown"),
-                features.join(",")
-            )
-            .as_bytes(),
-        );
-        Self {
+        let features = detected_host_features();
+        let mut profile = Self {
             driver: "local-task".into(),
             device_id: Some(0),
             triple,
+            architecture: None,
             features,
-            capability_fingerprint,
-            device_uri: None,
-        }
+            capability_fingerprint: Digest::from_bytes(b"pending"),
+            device_uri: Some("local-task://".into()),
+            device_name: Some("host-cpu".into()),
+            subgroup_size: None,
+            max_workgroup_invocations: None,
+            executable_target_flags: vec![
+                "--iree-hal-target-device=local".into(),
+                "--iree-hal-local-target-device-backends=llvm-cpu".into(),
+                "--iree-llvmcpu-target-cpu=host".into(),
+            ],
+            verified: host_triple() != "unknown",
+        };
+        profile.refresh_fingerprint();
+        profile
     }
 
-    /// Vulkan SPIR-V target. `chip` is an IREE Vulkan arch (e.g. `gfx1151`,
-    /// `rdna3`); empty uses [`Self::DEFAULT_ROCM_TARGET`] (same AMDGPU SKUs).
+    /// Vulkan SPIR-V target with an exact architecture reported by discovery.
+    /// An empty architecture produces an unverified profile that compilation
+    /// must reject.
     pub fn vulkan(chip: &str) -> Self {
-        let chip = if chip.is_empty() {
-            Self::DEFAULT_ROCM_TARGET
-        } else {
-            chip
-        };
-        Self {
+        let architecture = nonempty(chip);
+        let mut profile = Self {
             driver: "vulkan".into(),
             device_id: Some(0),
-            triple: Some(chip.to_string()),
-            features: vec!["spirv".into(), format!("vulkan-target={chip}")],
-            // Include promote-bf16 so cache keys diverge from pre-promote VMFBs.
-            capability_fingerprint: Digest::from_bytes(
-                format!("vulkan|{chip}|promote-bf16-f32").as_bytes(),
-            ),
+            triple: None,
+            architecture: architecture.clone(),
+            features: architecture
+                .iter()
+                .map(|chip| format!("vulkan-target={chip}"))
+                .chain(std::iter::once("spirv".into()))
+                .collect(),
+            capability_fingerprint: Digest::from_bytes(b"pending"),
             device_uri: None,
-        }
+            device_name: None,
+            subgroup_size: None,
+            max_workgroup_invocations: None,
+            executable_target_flags: architecture
+                .as_ref()
+                .map(|chip| {
+                    vec![
+                        "--iree-hal-target-device=vulkan".into(),
+                        format!("--iree-vulkan-target={chip}"),
+                    ]
+                })
+                .unwrap_or_default(),
+            verified: architecture.is_some(),
+        };
+        profile.refresh_fingerprint();
+        profile
     }
-
-    /// Vulkan with the default desktop AMDGPU arch (not Android baseline).
-    pub fn vulkan_generic() -> Self {
-        Self::vulkan(Self::DEFAULT_ROCM_TARGET)
-    }
-
-    /// Default NVPTX arch when `--target cuda` omits an explicit SM.
-    pub const DEFAULT_CUDA_TARGET: &'static str = "sm_80";
 
     /// HIP / ROCm target. `chip` is an LLVM AMDGPU target (e.g. `gfx1151`).
     pub fn hip_rocm(chip: &str) -> Self {
-        let chip = if chip.is_empty() {
-            Self::DEFAULT_ROCM_TARGET
-        } else {
-            chip
-        };
-        Self {
+        let architecture = nonempty(chip);
+        let mut profile = Self {
             driver: "hip".into(),
             device_id: Some(0),
-            triple: Some(chip.to_string()),
-            features: vec![format!("rocm-target={chip}")],
-            capability_fingerprint: Digest::from_bytes(format!("hip|{chip}").as_bytes()),
+            triple: None,
+            architecture: architecture.clone(),
+            features: architecture
+                .iter()
+                .map(|chip| format!("rocm-target={chip}"))
+                .collect(),
+            capability_fingerprint: Digest::from_bytes(b"pending"),
             device_uri: None,
-        }
+            device_name: None,
+            subgroup_size: None,
+            max_workgroup_invocations: None,
+            executable_target_flags: architecture
+                .as_ref()
+                .map(|chip| {
+                    vec![
+                        "--iree-hal-target-device=hip".into(),
+                        format!("--iree-rocm-target={chip}"),
+                    ]
+                })
+                .unwrap_or_default(),
+            verified: architecture.is_some(),
+        };
+        profile.refresh_fingerprint();
+        profile
     }
 
     /// CUDA target. `arch` is an NVPTX target (e.g. `sm_80`).
     pub fn cuda(arch: &str) -> Self {
-        let arch = if arch.is_empty() {
-            Self::DEFAULT_CUDA_TARGET
-        } else {
-            arch
-        };
-        Self {
+        let architecture = nonempty(arch);
+        let mut features = architecture
+            .iter()
+            .map(|arch| format!("cuda-target={arch}"))
+            .collect::<Vec<_>>();
+        if let Some(sm) = architecture.as_deref().and_then(cuda_sm) {
+            if sm >= 53 {
+                features.push("native_f16".into());
+            }
+            if sm >= 61 {
+                features.push("integer_dot_product".into());
+            }
+            if sm >= 70 {
+                features.push("tensor_cores".into());
+            }
+            if sm >= 80 {
+                features.push("native_bf16".into());
+            }
+            if sm >= 100 {
+                features.push("nvfp4".into());
+            }
+        }
+        let mut profile = Self {
             driver: "cuda".into(),
             device_id: Some(0),
-            triple: Some(arch.to_string()),
-            features: vec![format!("cuda-target={arch}")],
-            capability_fingerprint: Digest::from_bytes(format!("cuda|{arch}").as_bytes()),
+            triple: None,
+            architecture: architecture.clone(),
+            features,
+            capability_fingerprint: Digest::from_bytes(b"pending"),
             device_uri: None,
-        }
+            device_name: None,
+            subgroup_size: Some(32),
+            max_workgroup_invocations: None,
+            executable_target_flags: architecture
+                .as_ref()
+                .map(|arch| {
+                    vec![
+                        "--iree-hal-target-device=cuda".into(),
+                        format!("--iree-cuda-target={arch}"),
+                    ]
+                })
+                .unwrap_or_default(),
+            verified: architecture.is_some(),
+        };
+        profile.refresh_fingerprint();
+        profile
+    }
+
+    pub fn with_device_identity(
+        mut self,
+        device_id: u32,
+        device_uri: impl Into<String>,
+        device_name: impl Into<String>,
+    ) -> Self {
+        self.device_id = Some(device_id);
+        self.device_uri = nonempty(&device_uri.into());
+        self.device_name = nonempty(&device_name.into());
+        self.refresh_fingerprint();
+        self
+    }
+
+    pub fn with_discovered_features(mut self, features: impl IntoIterator<Item = String>) -> Self {
+        self.features.extend(features);
+        self.refresh_fingerprint();
+        self
+    }
+
+    pub fn with_execution_limits(
+        mut self,
+        subgroup_size: Option<u32>,
+        max_workgroup_invocations: Option<u32>,
+    ) -> Self {
+        self.subgroup_size = subgroup_size.or(self.subgroup_size);
+        self.max_workgroup_invocations =
+            max_workgroup_invocations.or(self.max_workgroup_invocations);
+        self.refresh_fingerprint();
+        self
+    }
+
+    pub fn is_compile_ready(&self) -> bool {
+        self.verified
+            && (!matches!(self.driver.as_str(), "cuda" | "hip" | "rocm" | "vulkan")
+                || self.architecture.is_some())
     }
 
     /// Preferred runtime device string: full URI when known, else driver name.
@@ -366,7 +461,7 @@ impl TargetProfile {
     /// ROCm chip / SKU for `--iree-rocm-target`, if this is a HIP profile.
     pub fn rocm_target(&self) -> Option<&str> {
         if self.driver == "hip" || self.driver == "rocm" {
-            self.triple.as_deref().or(Some(Self::DEFAULT_ROCM_TARGET))
+            self.architecture.as_deref()
         } else {
             None
         }
@@ -375,7 +470,7 @@ impl TargetProfile {
     /// CUDA SM arch for `--iree-cuda-target`, if this is a CUDA profile.
     pub fn cuda_target(&self) -> Option<&str> {
         if self.driver == "cuda" {
-            self.triple.as_deref().or(Some(Self::DEFAULT_CUDA_TARGET))
+            self.architecture.as_deref()
         } else {
             None
         }
@@ -384,7 +479,7 @@ impl TargetProfile {
     /// Vulkan GPU arch for `--iree-vulkan-target`, if this is a Vulkan profile.
     pub fn vulkan_target(&self) -> Option<&str> {
         if self.driver == "vulkan" {
-            self.triple.as_deref().or(Some(Self::DEFAULT_ROCM_TARGET))
+            self.architecture.as_deref()
         } else {
             None
         }
@@ -396,6 +491,88 @@ impl TargetProfile {
             .or_else(|| self.cuda_target())
             .or_else(|| self.vulkan_target())
     }
+
+    fn refresh_fingerprint(&mut self) {
+        self.features.sort();
+        self.features.dedup();
+        self.executable_target_flags.sort();
+        self.executable_target_flags.dedup();
+        self.capability_fingerprint = Digest::from_bytes(
+            format!(
+                "driver={}|device_id={:?}|triple={:?}|architecture={:?}|features={:?}|uri={:?}|name={:?}|subgroup={:?}|max_workgroup={:?}|flags={:?}|verified={}",
+                self.driver,
+                self.device_id,
+                self.triple,
+                self.architecture,
+                self.features,
+                self.device_uri,
+                self.device_name,
+                self.subgroup_size,
+                self.max_workgroup_invocations,
+                self.executable_target_flags,
+                self.verified
+            )
+            .as_bytes(),
+        );
+    }
+}
+
+fn nonempty(value: &str) -> Option<String> {
+    (!value.trim().is_empty()).then(|| value.trim().to_string())
+}
+
+fn cuda_sm(architecture: &str) -> Option<u32> {
+    architecture
+        .strip_prefix("sm_")
+        .or_else(|| architecture.strip_prefix("sm"))?
+        .parse()
+        .ok()
+}
+
+fn detected_host_features() -> Vec<String> {
+    let mut features = Vec::new();
+    #[cfg(target_arch = "x86_64")]
+    {
+        for (name, detected) in [
+            ("sse4.2", std::is_x86_feature_detected!("sse4.2")),
+            ("avx", std::is_x86_feature_detected!("avx")),
+            ("avx2", std::is_x86_feature_detected!("avx2")),
+            ("fma", std::is_x86_feature_detected!("fma")),
+            ("f16c", std::is_x86_feature_detected!("f16c")),
+            ("avx512f", std::is_x86_feature_detected!("avx512f")),
+            ("avx512bw", std::is_x86_feature_detected!("avx512bw")),
+            ("avx512vl", std::is_x86_feature_detected!("avx512vl")),
+            ("avx512vnni", std::is_x86_feature_detected!("avx512vnni")),
+        ] {
+            if detected {
+                features.push(name.into());
+            }
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        for (name, detected) in [
+            ("neon", std::arch::is_aarch64_feature_detected!("neon")),
+            (
+                "native_f16",
+                std::arch::is_aarch64_feature_detected!("fp16"),
+            ),
+            (
+                "native_bf16",
+                std::arch::is_aarch64_feature_detected!("bf16"),
+            ),
+            (
+                "dotprod",
+                std::arch::is_aarch64_feature_detected!("dotprod"),
+            ),
+            ("i8mm", std::arch::is_aarch64_feature_detected!("i8mm")),
+        ] {
+            if detected {
+                features.push(name.into());
+            }
+        }
+    }
+    features
 }
 
 fn host_triple() -> &'static str {
@@ -449,6 +626,16 @@ pub struct ModelMetadata {
     pub extra: MetadataMap,
 }
 
+/// Stable external component contract recorded in an executable manifest.
+/// Paths and offsets are intentionally absent so schema-compatible checkpoint
+/// values can reuse the same VMFB.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ManifestParameterComponent {
+    pub scope: String,
+    pub key: String,
+    pub byte_length: u64,
+}
+
 /// Session configuration for inference.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionConfig {
@@ -477,10 +664,18 @@ pub struct ExecutableManifest {
     pub architecture_revision: String,
     pub checkpoint_schema: SchemaFingerprint,
     pub target: TargetProfile,
+    #[serde(default)]
+    pub precision_policy: PrecisionPolicy,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected_kernels: Vec<SelectedKernel>,
     pub shape_profile: ShapeProfile,
     pub entrypoints: Vec<String>,
     pub kv_cache: KvCacheDescriptor,
     pub parameter_scope: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parameter_components: Vec<ManifestParameterComponent>,
+    #[serde(default)]
+    pub derived_parameters_required: bool,
     pub vmfb_path: String,
     /// Static `@prefill` token window compiled into the VMFB.
     #[serde(default = "default_prefill_window")]
@@ -498,17 +693,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn physical_encoding_q4_0_is_supported() {
-        assert!(PhysicalEncoding::gguf_q4_0().is_supported_v1());
-        assert!(!PhysicalEncoding::gguf_q4_0().is_planned_v1());
-        assert!(PhysicalEncoding::plain(ScalarType::Bf16).is_supported_v1());
-    }
-
-    #[test]
     fn target_profile_roundtrips() {
         let t = TargetProfile::llvm_cpu_host();
         let json = serde_json::to_string(&t).unwrap();
         let back: TargetProfile = serde_json::from_str(&json).unwrap();
         assert_eq!(t.driver, back.driver);
+    }
+
+    #[test]
+    fn target_fingerprint_is_deterministic_and_capability_sensitive() {
+        let a = TargetProfile::cuda("sm_100")
+            .with_device_identity(2, "cuda://GPU-stable", "example")
+            .with_discovered_features(["feature_b".into(), "feature_a".into()]);
+        let b = TargetProfile::cuda("sm_100")
+            .with_device_identity(2, "cuda://GPU-stable", "example")
+            .with_discovered_features(["feature_a".into(), "feature_b".into()]);
+        assert_eq!(a.capability_fingerprint, b.capability_fingerprint);
+        assert!(a.features.iter().any(|feature| feature == "nvfp4"));
+
+        let different_arch =
+            TargetProfile::cuda("sm_90").with_device_identity(2, "cuda://GPU-stable", "example");
+        assert_ne!(
+            a.capability_fingerprint,
+            different_arch.capability_fingerprint
+        );
     }
 }

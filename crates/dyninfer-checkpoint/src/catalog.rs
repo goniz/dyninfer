@@ -6,6 +6,7 @@ use dyninfer_core::{
     StorageComponent, StorageElementType,
 };
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Identity of a probed container.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +49,8 @@ impl MatchScore {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawTensorEntry {
     pub key: String,
+    #[serde(default)]
+    pub source_file_index: u32,
     pub shape: Vec<u64>,
     pub storage_type: StorageElementType,
     pub byte_ranges: Vec<ByteRange>,
@@ -104,8 +107,23 @@ pub struct CheckpointCatalog {
 pub struct RuntimeProviderPlan {
     pub kind: String,
     pub scope: String,
-    pub file_paths: Vec<String>,
+    pub file_paths: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parameters: Vec<ProviderParameterDescriptor>,
     pub notes: Vec<String>,
+}
+
+/// One stable IREE parameter key mapped directly onto an original checkpoint
+/// file range. `aliases` are temporary compatibility keys for legacy emitters;
+/// they reference the same range and never create derived bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderParameterDescriptor {
+    pub external_key: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    pub source_file_index: u32,
+    pub offset: u64,
+    pub length: u64,
 }
 
 /// Context passed to convention decoders.

@@ -54,11 +54,11 @@ impl TargetDiscovery {
     /// Best target for this machine: CUDA/HIP ≻ Vulkan ≻ CPU.
     pub fn select_best(&self) -> Result<TargetProfile> {
         let devices = self.discover()?;
-        Ok(devices
-            .into_iter()
-            .next()
-            .map(|d| d.profile)
-            .unwrap_or_else(TargetProfile::llvm_cpu_host))
+        let device = devices.into_iter().next().unwrap_or_else(cpu_device);
+        if !device.profile.is_compile_ready() {
+            return Err(unverified_target_error(&device));
+        }
+        Ok(device.profile)
     }
 
     /// Parse a CLI / config target spec into a [`TargetProfile`].
@@ -66,9 +66,9 @@ impl TargetDiscovery {
     /// Supported:
     /// - `auto` → probe IREE HAL devices; pick CUDA/HIP over Vulkan/CPU
     /// - `cpu` / `llvm-cpu` / `local*` → host CPU
-    /// - `vulkan` / `vulkan://…` → Vulkan (default chip `gfx1151`, or `DYNINFER_VULKAN_TARGET` / `DYNINFER_ROCM_TARGET`)
+    /// - `vulkan` / `vulkan://…` → a matching locally discovered Vulkan device
     /// - `vulkan:gfx1151` / `vulkan/rdna3` → Vulkan + arch for `--iree-vulkan-target`
-    /// - `rocm` / `hip` → HIP (default chip `gfx1151`, or `DYNINFER_ROCM_TARGET`)
+    /// - `rocm` / `hip` → a matching locally discovered HIP device
     /// - `rocm:gfx1151` / `hip:gfx1100` / `rocm/gfx1151` → HIP + chip
     /// - `cuda` / `cuda:sm_80` → CUDA (+ arch)
     /// - bare `gfx*` → HIP; bare `sm_*` → CUDA
@@ -80,24 +80,36 @@ impl TargetDiscovery {
         if spec == "cpu" || spec == "llvm-cpu" || spec.starts_with("local") {
             return Ok(TargetProfile::llvm_cpu_host());
         }
-        if let Some(chip) = parse_vulkan_spec(spec) {
-            return Ok(TargetProfile::vulkan(&chip));
+        let request = parse_gpu_request(spec).ok_or_else(|| {
+            DynInferError::Config(ConfigError {
+                message: format!(
+                    "unknown target specification: {spec} \
+                     (expected auto|cpu|vulkan|vulkan:<arch>|vulkan://<device>|\
+                     rocm|hip|cuda|rocm:<gfx>|cuda:<sm>)"
+                ),
+            })
+        })?;
+        let devices = TargetDiscovery.discover()?;
+        let matching = devices.into_iter().find(|device| {
+            canonical_driver(&device.driver) == request.driver
+                && request
+                    .architecture
+                    .as_ref()
+                    .is_none_or(|arch| device.arch.as_ref() == Some(arch))
+                && request.uri.as_ref().is_none_or(|uri| &device.uri == uri)
+        });
+        let device = matching.ok_or_else(|| {
+            DynInferError::Config(ConfigError {
+                message: format!(
+                    "target `{spec}` does not match a locally discovered device; \
+                     cross-target or guessed GPU compilation is not supported"
+                ),
+            })
+        })?;
+        if !device.profile.is_compile_ready() {
+            return Err(unverified_target_error(&device));
         }
-        if let Some(arch) = parse_cuda_spec(spec) {
-            return Ok(TargetProfile::cuda(&arch));
-        }
-        if let Some(chip) = parse_rocm_spec(spec) {
-            return Ok(TargetProfile::hip_rocm(&chip));
-        }
-        Err(DynInferError::Config(ConfigError {
-            message: format!(
-                "unknown target specification: {spec} \
-                 (expected auto|cpu|vulkan|vulkan:gfxXXXX|rocm|hip|cuda|rocm:gfxXXXX|cuda:sm_XX; \
-                 default ROCm/Vulkan chip {}, default CUDA {})",
-                TargetProfile::DEFAULT_ROCM_TARGET,
-                TargetProfile::DEFAULT_CUDA_TARGET
-            ),
-        }))
+        Ok(device.profile)
     }
 
     pub fn capability_fingerprint(profile: &TargetProfile) -> Digest {
@@ -135,83 +147,90 @@ fn sort_by_preference(devices: &mut [DiscoveredDevice]) {
     });
 }
 
-fn default_rocm_chip() -> String {
-    std::env::var("DYNINFER_ROCM_TARGET")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| TargetProfile::DEFAULT_ROCM_TARGET.to_string())
+fn unverified_target_error(device: &DiscoveredDevice) -> DynInferError {
+    DynInferError::Config(ConfigError {
+        message: format!(
+            "selected local device `{}` ({}) did not report an exact compile architecture; \
+             refusing to guess target flags",
+            device.name, device.uri
+        ),
+    })
 }
 
-fn default_vulkan_chip() -> String {
-    std::env::var("DYNINFER_VULKAN_TARGET")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(default_rocm_chip)
-}
-
-fn default_cuda_arch() -> String {
-    std::env::var("DYNINFER_CUDA_TARGET")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| TargetProfile::DEFAULT_CUDA_TARGET.to_string())
-}
-
-fn parse_vulkan_spec(spec: &str) -> Option<String> {
-    let lower = spec.to_ascii_lowercase();
-    if lower == "vulkan" || lower.starts_with("vulkan://") {
-        return Some(default_vulkan_chip());
+fn canonical_driver(driver: &str) -> &str {
+    match driver {
+        "rocm" => "hip",
+        other => other,
     }
-    for sep in [':', '/'] {
-        let p = format!("vulkan{sep}");
-        if lower.strip_prefix(&p).is_some() {
-            let raw = spec["vulkan".len() + 1..].trim();
-            if raw.is_empty() {
-                return Some(default_vulkan_chip());
-            }
-            return Some(raw.to_string());
+}
+
+struct GpuRequest {
+    driver: &'static str,
+    architecture: Option<String>,
+    uri: Option<String>,
+}
+
+fn parse_gpu_request(spec: &str) -> Option<GpuRequest> {
+    let lower = spec.to_ascii_lowercase();
+    if lower.starts_with("vulkan://") {
+        return Some(GpuRequest {
+            driver: "vulkan",
+            architecture: None,
+            uri: Some(spec.to_string()),
+        });
+    }
+    if lower.starts_with("hip://") || lower.starts_with("rocm://") {
+        return Some(GpuRequest {
+            driver: "hip",
+            architecture: None,
+            uri: Some(spec.to_string()),
+        });
+    }
+    if lower.starts_with("cuda://") {
+        return Some(GpuRequest {
+            driver: "cuda",
+            architecture: None,
+            uri: Some(spec.to_string()),
+        });
+    }
+    for (prefix, driver) in [
+        ("vulkan", "vulkan"),
+        ("rocm", "hip"),
+        ("hip", "hip"),
+        ("cuda", "cuda"),
+    ] {
+        if lower == prefix {
+            return Some(GpuRequest {
+                driver,
+                architecture: None,
+                uri: None,
+            });
         }
-    }
-    None
-}
-
-fn parse_rocm_spec(spec: &str) -> Option<String> {
-    let lower = spec.to_ascii_lowercase();
-    if lower == "rocm" || lower == "hip" {
-        return Some(default_rocm_chip());
-    }
-    for (prefix, sep) in [("rocm", ':'), ("hip", ':'), ("rocm", '/'), ("hip", '/')] {
-        let p = format!("{prefix}{sep}");
-        if lower.strip_prefix(&p).is_some() {
-            let raw = spec[prefix.len() + 1..].trim();
-            if raw.is_empty() {
-                return Some(default_rocm_chip());
+        for sep in [':', '/'] {
+            let marker = format!("{prefix}{sep}");
+            if lower.starts_with(&marker) {
+                let raw = spec[marker.len()..].trim();
+                return (!raw.is_empty()).then(|| GpuRequest {
+                    driver,
+                    architecture: Some(raw.to_string()),
+                    uri: None,
+                });
             }
-            return Some(raw.to_string());
         }
     }
     if lower.starts_with("gfx") || lower.starts_with("mi") || lower.starts_with("rdna") {
-        return Some(spec.to_string());
-    }
-    None
-}
-
-fn parse_cuda_spec(spec: &str) -> Option<String> {
-    let lower = spec.to_ascii_lowercase();
-    if lower == "cuda" {
-        return Some(default_cuda_arch());
-    }
-    for sep in [':', '/'] {
-        let p = format!("cuda{sep}");
-        if lower.strip_prefix(&p).is_some() {
-            let raw = spec[4 + 1..].trim();
-            if raw.is_empty() {
-                return Some(default_cuda_arch());
-            }
-            return Some(raw.to_string());
-        }
+        return Some(GpuRequest {
+            driver: "hip",
+            architecture: Some(spec.to_string()),
+            uri: None,
+        });
     }
     if lower.starts_with("sm_") {
-        return Some(spec.to_string());
+        return Some(GpuRequest {
+            driver: "cuda",
+            architecture: Some(spec.to_string()),
+            uri: None,
+        });
     }
     None
 }
@@ -272,6 +291,9 @@ pub fn parse_dump_devices(dump: &str) -> Vec<DiscoveredDevice> {
                 uri,
                 name: String::new(),
                 arch: None,
+                features: Vec::new(),
+                subgroup_size: None,
+                max_workgroup_invocations: None,
             });
             continue;
         }
@@ -283,6 +305,19 @@ pub fn parse_dump_devices(dump: &str) -> Vec<DiscoveredDevice> {
             }
             if let Some(arch) = trimmed.strip_prefix("- gpu-arch-name:") {
                 p.arch = Some(arch.trim().to_string());
+                continue;
+            }
+            if let Some(capability) = trimmed.strip_prefix("- gpu-compute-capability:") {
+                p.features
+                    .push(format!("compute_capability={}", capability.trim()));
+                continue;
+            }
+            if let Some(value) = trimmed.strip_prefix("- gpu-subgroup-size:") {
+                p.subgroup_size = value.trim().parse().ok();
+                continue;
+            }
+            if let Some(value) = trimmed.strip_prefix("- gpu-max-workgroup-invocations:") {
+                p.max_workgroup_invocations = value.trim().parse().ok();
             }
         }
     }
@@ -293,6 +328,43 @@ pub fn parse_dump_devices(dump: &str) -> Vec<DiscoveredDevice> {
         &mut cuda_index,
         &mut vulkan_index,
     );
+
+    // Some Vulkan drivers omit `gpu-arch-name` while the HIP view of the
+    // same physical adapter reports it. An exact, unique device-name match is
+    // discovered evidence (not a guessed architecture), and gives IREE the
+    // target required to compile a Vulkan executable for that adapter.
+    let correlated_arches: Vec<_> = devices
+        .iter()
+        .filter(|device| device.driver == "hip" || device.driver == "cuda")
+        .filter_map(|device| {
+            device
+                .arch
+                .as_ref()
+                .map(|arch| (device.name.clone(), arch.clone()))
+        })
+        .collect();
+    for device in devices
+        .iter_mut()
+        .filter(|device| device.driver == "vulkan" && device.arch.is_none())
+    {
+        let mut matching = correlated_arches
+            .iter()
+            .filter(|(name, _)| name == &device.name)
+            .map(|(_, arch)| arch.as_str());
+        let Some(arch) = matching.next() else {
+            continue;
+        };
+        if matching.any(|other| other != arch) {
+            continue;
+        }
+        device.arch = Some(arch.to_string());
+        device.profile = TargetProfile::vulkan(arch)
+            .with_device_identity(device.device_id, device.uri.clone(), device.name.clone())
+            .with_execution_limits(
+                device.profile.subgroup_size,
+                device.profile.max_workgroup_invocations,
+            );
+    }
 
     // Always offer CPU as a fallback option in the inventory.
     if !devices.iter().any(|d| d.driver.starts_with("local")) {
@@ -306,6 +378,9 @@ struct PendingDevice {
     uri: String,
     name: String,
     arch: Option<String>,
+    features: Vec<String>,
+    subgroup_size: Option<u32>,
+    max_workgroup_invocations: Option<u32>,
 }
 
 fn pending_to_device(
@@ -318,72 +393,74 @@ fn pending_to_device(
     // Skip empty local placeholders already covered by cpu_device; keep one local-task.
     match driver {
         "cuda" => {
-            let arch = p
-                .arch
-                .clone()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(default_cuda_arch);
+            let arch = p.arch.clone().filter(|s| !s.is_empty());
             let id = *cuda_index;
             *cuda_index += 1;
+            let name = nonempty_name(
+                &p.name,
+                &arch
+                    .as_ref()
+                    .map(|arch| format!("cuda-{arch}"))
+                    .unwrap_or_else(|| "cuda-device".into()),
+            );
+            let profile = TargetProfile::cuda(arch.as_deref().unwrap_or(""))
+                .with_device_identity(id, p.uri.clone(), name.clone())
+                .with_discovered_features(p.features)
+                .with_execution_limits(p.subgroup_size, p.max_workgroup_invocations);
             Some(DiscoveredDevice {
                 driver: "cuda".into(),
                 device_id: id,
-                name: nonempty_name(&p.name, &format!("cuda-{arch}")),
+                name,
                 uri: p.uri.clone(),
-                arch: Some(arch.clone()),
-                profile: {
-                    let mut profile = TargetProfile::cuda(&arch);
-                    profile.device_id = Some(id);
-                    if !p.uri.is_empty() {
-                        profile.device_uri = Some(p.uri.clone());
-                    }
-                    profile
-                },
+                arch,
+                profile,
             })
         }
         "hip" | "rocm" => {
-            let arch = p
-                .arch
-                .clone()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(default_rocm_chip);
+            let arch = p.arch.clone().filter(|s| !s.is_empty());
             let id = *hip_index;
             *hip_index += 1;
+            let name = nonempty_name(
+                &p.name,
+                &arch
+                    .as_ref()
+                    .map(|arch| format!("rocm-{arch}"))
+                    .unwrap_or_else(|| "rocm-device".into()),
+            );
+            let profile = TargetProfile::hip_rocm(arch.as_deref().unwrap_or(""))
+                .with_device_identity(id, p.uri.clone(), name.clone())
+                .with_discovered_features(p.features)
+                .with_execution_limits(p.subgroup_size, p.max_workgroup_invocations);
             Some(DiscoveredDevice {
                 driver: "hip".into(),
                 device_id: id,
-                name: nonempty_name(&p.name, &format!("rocm-{arch}")),
+                name,
                 uri: p.uri.clone(),
-                arch: Some(arch.clone()),
-                profile: {
-                    let mut profile = TargetProfile::hip_rocm(&arch);
-                    profile.device_id = Some(id);
-                    if !p.uri.is_empty() {
-                        profile.device_uri = Some(p.uri.clone());
-                    }
-                    profile
-                },
+                arch,
+                profile,
             })
         }
         "vulkan" => {
             let id = *vulkan_index;
             *vulkan_index += 1;
-            let arch = p
-                .arch
-                .clone()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(default_vulkan_chip);
-            let mut profile = TargetProfile::vulkan(&arch);
-            profile.device_id = Some(id);
-            if !p.uri.is_empty() {
-                profile.device_uri = Some(p.uri.clone());
-            }
+            let arch = p.arch.clone().filter(|s| !s.is_empty());
+            let name = nonempty_name(
+                &p.name,
+                &arch
+                    .as_ref()
+                    .map(|arch| format!("vulkan-{arch}"))
+                    .unwrap_or_else(|| "vulkan-device".into()),
+            );
+            let profile = TargetProfile::vulkan(arch.as_deref().unwrap_or(""))
+                .with_device_identity(id, p.uri.clone(), name.clone())
+                .with_discovered_features(p.features)
+                .with_execution_limits(p.subgroup_size, p.max_workgroup_invocations);
             Some(DiscoveredDevice {
                 driver: "vulkan".into(),
                 device_id: id,
-                name: nonempty_name(&p.name, &format!("vulkan-{arch}")),
+                name,
                 uri: p.uri,
-                arch: Some(arch),
+                arch,
                 profile,
             })
         }
@@ -465,23 +542,26 @@ mod tests {
             vulkan.profile.device_uri.as_deref(),
             Some(vulkan.uri.as_str())
         );
+        assert!(vulkan.profile.is_compile_ready());
+        assert_eq!(vulkan.profile.vulkan_target(), Some("gfx1151"));
     }
 
     #[test]
-    fn resolves_explicit_specs() {
-        let p = TargetDiscovery::resolve("rocm").unwrap();
-        assert_eq!(p.driver, "hip");
-        assert_eq!(p.rocm_target(), Some(TargetProfile::DEFAULT_ROCM_TARGET));
+    fn parses_explicit_specs_without_inventing_architectures() {
+        let request = parse_gpu_request("rocm").unwrap();
+        assert_eq!(request.driver, "hip");
+        assert!(request.architecture.is_none());
 
-        let p = TargetDiscovery::resolve("hip:gfx1100").unwrap();
-        assert_eq!(p.rocm_target(), Some("gfx1100"));
+        let request = parse_gpu_request("hip:gfx1100").unwrap();
+        assert_eq!(request.architecture.as_deref(), Some("gfx1100"));
 
-        let p = TargetDiscovery::resolve("cuda:sm_90").unwrap();
-        assert_eq!(p.driver, "cuda");
-        assert_eq!(p.cuda_target(), Some("sm_90"));
+        let request = parse_gpu_request("cuda:sm_90").unwrap();
+        assert_eq!(request.driver, "cuda");
+        assert_eq!(request.architecture.as_deref(), Some("sm_90"));
 
         let p = TargetDiscovery::resolve("cpu").unwrap();
         assert_eq!(p.driver, "local-task");
+        assert!(p.is_compile_ready());
     }
 
     #[test]

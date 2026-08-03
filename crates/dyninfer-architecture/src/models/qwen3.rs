@@ -3,15 +3,14 @@
 //! GQA, independent `head_dim`, per-head Q/K RMSNorm, often tied embeddings.
 
 use crate::naming::{canonicalize_hf_family, tie_output_to_embed};
-use crate::ops::{DenseDecoderConfig, emit_dense_decoder_cfg};
 use crate::slots::field;
 use crate::{
-    ArchitectureDefinition, ArchitecturePackage, ConfigSchema, EmitOutput, ModelBuilder,
-    ModelModule, ResolvedModelConfig,
+    ArchitectureDefinition, ConfigSchema, DecoderBlockSpec, ModelBuilder, ModelModule,
+    ResolvedModelConfig,
 };
-use dyninfer_checkpoint::{CheckpointCatalog, ParameterCatalog};
+use dyninfer_checkpoint::ParameterCatalog;
 use dyninfer_core::ArchitectureId;
-use dyninfer_error::{CompilationError, DynInferError, Result};
+use dyninfer_error::Result;
 use std::sync::LazyLock;
 
 static CONFIG_SCHEMA: LazyLock<ConfigSchema> = LazyLock::new(|| ConfigSchema {
@@ -68,16 +67,33 @@ impl ArchitectureDefinition for Qwen3Architecture {
 
     fn build(&self, config: &ResolvedModelConfig, m: &mut ModelBuilder) -> Result<ModelModule> {
         let num_layers = config.num_layers()?;
-        let _hidden = config.get_u32("hidden_size")?;
-        let _vocab = config.get_u32("vocab_size")?;
+        let hidden = config.get_u32("hidden_size")?;
+        let vocab = config.get_u32("vocab_size")?;
+        let block = DecoderBlockSpec {
+            hidden_size: hidden,
+            intermediate_size: config.get_u32("intermediate_size")?,
+            num_heads: config.get_u32("num_heads")?,
+            num_kv_heads: config.get_u32("num_kv_heads")?,
+            head_dim: config.get_u32("head_dim")?,
+            rms_norm_epsilon: config.get_f64("rms_norm_eps")?,
+            rope_theta: config
+                .values
+                .get("rope_theta")
+                .and_then(|value| value.as_f64()),
+        };
 
         let tokens = m.input_tokens("tokens")?;
-        let mut x = m.embedding(tokens, "token_embd.weight")?;
+        let mut x = m.embedding("token_embedding", tokens, "token_embd.weight", hidden)?;
         for layer in 0..num_layers {
-            x = m.dense_block(x, layer, /*has_qk_norm=*/ true)?;
+            x = m.decoder_block(x, layer, /*has_qk_norm=*/ true, &block)?;
         }
-        x = m.rms_norm(x, "output_norm.weight")?;
-        let logits = m.linear(x, "output.weight")?;
+        x = m.final_rms_norm(
+            "output_norm",
+            x,
+            "output_norm.weight",
+            block.rms_norm_epsilon,
+        )?;
+        let logits = m.output_projection("output_projection", x, "output.weight", vocab)?;
         m.export_prefill_and_decode(logits)?;
         m.finish()
     }
@@ -88,27 +104,5 @@ impl ArchitectureDefinition for Qwen3Architecture {
 
     fn sanitize_catalog(&self, catalog: &mut ParameterCatalog) {
         tie_output_to_embed(catalog);
-    }
-
-    fn emit_executable(
-        &self,
-        package: &ArchitecturePackage,
-        catalog: &CheckpointCatalog,
-    ) -> Result<EmitOutput> {
-        let mut cfg = DenseDecoderConfig::from_package(package, catalog);
-        cfg.has_qk_norm = true;
-        if !cfg.supports_dense_emit() {
-            return Err(DynInferError::Compilation(CompilationError {
-                message: format!("qwen3.decoder cannot emit dense executable for {cfg:?}"),
-                pass: Some("emit".into()),
-                diagnostics: vec![],
-            }));
-        }
-        let mlir_text = emit_dense_decoder_cfg(package.id.as_str(), &cfg)?;
-        Ok(EmitOutput {
-            prefill_window: cfg.seq,
-            max_kv: cfg.max_kv,
-            mlir_text,
-        })
     }
 }

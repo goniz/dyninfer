@@ -7,22 +7,20 @@
 
 mod builder;
 mod config;
-mod emit;
 mod models;
 mod naming;
-mod ops;
 mod package;
 mod registry;
 mod remapping;
 mod slots;
 
-pub use builder::{ArchitectureDefinition, ModelBuilder, ModelModule, Value, verify_mlir};
-pub use config::{ConfigField, ConfigSchema, ResolvedModelConfig};
-pub use emit::EmitOutput;
-pub use models::{LlamaArchitecture, Qwen3Architecture};
-pub use ops::{
-    COMPUTE_DTYPE, DenseDecoderConfig, LARGE_PREFILL_WINDOW, PREFILL_WINDOW, TINY_PREFILL_WINDOW,
+pub use builder::{
+    ArchitectureDefinition, DecoderBlockSpec, ModelBuilder, ModelModule, Value,
+    verify_architecture_catalog_conformance, verify_architecture_conformance,
+    verify_architecture_graph,
 };
+pub use config::{ConfigField, ConfigSchema, ResolvedModelConfig};
+pub use models::{LlamaArchitecture, Qwen3Architecture};
 pub use package::ArchitecturePackage;
 pub use registry::ArchitectureRegistry;
 pub use remapping::{MODEL_REMAPPING, remap_model_type};

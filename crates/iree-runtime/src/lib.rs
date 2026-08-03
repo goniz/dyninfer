@@ -110,35 +110,106 @@ impl Drop for NativeSession {
 pub struct Context {
     _instance: Instance,
     module: Module,
-    parameters: Option<PathBuf>,
-    /// In-memory f32 parameter blobs (Vulkan bf16 promote). Kept alive for the
-    /// session; mutually exclusive with [`Self::parameters`]. Shared via [`Arc`]
-    /// so multiple sessions can reuse the same host weight staging.
-    host_parameters: Option<Arc<HostParameterStorage>>,
+    /// Explicit original-file/range descriptors, shared by independent
+    /// sessions without staging checkpoint payloads in host memory.
+    file_parameters: Option<Arc<FileParameterStorage>>,
     /// IREE HAL driver name or full device URI (`hip`, `vulkan://…`, …).
     /// Empty → local-task.
     device: Option<String>,
     session: Mutex<Option<NativeSession>>,
 }
 
-/// Owns CString keys + f32 LE bytes for `dyninfer_iree_session_create_with_host_params`.
-pub struct HostParameterStorage {
-    entries: Vec<(CString, Vec<u8>)>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileParameterDescriptor {
+    pub key: String,
+    pub source_file_index: usize,
+    pub offset: u64,
+    pub length: u64,
 }
 
-impl HostParameterStorage {
-    pub fn from_f32_entries(entries: Vec<(String, Vec<u8>)>) -> Result<Self> {
-        let mut out = Vec::with_capacity(entries.len());
-        for (key, data) in entries {
-            let ckey = CString::new(key.as_str()).map_err(|e| {
-                DynInferError::IreeRuntime(IreeRuntimeError {
-                    message: format!("invalid parameter key {key:?}: {e}"),
-                    status_code: None,
-                })
-            })?;
-            out.push((ckey, data));
+/// Owns descriptor strings passed to the direct IREE file-range provider.
+/// File payloads are never read by this type.
+#[derive(Debug)]
+pub struct FileParameterStorage {
+    files: Vec<CString>,
+    entries: Vec<(CString, usize, u64, u64)>,
+}
+
+impl FileParameterStorage {
+    pub fn new(files: Vec<PathBuf>, entries: Vec<FileParameterDescriptor>) -> Result<Self> {
+        if files.is_empty() || entries.is_empty() {
+            return Err(runtime_error(
+                "direct parameter files and entries must be non-empty",
+            ));
         }
-        Ok(Self { entries: out })
+        let mut file_sizes = Vec::with_capacity(files.len());
+        let mut c_files = Vec::with_capacity(files.len());
+        for path in files {
+            let metadata = std::fs::metadata(&path).map_err(|error| {
+                runtime_error(format!(
+                    "cannot stat direct parameter file {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if !metadata.is_file() {
+                return Err(runtime_error(format!(
+                    "direct parameter source is not a file: {}",
+                    path.display()
+                )));
+            }
+            file_sizes.push(metadata.len());
+            c_files.push(path_cstring(&path)?);
+        }
+
+        let mut keys = std::collections::BTreeMap::new();
+        for entry in entries {
+            if entry.length == 0 || entry.source_file_index >= c_files.len() {
+                return Err(runtime_error(format!(
+                    "invalid direct parameter descriptor `{}`",
+                    entry.key
+                )));
+            }
+            let end = entry.offset.checked_add(entry.length).ok_or_else(|| {
+                runtime_error(format!("parameter range overflows for `{}`", entry.key))
+            })?;
+            if end > file_sizes[entry.source_file_index] {
+                return Err(runtime_error(format!(
+                    "parameter `{}` range [{}, {end}) exceeds file size {}",
+                    entry.key, entry.offset, file_sizes[entry.source_file_index]
+                )));
+            }
+            let location = (entry.source_file_index, entry.offset, entry.length);
+            if let Some(existing) = keys.get(&entry.key) {
+                if existing != &location {
+                    return Err(runtime_error(format!(
+                        "direct parameter key `{}` maps to conflicting ranges",
+                        entry.key
+                    )));
+                }
+                continue;
+            }
+            keys.insert(entry.key, location);
+        }
+        let entries = keys
+            .into_iter()
+            .map(|(key, (source_file_index, offset, length))| {
+                CString::new(key)
+                    .map(|key| (key, source_file_index, offset, length))
+                    .map_err(|error| runtime_error(format!("invalid parameter key: {error}")))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            files: c_files,
+            entries,
+        })
+    }
+
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn file_count(&self) -> usize {
+        self.files.len()
     }
 }
 
@@ -147,31 +218,14 @@ impl Context {
         Ok(Self {
             _instance: instance,
             module,
-            parameters: None,
-            host_parameters: None,
+            file_parameters: None,
             device: None,
             session: Mutex::new(None),
         })
     }
 
-    pub fn with_parameters(mut self, path: impl AsRef<Path>) -> Self {
-        self.parameters = Some(path.as_ref().to_path_buf());
-        self.host_parameters = None;
-        self
-    }
-
-    /// Bind host-owned f32 parameter blobs (no parameter file). Used when the
-    /// VMFB expects promoted f32 weights.
-    pub fn with_host_parameters(mut self, storage: HostParameterStorage) -> Self {
-        self.host_parameters = Some(Arc::new(storage));
-        self.parameters = None;
-        self
-    }
-
-    /// Share an existing host parameter staging across contexts.
-    pub fn with_host_parameters_shared(mut self, storage: Arc<HostParameterStorage>) -> Self {
-        self.host_parameters = Some(storage);
-        self.parameters = None;
+    pub fn with_file_parameters(mut self, storage: Arc<FileParameterStorage>) -> Self {
+        self.file_parameters = Some(storage);
         self
     }
 
@@ -230,32 +284,42 @@ impl Context {
                 })?;
 
             let mut ptr = ptr::null_mut();
-            let rc = if let Some(host) = self.host_parameters.as_ref() {
-                let c_params: Vec<sys::dyninfer_iree_host_param_t> = host
+            let rc = if let Some(files) = self.file_parameters.as_ref() {
+                let c_files: Vec<sys::dyninfer_iree_parameter_file_t> = files
+                    .files
+                    .iter()
+                    .map(|path| sys::dyninfer_iree_parameter_file_t {
+                        path: path.as_ptr(),
+                    })
+                    .collect();
+                let c_params: Vec<sys::dyninfer_iree_file_param_t> = files
                     .entries
                     .iter()
-                    .map(|(key, data)| sys::dyninfer_iree_host_param_t {
-                        key: key.as_ptr(),
-                        data: data.as_ptr().cast(),
-                        length: data.len(),
+                    .map(|(key, source_file_index, offset, length)| {
+                        sys::dyninfer_iree_file_param_t {
+                            key: key.as_ptr(),
+                            source_file_index: *source_file_index,
+                            offset: *offset,
+                            length: *length,
+                        }
                     })
                     .collect();
                 unsafe {
-                    sys::dyninfer_iree_session_create_with_host_params(
+                    sys::dyninfer_iree_session_create_with_file_params(
                         device_c.as_ref().map(|c| c.as_ptr()).unwrap_or(ptr::null()),
                         vmfb_c.as_ptr(),
+                        c_files.as_ptr(),
+                        c_files.len(),
                         c_params.as_ptr(),
                         c_params.len(),
                         &mut ptr,
                     )
                 }
             } else {
-                let params_c = self.parameters.as_deref().map(path_cstring).transpose()?;
                 unsafe {
                     sys::dyninfer_iree_session_create(
                         device_c.as_ref().map(|c| c.as_ptr()).unwrap_or(ptr::null()),
                         vmfb_c.as_ptr(),
-                        params_c.as_ref().map(|c| c.as_ptr()).unwrap_or(ptr::null()),
                         &mut ptr,
                     )
                 }
@@ -362,11 +426,25 @@ pub fn causal_attn_bias(pos: i64, max_kv: usize) -> Vec<f32> {
 }
 
 fn path_cstring(path: &Path) -> Result<CString> {
-    CString::new(path.to_string_lossy().as_bytes()).map_err(|e| {
+    #[cfg(unix)]
+    let encoded = {
+        use std::os::unix::ffi::OsStrExt;
+        CString::new(path.as_os_str().as_bytes())
+    };
+    #[cfg(not(unix))]
+    let encoded = CString::new(path.to_string_lossy().into_owned());
+    encoded.map_err(|e| {
         DynInferError::IreeRuntime(IreeRuntimeError {
             message: format!("path contains NUL: {e}"),
             status_code: None,
         })
+    })
+}
+
+fn runtime_error(message: impl Into<String>) -> DynInferError {
+    DynInferError::IreeRuntime(IreeRuntimeError {
+        message: message.into(),
+        status_code: None,
     })
 }
 
@@ -402,4 +480,73 @@ fn take_f32_buf(rc: i32, out: *mut f32, count: usize) -> Result<Vec<f32>> {
     let values = unsafe { std::slice::from_raw_parts(out, count) }.to_vec();
     unsafe { sys::dyninfer_iree_free(out.cast()) };
     Ok(values)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_file_storage_coalesces_identical_aliases_and_rejects_conflicts() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        temp.as_file().set_len(64).unwrap();
+        let path = temp.path().to_path_buf();
+        let storage = FileParameterStorage::new(
+            vec![path.clone()],
+            vec![
+                FileParameterDescriptor {
+                    key: "shared".into(),
+                    source_file_index: 0,
+                    offset: 8,
+                    length: 16,
+                },
+                FileParameterDescriptor {
+                    key: "shared".into(),
+                    source_file_index: 0,
+                    offset: 8,
+                    length: 16,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(storage.file_count(), 1);
+        assert_eq!(storage.entry_count(), 1);
+
+        let conflict = FileParameterStorage::new(
+            vec![path],
+            vec![
+                FileParameterDescriptor {
+                    key: "shared".into(),
+                    source_file_index: 0,
+                    offset: 8,
+                    length: 16,
+                },
+                FileParameterDescriptor {
+                    key: "shared".into(),
+                    source_file_index: 0,
+                    offset: 16,
+                    length: 16,
+                },
+            ],
+        )
+        .unwrap_err();
+        assert!(conflict.to_string().contains("conflicting ranges"));
+    }
+
+    #[test]
+    fn direct_file_storage_rejects_out_of_bounds_range() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        temp.as_file().set_len(16).unwrap();
+        let error = FileParameterStorage::new(
+            vec![temp.path().to_path_buf()],
+            vec![FileParameterDescriptor {
+                key: "too-large".into(),
+                source_file_index: 0,
+                offset: 8,
+                length: 16,
+            }],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("exceeds file size"));
+    }
 }

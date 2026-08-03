@@ -10,6 +10,7 @@ members = [
   "crates/dyninfer-architecture",
   "crates/dyninfer-binding",
   "crates/dyninfer-kernel-registry",
+  "crates/dyninfer-quantization",
   "crates/dyninfer-target",
   "crates/dyninfer-cache",
   "crates/dyninfer-compiler-sys",
@@ -60,6 +61,7 @@ dyninfer-checkpoint-npz = { path = "crates/dyninfer-checkpoint-npz" }
 dyninfer-architecture = { path = "crates/dyninfer-architecture" }
 dyninfer-binding = { path = "crates/dyninfer-binding" }
 dyninfer-kernel-registry = { path = "crates/dyninfer-kernel-registry" }
+dyninfer-quantization = { path = "crates/dyninfer-quantization" }
 dyninfer-target = { path = "crates/dyninfer-target" }
 dyninfer-cache = { path = "crates/dyninfer-cache" }
 dyninfer-compiler-sys = { path = "crates/dyninfer-compiler-sys" }

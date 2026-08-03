@@ -5,7 +5,8 @@ Checkpoint-specializing compiler and local inference runtime.
 The engine accepts a model architecture package, an unmodified checkpoint
 (SafeTensors / GGUF initially), and a target profile, then produces an IREE
 VM FlatBuffer (`.vmfb`) that resolves parameters from the original checkpoint
-or an optional derived parameter cache.
+through exact file-backed byte ranges. Bundles and caches never contain weight
+copies or repacked parameters.
 
 ```text
 Architecture IR
@@ -16,11 +17,15 @@ Architecture IR
 
 ## Status
 
-Implementation is tracking [`spec.md`](spec.md). **Milestone 1 (dense Llama PoC) is in:**
+Implementation is tracking [`spec.md`](spec.md). The shared dense pipeline is in:
 
 - Full Cargo workspace (`dyninfer` CLI + 18 crates)
-- SafeTensors + GGUF metadata indexing and convention decoding
-- Llama architecture slots, binder, target discovery, artifact cache
+- Dense/sharded/MLX SafeTensors and mixed per-tensor GGUF schema decoding
+- Direct Qwen3 inference for dense, MLX affine U4, and mixed
+  GGUF Q4_0/Q4_1/Q8_0/Q6_K weights on CPU, HIP, and Vulkan
+- Typed Llama/Qwen3 Architecture IR and Bound Model IR
+- Strict per-operation kernel coverage and exact local-target specialization
+- Direct multi-file/component IREE parameter descriptors over original files
 - Real tiny-Llama MLIR (external IREE params from SafeTensors) + Rust reference e2e
 - In-process IREE compile via bindgen + `libIREECompiler` (`//crates/iree-compiler-sys`)
 - Tool-backed run via Bazel-fetched `iree-run-module` (`//bazel/iree:tools`)
@@ -52,26 +57,34 @@ bazel run //crates/dyninfer-cli:dyninfer -- generate \
   --max-new-tokens 16
 ```
 
-### Qwen3-0.6B Q4_0 GGUF (device-fused qkernel)
+### Qwen3 quantized checkpoints
 
-Prefer a pure Q4_0 file. Good source:
-[`ggml-org/Qwen3-0.6B-GGUF`](https://huggingface.co/ggml-org/Qwen3-0.6B-GGUF)
-(`Qwen3-0.6B-Q4_0.gguf`). Pair with tokenizer/config from `Qwen/Qwen3-0.6B`.
+GGUF and MLX checkpoints are decoded per tensor. Inspection support does not
+imply executable support: compilation rejects the whole model when any
+operation/encoding/local-target combination lacks a qualified production
+kernel. Q4_0, Q4_1, Q8_0, and Q6_K have direct kernels, and the popular
+`Qwen3-0.6B-Q4_0.gguf` from
+`unsloth/Qwen3-0.6B-GGUF` is executable today: its Q4_0, Q4_1, and Q6_K
+tensors are selected independently and consumed directly on CPU, HIP, and
+Vulkan. UD-Q4_K_XL and UD-IQ1_S are parsed as mixed per-tensor schemas but
+remain intentionally rejected until kernels exist for every IQ/K encoding
+they use. MLX affine U4 SafeTensors are executable on the same three backends.
 
 ```bash
-hf download ggml-org/Qwen3-0.6B-GGUF Qwen3-0.6B-Q4_0.gguf --local-dir /tmp/qwen3-q4
-hf download Qwen/Qwen3-0.6B config.json tokenizer.json tokenizer_config.json \
-  vocab.json merges.txt --local-dir /tmp/qwen3-q4
+hf download unsloth/Qwen3-0.6B-GGUF Qwen3-0.6B-Q4_0.gguf \
+  --local-dir /tmp/qwen3-q4
 
-bazel run //crates/dyninfer-cli:dyninfer -- generate \
-  --model-dir /tmp/qwen3-q4 \
+bazel run //crates/dyninfer-cli:dyninfer -- coverage \
   --checkpoint /tmp/qwen3-q4/Qwen3-0.6B-Q4_0.gguf \
   --architecture qwen3.decoder \
-  --prefill-window 8 --max-kv 16 \
-  --prompt "Hello" --max-new-tokens 8 --target cpu
+  --target cpu --json
 ```
 
-(`unsloth/Qwen3-0.6B-GGUF` Q4_0 mixes Q4_1 / Q6_K and is not supported yet.)
+Use `--target rocm` or `--target vulkan` for the locally discovered GPU.
+Target selection never falls back to CPU. See
+[`docs/quantization/gguf-q4.md`](docs/quantization/gguf-q4.md) and
+[`docs/quantization/mlx-affine-u4.md`](docs/quantization/mlx-affine-u4.md)
+for the exact executable matrix and qualification notes.
 
 ### TinyStories Llama example
 
@@ -112,7 +125,7 @@ dyninfer checkpoint inspect model.gguf --json
 dyninfer bind --checkpoint model.safetensors --output binding.json   # auto arch
 dyninfer compile --checkpoint model.safetensors --target auto --output model.bundle
 dyninfer smoke                        # --target auto probes IREE (cuda/hip ≻ vulkan ≻ cpu)
-dyninfer smoke --target rocm          # force HIP; chip from probe default gfx1151 / DYNINFER_ROCM_TARGET
+dyninfer smoke --target rocm          # force the locally detected HIP device; no guessed chip
 dyninfer generate --hf ORG/NAME --prompt "Hello"
 dyninfer run --bundle model.bundle --checkpoint model.safetensors --prompt "Hello"
 dyninfer cache list

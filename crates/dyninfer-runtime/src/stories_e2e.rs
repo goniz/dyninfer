@@ -56,7 +56,7 @@ mod tests {
         );
         assert_eq!(
             plan.bindings.len() + plan.unresolved_optional_slots.len(),
-            package.parameter_slots.len()
+            package.parameter_slots().len()
         );
         assert!(
             catalog

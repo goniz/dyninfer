@@ -1,6 +1,6 @@
 use crate::builder::ModelModule;
 use crate::config::ResolvedModelConfig;
-use dyninfer_core::{ArchitectureId, ParameterSlot};
+use dyninfer_core::{ArchitectureGraph, ArchitectureId, ParameterSlot};
 use dyninfer_error::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -9,8 +9,7 @@ use std::path::Path;
 pub struct ArchitecturePackage {
     pub id: ArchitectureId,
     pub revision: String,
-    pub mlir_text: String,
-    pub parameter_slots: Vec<ParameterSlot>,
+    pub graph: ArchitectureGraph,
     pub resolved_config: ResolvedModelConfig,
 }
 
@@ -21,12 +20,15 @@ impl ArchitecturePackage {
         revision: String,
     ) -> Self {
         Self {
-            id: module.architecture_id,
+            id: module.graph.architecture_id.clone(),
             revision,
-            mlir_text: module.mlir_text,
-            parameter_slots: module.parameter_slots,
+            graph: module.graph,
             resolved_config,
         }
+    }
+
+    pub fn parameter_slots(&self) -> &[ParameterSlot] {
+        &self.graph.parameter_slots
     }
 
     pub fn write_json(&self, path: impl AsRef<Path>) -> Result<()> {

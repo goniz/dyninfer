@@ -27,7 +27,12 @@ impl CheckpointConventionDecoder for DenseSafetensorsConvention {
         index: &RawCheckpointIndex,
         _context: &DecodeContext,
     ) -> Result<MatchScore> {
-        if index.container.format_id.as_str() != "safetensors" {
+        if !index
+            .container
+            .format_id
+            .as_str()
+            .starts_with("safetensors")
+        {
             return Ok(MatchScore::NONE);
         }
         let dense_count = index
@@ -100,6 +105,7 @@ impl CheckpointConventionDecoder for DenseSafetensorsConvention {
                 components: vec![StorageComponent {
                     name: "data".into(),
                     key: entry.key.clone(),
+                    source_file_index: entry.source_file_index,
                     shape,
                     storage_type: entry.storage_type.clone(),
                     byte_ranges: entry.byte_ranges.clone(),

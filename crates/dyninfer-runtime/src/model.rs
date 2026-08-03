@@ -5,18 +5,20 @@ use dyninfer_binding::Binder;
 use dyninfer_cache::{ArtifactCache, CacheKeyInputs, make_cache_key};
 use dyninfer_checkpoint::{
     BuiltinCheckpointSupport, CheckpointCatalog, DecodeContext, InspectionLimits,
+    build_runtime_provider_plan,
 };
 use dyninfer_compiler::{
     COMPILER_VERSION, CompileOptions, CompileRequest, IREE_REVISION, KERNEL_REGISTRY_VERSION,
-    LocalCompiler, ModelCompiler,
+    LocalCompiler, ModelCompiler, build_bound_model, default_shape_profile,
 };
 use dyninfer_core::{
-    ArchitectureId, BindingPlan, ExecutableManifest, ModelMetadata, SessionConfig, ShapeProfile,
-    content_digest,
+    ArchitectureId, BindingPlan, ExecutableManifest, ModelMetadata, PrecisionPolicy, SessionConfig,
+    ShapeProfile, content_digest,
 };
 use dyninfer_error::{CacheError, DynInferError, Result};
+use dyninfer_quantization::{CoverageReport, dry_run_coverage};
 use dyninfer_target::TargetDiscovery;
-use iree_runtime::{Context, HostParameterStorage, Instance, Module};
+use iree_runtime::{Context, FileParameterDescriptor, FileParameterStorage, Instance, Module};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -33,8 +35,7 @@ pub struct BundlePaths {
 
 /// Immutable ingredients needed to open an independent IREE context (own KV).
 enum RuntimeParameters {
-    File(PathBuf),
-    Host(Arc<HostParameterStorage>),
+    Direct(Arc<FileParameterStorage>),
 }
 
 struct ExecutableHandle {
@@ -50,8 +51,9 @@ impl ExecutableHandle {
         let module = Module::from_path(&self.vmfb_path)?;
         let mut context = Context::create(instance, module)?;
         context = match &self.parameters {
-            RuntimeParameters::File(path) => context.with_parameters(path),
-            RuntimeParameters::Host(host) => context.with_host_parameters_shared(Arc::clone(host)),
+            RuntimeParameters::Direct(parameters) => {
+                context.with_file_parameters(Arc::clone(parameters))
+            }
         };
         if let Some(device) = &self.device {
             context = context.with_device(device.clone());
@@ -155,6 +157,30 @@ impl ModelLoader {
         Ok((package, catalog, plan))
     }
 
+    /// Resolve and validate production kernel coverage without emitting MLIR.
+    pub fn kernel_coverage(
+        &self,
+        architecture_id: &ArchitectureId,
+        checkpoint: impl AsRef<Path>,
+        target_spec: &str,
+        overrides: &dyninfer_core::MetadataMap,
+    ) -> Result<CoverageReport> {
+        let target = TargetDiscovery::resolve(target_spec)?;
+        let (package, catalog, binding) =
+            self.bind(architecture_id, checkpoint.as_ref(), overrides)?;
+        let encodings = crate::default_quantization_registry()?;
+        let kernels = crate::default_kernel_registry(&encodings)?;
+        Ok(dry_run_coverage(
+            &package.graph,
+            &catalog.parameters,
+            &binding,
+            &encodings,
+            &kernels,
+            &target,
+            &dyninfer_core::PrecisionPolicy::default(),
+        ))
+    }
+
     pub fn compile_to_bundle(
         &self,
         architecture_id: &ArchitectureId,
@@ -185,14 +211,40 @@ impl ModelLoader {
         let target = TargetDiscovery::resolve(target_spec)?;
         let (package, catalog, plan) =
             self.bind(architecture_id, checkpoint.as_ref(), overrides)?;
-        let shape = ShapeProfile::default();
-
-        let emit = self
-            .architectures
-            .emit_executable(architecture_id, &package, &catalog)?;
+        let shape = default_shape_profile(&package);
+        let precision_policy = PrecisionPolicy::default();
+        let encodings = crate::default_quantization_registry()?;
+        let kernels = crate::default_kernel_registry(&encodings)?;
+        let coverage = dry_run_coverage(
+            &package.graph,
+            &catalog.parameters,
+            &plan,
+            &encodings,
+            &kernels,
+            &target,
+            &precision_policy,
+        );
+        coverage.require_complete()?;
+        let selected_kernels = coverage.selected_kernels();
+        let bound_model = build_bound_model(
+            &package,
+            &plan,
+            &target,
+            &precision_policy,
+            selected_kernels,
+            &shape,
+        )?;
 
         if let Some(cache) = &self.cache {
-            let key = cache_key_for(&package, &catalog, &plan, &target, &shape, options)?;
+            let key = cache_key_for(
+                &package,
+                &catalog,
+                &plan,
+                &target,
+                &precision_policy,
+                &shape,
+                options,
+            )?;
             if let Some(hit) = cache.lookup(&key)? {
                 return self.materialize_bundle_from_cache(
                     &hit.vmfb_path,
@@ -205,19 +257,23 @@ impl ModelLoader {
 
         let compiler = LocalCompiler::new(options)?;
         let output_compile = compiler.compile(&CompileRequest {
-            architecture: &package,
-            checkpoint: &catalog,
-            binding: &plan,
-            target: &target,
+            bound_model: &bound_model,
+            architecture_revision: &package.revision,
+            checkpoint_schema: &catalog.schema_fingerprint,
             shape_profile: &shape,
             options,
-            mlir_text: &emit.mlir_text,
-            prefill_window: emit.prefill_window,
-            max_kv: emit.max_kv.max(emit.prefill_window),
         })?;
 
         if let Some(cache) = &self.cache {
-            let key = cache_key_for(&package, &catalog, &plan, &target, &shape, options)?;
+            let key = cache_key_for(
+                &package,
+                &catalog,
+                &plan,
+                &target,
+                &precision_policy,
+                &shape,
+                options,
+            )?;
             cache.publish(
                 &key,
                 &output_compile.executable.bytes,
@@ -256,38 +312,80 @@ impl ModelLoader {
                 path: Some(bundle.display().to_string()),
             }));
         }
+        let local_target = TargetDiscovery::resolve(manifest.target.runtime_device())?;
+        if local_target.capability_fingerprint != manifest.target.capability_fingerprint {
+            return Err(DynInferError::Cache(CacheError {
+                message: format!(
+                    "bundle target fingerprint does not match the currently discovered device `{}`",
+                    manifest.target.runtime_device()
+                ),
+                digest: Some(manifest.target.capability_fingerprint.to_string()),
+                path: Some(bundle.display().to_string()),
+            }));
+        }
 
         let _span = info_span!("parameters.open").entered();
-        let is_gguf = catalog.container.format_id.as_str() == "gguf"
-            || catalog.convention_id.as_str().starts_with("gguf");
-        let has_q4 = catalog
+        if manifest.derived_parameters_required {
+            return Err(DynInferError::Cache(CacheError {
+                message: "bundle requests forbidden derived parameters".into(),
+                digest: Some(manifest.checkpoint_schema.digest.to_string()),
+                path: Some(bundle.display().to_string()),
+            }));
+        }
+        let provider_plan = build_runtime_provider_plan(&catalog, &binding)?;
+        let expected_components: std::collections::BTreeMap<_, _> = manifest
+            .parameter_components
+            .iter()
+            .map(|component| {
+                (
+                    (component.scope.as_str(), component.key.as_str()),
+                    component.byte_length,
+                )
+            })
+            .collect();
+        let actual_components: std::collections::BTreeMap<_, _> = provider_plan
             .parameters
             .iter()
-            .any(|p| matches!(&p.encoding, dyninfer_core::PhysicalEncoding::BlockQuantized { codec, .. } if codec.as_str() == "gguf.q4_0"));
-
-        let (parameters, device) =
-            if needs_host_f32_params(&manifest.target.driver) || is_gguf || has_q4 {
-                // Vulkan promote, GGUF dense, and Q4: bind host blobs.
-                // Q4 layer weights stay packed; embd/output are host-dequantized.
-                let host_entries = if is_gguf || has_q4 {
-                    dyninfer_checkpoint_gguf::decode_parameters_as_host(&catalog)?
-                } else {
-                    dyninfer_checkpoint_safetensors::decode_parameters_as_f32_host(&catalog)?
-                        .entries
-                };
-                let storage = HostParameterStorage::from_f32_entries(host_entries)?;
+            .map(|parameter| {
                 (
-                    RuntimeParameters::Host(Arc::new(storage)),
-                    Some(manifest.target.runtime_device().to_string()),
+                    (
+                        provider_plan.scope.as_str(),
+                        parameter.external_key.as_str(),
+                    ),
+                    parameter.length,
                 )
-            } else {
-                let params_path =
-                    dyninfer_checkpoint_safetensors::resolve_runtime_parameters(&catalog)?;
-                (
-                    RuntimeParameters::File(params_path),
-                    Some(manifest.target.runtime_device().to_string()),
-                )
-            };
+            })
+            .collect();
+        if expected_components != actual_components {
+            return Err(DynInferError::Cache(CacheError {
+                message: "checkpoint component keys or lengths do not match bundle manifest".into(),
+                digest: Some(manifest.checkpoint_schema.digest.to_string()),
+                path: Some(bundle.display().to_string()),
+            }));
+        }
+        let mut descriptors = Vec::new();
+        for parameter in &provider_plan.parameters {
+            descriptors.push(FileParameterDescriptor {
+                key: parameter.external_key.clone(),
+                source_file_index: parameter.source_file_index as usize,
+                offset: parameter.offset,
+                length: parameter.length,
+            });
+            descriptors.extend(
+                parameter
+                    .aliases
+                    .iter()
+                    .map(|alias| FileParameterDescriptor {
+                        key: alias.clone(),
+                        source_file_index: parameter.source_file_index as usize,
+                        offset: parameter.offset,
+                        length: parameter.length,
+                    }),
+            );
+        }
+        let storage = FileParameterStorage::new(provider_plan.file_paths.clone(), descriptors)?;
+        let parameters = RuntimeParameters::Direct(Arc::new(storage));
+        let device = Some(manifest.target.runtime_device().to_string());
 
         // Eagerly validate that the VMFB + parameters can open; discard the
         // probe context so create_session still gets an independent KV.
@@ -408,27 +506,18 @@ impl ModelLoader {
     }
 }
 
-/// Vulkan VMFBs are compiled with `--iree-input-promote-bf16-to-f32`, so
-/// parameter blobs must be host-expanded f32 (checkpoint file stays bf16).
-fn needs_host_f32_params(driver: &str) -> bool {
-    matches!(driver, "vulkan")
-}
-
 fn cache_key_for(
     package: &ArchitecturePackage,
     catalog: &CheckpointCatalog,
     plan: &BindingPlan,
     target: &dyninfer_core::TargetProfile,
+    precision_policy: &PrecisionPolicy,
     shape: &ShapeProfile,
     options: &CompileOptions,
 ) -> Result<dyninfer_cache::CacheKey> {
-    // Architecture IR + slots digest (mlir_text may be empty sketch; slots matter).
-    let architecture_digest = content_digest(&(
-        &package.id,
-        &package.revision,
-        &package.mlir_text,
-        &package.parameter_slots,
-    ))?;
+    // Typed Architecture IR digest. Checkpoint bindings and weight values are
+    // deliberately separate cache-key inputs.
+    let architecture_digest = content_digest(&(&package.id, &package.revision, &package.graph))?;
     let resolved_config_digest = content_digest(&package.resolved_config)?;
     let compile_options_digest = content_digest(options)?;
     make_cache_key(&CacheKeyInputs {
@@ -439,6 +528,7 @@ fn cache_key_for(
         binding: plan,
         checkpoint_schema: catalog.schema_fingerprint.digest.as_str(),
         target,
+        precision_policy,
         shape_profile: shape,
         kernel_registry_version: KERNEL_REGISTRY_VERSION,
         compiler_version: COMPILER_VERSION,

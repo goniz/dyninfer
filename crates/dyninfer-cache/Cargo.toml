@@ -1,6 +1,6 @@
 [package]
 name = "dyninfer-cache"
-description = "Content-addressed executable and derived parameter cache"
+description = "Content-addressed specialized executable cache"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

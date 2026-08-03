@@ -5,8 +5,8 @@
 //! Q/K RMSNorm, and HuggingFace Llama/Qwen-style (`rotate_half`) RoPE.
 //!
 //! Weight globals always use the per-tensor dtype from the checkpoint catalog.
-//! Activations / logits use [`COMPUTE_DTYPE`] (currently f32); narrower float
-//! weights are cast after load.
+//! Activation and accumulator types come from the selected kernel records;
+//! narrower float weights are converted explicitly at operation boundaries.
 //!
 //! # Prefill / KV sizes
 //!
@@ -24,10 +24,13 @@
 //! melior bindings, **not** a zml-like tensor DSL. Follow-up is higher-level
 //! helpers (`attn`, `rope`, …), not switching IR frontends.
 
-use crate::ArchitecturePackage;
-use crate::ops::{kernels, qkernel};
-use dyninfer_checkpoint::CheckpointCatalog;
-use dyninfer_core::{PhysicalEncoding, ScalarType, StorageElementType};
+use super::{
+    kernels,
+    parameter::{ParameterLowerings, default_parameter_lowerings},
+};
+use dyninfer_core::{
+    BoundModel, ExecutionMode, OperationKind, ParameterBinding, ScalarType, StorageElementType,
+};
 use dyninfer_error::Result;
 use dyninfer_mlir::{FuncBuilder, ModuleBuilder};
 use std::collections::BTreeMap;
@@ -45,13 +48,6 @@ pub const LARGE_MAX_KV: u32 = 256;
 /// Matches [`TINY_PREFILL_WINDOW`]: decode-at-last fills a dense softmax domain.
 /// Larger models pass a host `attn_bias` for padded KV slots.
 pub const TINY_MAX_KV: u32 = 4;
-
-/// Activation / logits compute type. Independent of on-disk weight dtypes.
-///
-/// Fixed to f32 for Milestone-1 correctness (matches the Rust reference path).
-/// bf16/fp16 compute is a follow-up gated on target HAL support — not a
-/// checkpoint property.
-pub const COMPUTE_DTYPE: ScalarType = ScalarType::F32;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DenseDecoderConfig {
@@ -74,10 +70,17 @@ pub struct DenseDecoderConfig {
     pub param_keys: BTreeMap<String, String>,
     /// Canonical slot name → on-disk scalar dtype from the checkpoint catalog.
     pub param_dtypes: BTreeMap<String, ScalarType>,
-    /// Canonical slot name → physical encoding (plain vs gguf.q4_0).
-    pub param_encodings: BTreeMap<String, PhysicalEncoding>,
-    /// Canonical slot name → packed storage bytes (Q4_0).
-    pub param_nbytes: BTreeMap<String, u64>,
+    /// Canonical slot name → selected operation-local activation dtype.
+    pub param_compute_dtypes: BTreeMap<String, ScalarType>,
+    /// Complete bound parameter/component descriptors for encoding-specific
+    /// compiler-owned lowerings.
+    pub param_bindings: BTreeMap<String, ParameterBinding>,
+    /// Canonical slot + mode → lowering selected by strict coverage.
+    pub param_lowerings: BTreeMap<(String, ExecutionMode), String>,
+    /// Vulkan SPIR-V in the pinned IREE revision cannot legalize BF16/F16
+    /// widening when it is fused into a contraction. Keep that conversion in
+    /// its own device dispatch; other backends retain the fused path.
+    pub separate_storage_casts: bool,
 }
 
 impl DenseDecoderConfig {
@@ -93,15 +96,11 @@ impl DenseDecoderConfig {
         self.num_heads / self.num_kv_heads.max(1)
     }
 
-    pub fn from_package(package: &ArchitecturePackage, catalog: &CheckpointCatalog) -> Self {
-        let cfg = &package.resolved_config;
-        let meta = &catalog.metadata;
+    pub fn from_bound_model(bound: &BoundModel) -> Self {
+        let cfg = &bound.resolved_config;
         let u = |keys: &[&str], default: u32| -> u32 {
             for k in keys {
-                if let Some(v) = cfg.values.get(*k).and_then(|v| v.as_u64()) {
-                    return v as u32;
-                }
-                if let Some(v) = meta.get(*k).and_then(|v| v.as_u64()) {
+                if let Some(v) = cfg.get(*k).and_then(|v| v.as_u64()) {
                     return v as u32;
                 }
             }
@@ -109,10 +108,7 @@ impl DenseDecoderConfig {
         };
         let f = |keys: &[&str], default: f32| -> f32 {
             for k in keys {
-                if let Some(v) = cfg.values.get(*k).and_then(|v| v.as_f64()) {
-                    return v as f32;
-                }
-                if let Some(v) = meta.get(*k).and_then(|v| v.as_f64()) {
+                if let Some(v) = cfg.get(*k).and_then(|v| v.as_f64()) {
                     return v as f32;
                 }
             }
@@ -135,53 +131,64 @@ impl DenseDecoderConfig {
             1,
         );
         let head_dim = u(&["head_dim"], hidden / num_heads.max(1));
-        // Heuristic buckets when the caller did not pass explicit shapes.
-        // Values are intentionally small for PoC compile times.
         let is_synthetic = vocab == 32 && hidden == 64 && num_heads == 4;
-        let is_large = vocab > 50_000 || num_layers > 16 || hidden >= 1024;
-        let (default_seq, default_max_kv) = if is_synthetic {
-            (TINY_PREFILL_WINDOW, TINY_MAX_KV)
-        } else if is_large {
-            (LARGE_PREFILL_WINDOW, LARGE_MAX_KV)
-        } else {
-            (PREFILL_WINDOW, PREFILL_MAX_KV)
-        };
-        // Explicit overrides win (CLI `--prefill-window` / `--set prefill_window=`).
-        let seq = u(&["prefill_window"], default_seq);
-        let max_kv = u(&["max_kv"], default_max_kv);
-        let rope_theta = cfg
-            .values
-            .get("rope_theta")
-            .and_then(|v| v.as_f64())
-            .or_else(|| meta.get("rope_theta").and_then(|v| v.as_f64()))
-            .map(|v| v as f32);
-        let has_qk_norm = catalog
-            .parameters
+        let seq = bound
+            .execution_shapes
             .iter()
-            .any(|p| p.canonical_name.as_str().contains("attn_q_norm.weight"));
+            .find(|shape| shape.mode == ExecutionMode::Prefill)
+            .map(|shape| shape.sequence_length)
+            .unwrap_or(1);
+        let max_kv = bound
+            .execution_shapes
+            .iter()
+            .map(|shape| shape.max_kv_length)
+            .max()
+            .unwrap_or(seq);
+        let rope_theta = bound
+            .architecture
+            .operations
+            .iter()
+            .find_map(|operation| match operation.kind {
+                OperationKind::Rope { theta, .. } => Some(theta as f32),
+                _ => None,
+            });
+        let has_qk_norm = bound
+            .architecture
+            .operations
+            .iter()
+            .any(|operation| matches!(operation.kind, OperationKind::PerHeadRmsNorm { .. }));
         let mut param_keys = BTreeMap::new();
         let mut param_dtypes = BTreeMap::new();
-        let mut param_encodings = BTreeMap::new();
-        let mut param_nbytes = BTreeMap::new();
-        for p in &catalog.parameters {
+        let mut param_compute_dtypes = BTreeMap::new();
+        let mut param_bindings = BTreeMap::new();
+        let mut param_lowerings = BTreeMap::new();
+        for p in &bound.binding.bindings {
             let key = p
                 .components
                 .first()
-                .map(|c| c.key.clone())
+                .map(|c| c.external_key.clone())
                 .unwrap_or_else(|| p.canonical_name.to_string());
             param_keys.insert(p.canonical_name.to_string(), key);
-            param_encodings.insert(p.canonical_name.to_string(), p.encoding.clone());
-            if let Some(ty) = catalog_param_dtype(p) {
+            if let Some(ty) = bound_param_dtype(p) {
                 param_dtypes.insert(p.canonical_name.to_string(), ty);
             }
-            let nbytes = p
-                .components
-                .iter()
-                .flat_map(|c| c.byte_ranges.iter())
-                .map(|r| r.length)
-                .fold(0u64, |a, b| a.saturating_add(b));
-            if nbytes > 0 {
-                param_nbytes.insert(p.canonical_name.to_string(), nbytes);
+            param_bindings.insert(p.canonical_name.to_string(), p.clone());
+        }
+        for selected in &bound.selected_kernels {
+            for slot in &selected.parameter_slots {
+                if let Some(binding) = bound
+                    .binding
+                    .bindings
+                    .iter()
+                    .find(|binding| &binding.slot_id == slot)
+                {
+                    param_compute_dtypes
+                        .insert(binding.canonical_name.to_string(), selected.activation_type);
+                    param_lowerings.insert(
+                        (binding.canonical_name.to_string(), selected.mode),
+                        selected.lowering_id.to_string(),
+                    );
+                }
             }
         }
         Self {
@@ -201,7 +208,7 @@ impl DenseDecoderConfig {
                 &["rms_norm_eps", "llama.attention.layer_norm_rms_epsilon"],
                 1e-5,
             ),
-            // `rope_theta <= 0` in metadata/overrides disables RoPE (bisect / ablations).
+            // The typed graph decides whether RoPE exists and carries theta.
             rope_theta: if is_synthetic {
                 None
             } else if rope_theta.is_some_and(|t| t <= 0.0) {
@@ -212,12 +219,14 @@ impl DenseDecoderConfig {
             has_qk_norm,
             param_keys,
             param_dtypes,
-            param_encodings,
-            param_nbytes,
+            param_compute_dtypes,
+            param_bindings,
+            param_lowerings,
+            separate_storage_casts: bound.target.driver == "vulkan",
         }
     }
 
-    fn param_key(&self, canonical: &str) -> String {
+    pub(super) fn param_key(&self, canonical: &str) -> String {
         self.param_keys
             .get(canonical)
             .cloned()
@@ -226,42 +235,28 @@ impl DenseDecoderConfig {
 
     /// On-disk dtype for a parameter. Always sourced from the checkpoint catalog
     /// when present; synthetic fixtures without catalog entries default to f32.
-    fn param_dtype(&self, canonical: &str) -> ScalarType {
+    pub(super) fn param_dtype(&self, canonical: &str) -> ScalarType {
         self.param_dtypes
             .get(canonical)
             .copied()
             .unwrap_or(ScalarType::F32)
     }
 
-    fn param_is_q4_0(&self, canonical: &str) -> bool {
-        self.param_encodings.get(canonical).is_some_and(|e| {
-            matches!(
-                e,
-                PhysicalEncoding::BlockQuantized { codec, .. } if codec.as_str() == "gguf.q4_0"
-            )
-        })
+    pub(super) fn param_compute_dtype(&self, canonical: &str) -> ScalarType {
+        self.param_compute_dtypes
+            .get(canonical)
+            .copied()
+            .unwrap_or(ScalarType::F32)
     }
 
-    /// Q4 matrices used by matmul bind as packed i8 and use fused unpack+dot.
-    /// Embedding / lm_head tables stay host-dequantized f32 so gather and the
-    /// huge vocab projection remain dense (device path targets layer linears).
-    fn param_device_q4(&self, canonical: &str) -> bool {
-        self.param_is_q4_0(canonical)
-            && canonical != "token_embd.weight"
-            && canonical != "output.weight"
+    pub(super) fn param_binding(&self, canonical: &str) -> Option<&ParameterBinding> {
+        self.param_bindings.get(canonical)
     }
 
-    fn has_device_q4(&self) -> bool {
-        self.param_encodings
-            .keys()
-            .any(|k| self.param_device_q4(k))
-    }
-
-    fn param_packed_nbytes(&self, canonical: &str, rows: u32, cols: u32) -> u32 {
-        if let Some(&n) = self.param_nbytes.get(canonical) {
-            return n as u32;
-        }
-        qkernel::q4_0_packed_len(rows, cols)
+    pub(super) fn param_lowering(&self, canonical: &str, mode: ExecutionMode) -> Option<&str> {
+        self.param_lowerings
+            .get(&(canonical.to_string(), mode))
+            .map(String::as_str)
     }
 
     /// True for the synthetic Milestone-1 fixture (`tiny_llama_dense_f32`):
@@ -329,7 +324,7 @@ pub fn build_dense_decoder(
     Ok(())
 }
 
-fn catalog_param_dtype(param: &dyninfer_checkpoint::LogicalParameter) -> Option<ScalarType> {
+fn bound_param_dtype(param: &dyninfer_core::ParameterBinding) -> Option<ScalarType> {
     let comp = param.components.first()?;
     match &comp.storage_type {
         StorageElementType::Scalar { ty } => Some(*ty),
@@ -337,43 +332,18 @@ fn catalog_param_dtype(param: &dyninfer_checkpoint::LogicalParameter) -> Option<
     }
 }
 
-fn mlir_ty(ty: ScalarType) -> String {
-    ty.to_string()
-}
-
-fn parse_matrix_shape(shape: &str) -> (u32, u32) {
-    let (rows, cols) = shape
-        .split_once('x')
-        .unwrap_or_else(|| panic!("expected RxC shape, got {shape}"));
-    (
-        rows.parse().unwrap_or_else(|_| panic!("bad rows in {shape}")),
-        cols.parse().unwrap_or_else(|_| panic!("bad cols in {shape}")),
-    )
-}
-
 fn emit_global(
     builder: &mut ModuleBuilder,
     c: &DenseDecoderConfig,
+    _parameters: &ParameterLowerings,
     sym: &str,
     canonical: &str,
     shape: &str,
 ) -> Result<()> {
-    let key = c.param_key(canonical);
-    if c.param_device_q4(canonical) {
-        let (rows, cols) = parse_matrix_shape(shape);
-        let nbytes = c.param_packed_nbytes(canonical, rows, cols);
-        return builder.util_global_parameter(sym, &key, &format!("tensor<{nbytes}xi8>"));
-    }
-    // Host-dequantized Q4 embd (and plain tensors) bind as dense f32 / catalog dtype.
-    let wt = if c.param_is_q4_0(canonical) {
-        mlir_ty(ScalarType::F32)
-    } else {
-        mlir_ty(c.param_dtype(canonical))
-    };
-    builder.util_global_parameter(sym, &key, &format!("tensor<{shape}x{wt}>"))
+    default_parameter_lowerings().emit_global(builder, c, sym, canonical, shape)
 }
 
-/// Load a weight global and cast to [`COMPUTE_DTYPE`] when the checkpoint dtype differs.
+/// Load a weight global and cast to the operation-local selected compute type.
 fn emit_load_compute(
     f: &mut FuncBuilder,
     c: &DenseDecoderConfig,
@@ -382,30 +352,9 @@ fn emit_load_compute(
     canonical: &str,
     shape: &str,
 ) {
-    if c.param_device_q4(canonical) {
-        let (rows, cols) = parse_matrix_shape(shape);
-        let nbytes = c.param_packed_nbytes(canonical, rows, cols);
-        qkernel::load_q4_0_packed(f, ssa, sym, nbytes);
-        return;
-    }
-    let storage = if c.param_is_q4_0(canonical) {
-        ScalarType::F32
-    } else {
-        c.param_dtype(canonical)
-    };
-    let wt = mlir_ty(storage);
-    let ct = mlir_ty(COMPUTE_DTYPE);
-    match storage {
-        ScalarType::F16 | ScalarType::Bf16 if COMPUTE_DTYPE == ScalarType::F32 => {
-            kernels::load_compute(f, ssa, sym, &wt, &ct, shape);
-        }
-        ScalarType::F32 if COMPUTE_DTYPE == ScalarType::F32 => {
-            kernels::load_compute(f, ssa, sym, &wt, &ct, shape);
-        }
-        other => panic!(
-            "dense decoder: cannot cast checkpoint dtype {other} → compute {COMPUTE_DTYPE} for {canonical}"
-        ),
-    }
+    default_parameter_lowerings()
+        .emit_load(f, c, ssa, sym, canonical, shape)
+        .expect("selected parameter load was validated before MLIR emission");
 }
 
 fn emit_linear_call(
@@ -413,7 +362,6 @@ fn emit_linear_call(
     c: &DenseDecoderConfig,
     result: &str,
     dense_fn: &str,
-    q4_fn: &str,
     x: &str,
     w: &str,
     weight_canonical: &str,
@@ -421,16 +369,26 @@ fn emit_linear_call(
     in_dim: u32,
     out_dim: u32,
 ) {
-    if c.param_device_q4(weight_canonical) {
-        let nbytes = c.param_packed_nbytes(weight_canonical, out_dim, in_dim);
-        f.op_asm(format!(
-            "  %{result} = func.call @{q4_fn}(%{x}, %{w}) : (tensor<{s}x{in_dim}xf32>, tensor<{nbytes}xi8>) -> tensor<{s}x{out_dim}xf32>\n"
-        ));
+    let mode = if dense_fn.ends_with("_tok") {
+        ExecutionMode::Decode
     } else {
-        f.op_asm(format!(
-            "  %{result} = func.call @{dense_fn}(%{x}, %{w}) : (tensor<{s}x{in_dim}xf32>, tensor<{out_dim}x{in_dim}xf32>) -> tensor<{s}x{out_dim}xf32>\n"
-        ));
-    }
+        ExecutionMode::Prefill
+    };
+    default_parameter_lowerings()
+        .emit_linear_call(
+            f,
+            c,
+            result,
+            dense_fn,
+            x,
+            w,
+            weight_canonical,
+            mode,
+            s,
+            in_dim,
+            out_dim,
+        )
+        .expect("selected linear lowering was validated before MLIR emission");
 }
 
 /// Project hidden → vocab logits. Emits `%logits : tensor<{vocab}xf32>`.
@@ -439,39 +397,40 @@ fn emit_output_proj(
     c: &DenseDecoderConfig,
     hidden_ssa: &str,
     weight_ssa: &str,
-    q4_fn: &str,
+    mode: ExecutionMode,
 ) {
     let (h, v) = (c.hidden, c.vocab);
-    if c.param_device_q4("output.weight") {
-        let nbytes = c.param_packed_nbytes("output.weight", v, h);
-        f.op_asm(format!(
-            "  %y = func.call @{q4_fn}(%{hidden_ssa}, %{weight_ssa}) : (tensor<1x{h}xf32>, tensor<{nbytes}xi8>) -> tensor<1x{v}xf32>\n"
-        ));
-    } else {
-        f.op_asm("  %c0f = arith.constant 0.0 : f32\n");
-        f.op_asm(format!("  %wt_i = tensor.empty() : tensor<{h}x{v}xf32>\n"));
-        f.op_asm(format!(
-            "  %wt = linalg.transpose ins(%{weight_ssa} : tensor<{v}x{h}xf32>) outs(%wt_i : tensor<{h}x{v}xf32>) permutation = [1, 0]\n"
-        ));
-        f.op_asm(format!("  %yi = tensor.empty() : tensor<1x{v}xf32>\n"));
-        f.op_asm(format!(
-            "  %yz = linalg.fill ins(%c0f : f32) outs(%yi : tensor<1x{v}xf32>) -> tensor<1x{v}xf32>\n"
-        ));
-        f.op_asm(format!(
-            "  %y = linalg.matmul ins(%{hidden_ssa}, %wt : tensor<1x{h}xf32>, tensor<{h}x{v}xf32>) outs(%yz : tensor<1x{v}xf32>) -> tensor<1x{v}xf32>\n"
-        ));
+    if default_parameter_lowerings()
+        .emit_output_projection(f, c, hidden_ssa, weight_ssa, mode)
+        .expect("selected output lowering was validated before MLIR emission")
+    {
+        return;
     }
+    f.op_asm("  %c0f = arith.constant 0.0 : f32\n");
+    f.op_asm(format!("  %wt_i = tensor.empty() : tensor<{h}x{v}xf32>\n"));
+    f.op_asm(format!(
+        "  %wt = linalg.transpose ins(%{weight_ssa} : tensor<{v}x{h}xf32>) outs(%wt_i : tensor<{h}x{v}xf32>) permutation = [1, 0]\n"
+    ));
+    f.op_asm(format!("  %yi = tensor.empty() : tensor<1x{v}xf32>\n"));
+    f.op_asm(format!(
+        "  %yz = linalg.fill ins(%c0f : f32) outs(%yi : tensor<1x{v}xf32>) -> tensor<1x{v}xf32>\n"
+    ));
+    f.op_asm(format!(
+        "  %y = linalg.matmul ins(%{hidden_ssa}, %wt : tensor<1x{h}xf32>, tensor<{h}x{v}xf32>) outs(%yz : tensor<1x{v}xf32>) -> tensor<1x{v}xf32>\n"
+    ));
     f.op_asm(format!(
         "  %logits = tensor.collapse_shape %y [[0, 1]] : tensor<1x{v}xf32> into tensor<{v}xf32>\n"
     ));
 }
 
 fn emit_globals(builder: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()> {
+    let parameters = default_parameter_lowerings();
     let (v, h, i) = (c.vocab, c.hidden, c.intermediate);
     let (q, kv, d) = (c.q_dim(), c.kv_dim(), c.head_dim);
     emit_global(
         builder,
         c,
+        parameters,
         "token_embd_weight",
         "token_embd.weight",
         &format!("{v}x{h}"),
@@ -482,6 +441,7 @@ fn emit_globals(builder: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<(
         emit_global(
             builder,
             c,
+            parameters,
             &format!("{p}_attn_norm_weight"),
             &format!("{n}.attn_norm.weight"),
             &format!("{h}"),
@@ -489,6 +449,7 @@ fn emit_globals(builder: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<(
         emit_global(
             builder,
             c,
+            parameters,
             &format!("{p}_attn_q_weight"),
             &format!("{n}.attn_q.weight"),
             &format!("{q}x{h}"),
@@ -496,6 +457,7 @@ fn emit_globals(builder: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<(
         emit_global(
             builder,
             c,
+            parameters,
             &format!("{p}_attn_k_weight"),
             &format!("{n}.attn_k.weight"),
             &format!("{kv}x{h}"),
@@ -503,6 +465,7 @@ fn emit_globals(builder: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<(
         emit_global(
             builder,
             c,
+            parameters,
             &format!("{p}_attn_v_weight"),
             &format!("{n}.attn_v.weight"),
             &format!("{kv}x{h}"),
@@ -510,6 +473,7 @@ fn emit_globals(builder: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<(
         emit_global(
             builder,
             c,
+            parameters,
             &format!("{p}_attn_output_weight"),
             &format!("{n}.attn_output.weight"),
             &format!("{h}x{q}"),
@@ -518,6 +482,7 @@ fn emit_globals(builder: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<(
             emit_global(
                 builder,
                 c,
+                parameters,
                 &format!("{p}_attn_q_norm_weight"),
                 &format!("{n}.attn_q_norm.weight"),
                 &format!("{d}"),
@@ -525,6 +490,7 @@ fn emit_globals(builder: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<(
             emit_global(
                 builder,
                 c,
+                parameters,
                 &format!("{p}_attn_k_norm_weight"),
                 &format!("{n}.attn_k_norm.weight"),
                 &format!("{d}"),
@@ -533,6 +499,7 @@ fn emit_globals(builder: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<(
         emit_global(
             builder,
             c,
+            parameters,
             &format!("{p}_ffn_norm_weight"),
             &format!("{n}.ffn_norm.weight"),
             &format!("{h}"),
@@ -540,6 +507,7 @@ fn emit_globals(builder: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<(
         emit_global(
             builder,
             c,
+            parameters,
             &format!("{p}_ffn_gate_weight"),
             &format!("{n}.ffn_gate.weight"),
             &format!("{i}x{h}"),
@@ -547,6 +515,7 @@ fn emit_globals(builder: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<(
         emit_global(
             builder,
             c,
+            parameters,
             &format!("{p}_ffn_up_weight"),
             &format!("{n}.ffn_up.weight"),
             &format!("{i}x{h}"),
@@ -554,6 +523,7 @@ fn emit_globals(builder: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<(
         emit_global(
             builder,
             c,
+            parameters,
             &format!("{p}_ffn_down_weight"),
             &format!("{n}.ffn_down.weight"),
             &format!("{h}x{i}"),
@@ -562,6 +532,7 @@ fn emit_globals(builder: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<(
     emit_global(
         builder,
         c,
+        parameters,
         "output_norm_weight",
         "output_norm.weight",
         &format!("{h}"),
@@ -569,6 +540,7 @@ fn emit_globals(builder: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<(
     emit_global(
         builder,
         c,
+        parameters,
         "output_weight",
         "output.weight",
         &format!("{v}x{h}"),
@@ -589,6 +561,7 @@ fn emit_globals(builder: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<(
 }
 
 fn emit_helpers(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()> {
+    let parameters = default_parameter_lowerings();
     let (s, h, i, nh, nkv, d) = (
         c.seq,
         c.hidden,
@@ -606,13 +579,8 @@ fn emit_helpers(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()
     kernels::emit_linear(module, "linear_qh", s, q, h, true)?;
     kernels::emit_linear(module, "linear_hi", s, h, i, true)?;
     kernels::emit_linear(module, "linear_ih", s, i, h, true)?;
-    if c.has_device_q4() {
-        qkernel::emit_q4_0_linear(module, "q4_linear_hq", s, h, q)?;
-        qkernel::emit_q4_0_linear(module, "q4_linear_hkv", s, h, kv)?;
-        qkernel::emit_q4_0_linear(module, "q4_linear_qh", s, q, h)?;
-        qkernel::emit_q4_0_linear(module, "q4_linear_hi", s, h, i)?;
-        qkernel::emit_q4_0_linear(module, "q4_linear_ih", s, i, h)?;
-    }
+
+    parameters.emit_quantized_helpers(module, c)?;
 
     if c.has_qk_norm {
         kernels::emit_rms_norm_heads(module, "rms_norm_q_heads", s, nh, d, c.rms_norm_eps)?;
@@ -822,17 +790,6 @@ fn emit_decode_helpers(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Re
     kernels::emit_linear(module, "linear_qh_tok", 1, q, h, true)?;
     kernels::emit_linear(module, "linear_hi_tok", 1, h, i, true)?;
     kernels::emit_linear(module, "linear_ih_tok", 1, i, h, true)?;
-    if c.has_device_q4() {
-        qkernel::emit_q4_0_linear(module, "q4_linear_hq_tok", 1, h, q)?;
-        qkernel::emit_q4_0_linear(module, "q4_linear_hkv_tok", 1, h, kv)?;
-        qkernel::emit_q4_0_linear(module, "q4_linear_qh_tok", 1, q, h)?;
-        qkernel::emit_q4_0_linear(module, "q4_linear_hi_tok", 1, h, i)?;
-        qkernel::emit_q4_0_linear(module, "q4_linear_ih_tok", 1, i, h)?;
-        if c.param_device_q4("output.weight") {
-            qkernel::emit_q4_0_linear(module, "q4_linear_out", 1, h, c.vocab)?;
-            qkernel::emit_q4_0_linear(module, "q4_linear_out_tok", 1, h, c.vocab)?;
-        }
-    }
 
     if c.has_qk_norm {
         kernels::emit_rms_norm_heads(module, "rms_norm_q_heads_tok", 1, nh, d, c.rms_norm_eps)?;
@@ -1055,6 +1012,7 @@ fn emit_decode_helpers(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Re
 }
 
 fn emit_prefill(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()> {
+    let parameters = default_parameter_lowerings();
     // Prefill is still largely `op_asm` for region-bearing linalg. Typed
     // melior/IREE dialect helpers cover single ops; they do not remove the need
     // to author the graph. See crate-level docs in `dyninfer-mlir`.
@@ -1089,9 +1047,18 @@ fn emit_prefill(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()
         f.op_asm(format!(
             "  %i{pos} = arith.index_cast %t{pos} : i64 to index\n"
         ));
-        f.op_asm(format!(
-            "  %r{pos} = tensor.extract_slice %emb_t[%i{pos}, 0] [1, {h}] [1, 1] : tensor<{v}x{h}xf32> to tensor<1x{h}xf32>\n"
-        ));
+        if !parameters.emit_embedding_call(
+            &mut f,
+            c,
+            &format!("r{pos}"),
+            &format!("i{pos}"),
+            "emb_t",
+            ExecutionMode::Prefill,
+        )? {
+            f.op_asm(format!(
+                "  %r{pos} = tensor.extract_slice %emb_t[%i{pos}, 0] [1, {h}] [1, 1] : tensor<{v}x{h}xf32> to tensor<1x{h}xf32>\n"
+            ));
+        }
         let prev = if pos == 0 {
             "h_acc0".to_string()
         } else {
@@ -1207,7 +1174,6 @@ fn emit_prefill(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()
             c,
             &format!("{p}_q"),
             "linear_hq",
-            "q4_linear_hq",
             &format!("{p}_xn"),
             &format!("{p}_wq"),
             &format!("{n}.attn_q.weight"),
@@ -1220,7 +1186,6 @@ fn emit_prefill(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()
             c,
             &format!("{p}_k"),
             "linear_hkv",
-            "q4_linear_hkv",
             &format!("{p}_xn"),
             &format!("{p}_wk"),
             &format!("{n}.attn_k.weight"),
@@ -1233,7 +1198,6 @@ fn emit_prefill(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()
             c,
             &format!("{p}_v"),
             "linear_hkv",
-            "q4_linear_hkv",
             &format!("{p}_xn"),
             &format!("{p}_wv"),
             &format!("{n}.attn_v.weight"),
@@ -1285,7 +1249,6 @@ fn emit_prefill(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()
             c,
             &format!("{p}_o"),
             "linear_qh",
-            "q4_linear_qh",
             &format!("{p}_ctx"),
             &format!("{p}_wo"),
             &format!("{n}.attn_output.weight"),
@@ -1304,7 +1267,6 @@ fn emit_prefill(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()
             c,
             &format!("{p}_gate"),
             "linear_hi",
-            "q4_linear_hi",
             &format!("{p}_fn"),
             &format!("{p}_wgate"),
             &format!("{n}.ffn_gate.weight"),
@@ -1317,7 +1279,6 @@ fn emit_prefill(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()
             c,
             &format!("{p}_up"),
             "linear_hi",
-            "q4_linear_hi",
             &format!("{p}_fn"),
             &format!("{p}_wup"),
             &format!("{n}.ffn_up.weight"),
@@ -1350,7 +1311,6 @@ fn emit_prefill(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()
             c,
             &format!("{p}_down"),
             "linear_ih",
-            "q4_linear_ih",
             &format!("{p}_ff"),
             &format!("{p}_wdown"),
             &format!("{n}.ffn_down.weight"),
@@ -1398,13 +1358,14 @@ fn emit_prefill(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()
     f.op_asm(format!(
         "  %ln1 = tensor.extract_slice %ln[0, 0] [1, {h}] [1, 1] : tensor<{s}x{h}xf32> to tensor<1x{h}xf32>\n"
     ));
-    emit_output_proj(&mut f, c, "ln1", "wout", "q4_linear_out");
+    emit_output_proj(&mut f, c, "ln1", "wout", ExecutionMode::Prefill);
     f.op_asm(format!("  return %logits : tensor<{v}xf32>"));
 
     f.finish(module)
 }
 
 fn emit_decode(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()> {
+    let parameters = default_parameter_lowerings();
     let (h, v, mk) = (c.hidden, c.vocab, c.max_kv);
     let (q, kv) = (c.q_dim(), c.kv_dim());
     let d = c.head_dim;
@@ -1424,9 +1385,11 @@ fn emit_decode(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()>
     );
     f.op_asm("  %tok = tensor.extract %token[] : tensor<i64>\n");
     f.op_asm("  %ti = arith.index_cast %tok : i64 to index\n");
-    f.op_asm(format!(
-        "  %row = tensor.extract_slice %emb_t[%ti, 0] [1, {h}] [1, 1] : tensor<{v}x{h}xf32> to tensor<1x{h}xf32>\n"
-    ));
+    if !parameters.emit_embedding_call(&mut f, c, "row", "ti", "emb_t", ExecutionMode::Decode)? {
+        f.op_asm(format!(
+            "  %row = tensor.extract_slice %emb_t[%ti, 0] [1, {h}] [1, 1] : tensor<{v}x{h}xf32> to tensor<1x{h}xf32>\n"
+        ));
+    }
     let mut h_name = "row".to_string();
 
     for layer in 0..c.num_layers {
@@ -1532,7 +1495,6 @@ fn emit_decode(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()>
             c,
             &format!("{p}_q"),
             "linear_hq_tok",
-            "q4_linear_hq_tok",
             &format!("{p}_xn"),
             &format!("{p}_wq"),
             &format!("{n}.attn_q.weight"),
@@ -1545,7 +1507,6 @@ fn emit_decode(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()>
             c,
             &format!("{p}_k"),
             "linear_hkv_tok",
-            "q4_linear_hkv_tok",
             &format!("{p}_xn"),
             &format!("{p}_wk"),
             &format!("{n}.attn_k.weight"),
@@ -1558,7 +1519,6 @@ fn emit_decode(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()>
             c,
             &format!("{p}_v"),
             "linear_hkv_tok",
-            "q4_linear_hkv_tok",
             &format!("{p}_xn"),
             &format!("{p}_wv"),
             &format!("{n}.attn_v.weight"),
@@ -1598,7 +1558,6 @@ fn emit_decode(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()>
             c,
             &format!("{p}_o"),
             "linear_qh_tok",
-            "q4_linear_qh_tok",
             &format!("{p}_ctx"),
             &format!("{p}_wo"),
             &format!("{n}.attn_output.weight"),
@@ -1617,7 +1576,6 @@ fn emit_decode(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()>
             c,
             &format!("{p}_gate"),
             "linear_hi_tok",
-            "q4_linear_hi_tok",
             &format!("{p}_fn"),
             &format!("{p}_wgate"),
             &format!("{n}.ffn_gate.weight"),
@@ -1630,7 +1588,6 @@ fn emit_decode(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()>
             c,
             &format!("{p}_up"),
             "linear_hi_tok",
-            "q4_linear_hi_tok",
             &format!("{p}_fn"),
             &format!("{p}_wup"),
             &format!("{n}.ffn_up.weight"),
@@ -1663,7 +1620,6 @@ fn emit_decode(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()>
             c,
             &format!("{p}_down"),
             "linear_ih_tok",
-            "q4_linear_ih_tok",
             &format!("{p}_ff"),
             &format!("{p}_wdown"),
             &format!("{n}.ffn_down.weight"),
@@ -1696,7 +1652,7 @@ fn emit_decode(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()>
     f.op_asm(format!(
         "  %ln = func.call @rms_norm_tok(%{h_name}, %out_nw) : (tensor<1x{h}xf32>, tensor<{h}xf32>) -> tensor<1x{h}xf32>\n"
     ));
-    emit_output_proj(&mut f, c, "ln", "wout", "q4_linear_out_tok");
+    emit_output_proj(&mut f, c, "ln", "wout", ExecutionMode::Decode);
     f.op_asm(format!("  return %logits : tensor<{v}xf32>"));
 
     f.finish(module)
@@ -1723,8 +1679,10 @@ mod tests {
             has_qk_norm: true,
             param_keys: BTreeMap::new(),
             param_dtypes: BTreeMap::from([("token_embd.weight".into(), ScalarType::Bf16)]),
-            param_encodings: BTreeMap::new(),
-            param_nbytes: BTreeMap::new(),
+            param_compute_dtypes: BTreeMap::new(),
+            param_bindings: BTreeMap::new(),
+            param_lowerings: BTreeMap::new(),
+            separate_storage_casts: false,
         };
         assert!(c.supports_dense_emit());
         assert_eq!(c.q_dim(), 2048);
@@ -1751,8 +1709,10 @@ mod tests {
             has_qk_norm: false,
             param_keys: BTreeMap::new(),
             param_dtypes: BTreeMap::new(),
-            param_encodings: BTreeMap::new(),
-            param_nbytes: BTreeMap::new(),
+            param_compute_dtypes: BTreeMap::new(),
+            param_bindings: BTreeMap::new(),
+            param_lowerings: BTreeMap::new(),
+            separate_storage_casts: false,
         };
         assert!(c.supports_dense_emit());
         assert!(c.is_synthetic_fixture());
@@ -1773,6 +1733,10 @@ mod tests {
         param_dtypes.insert("blk.0.ffn_down.weight".into(), ScalarType::F32);
         param_dtypes.insert("output_norm.weight".into(), ScalarType::F32);
         param_dtypes.insert("output.weight".into(), ScalarType::Bf16);
+        let param_keys = BTreeMap::from([(
+            "token_embd.weight".into(),
+            "weights::token_embd.weight::data".into(),
+        )]);
         let c = DenseDecoderConfig {
             vocab: 32,
             hidden: 64,
@@ -1786,16 +1750,22 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: None,
             has_qk_norm: false,
-            param_keys: BTreeMap::new(),
+            param_keys,
             param_dtypes,
-            param_encodings: BTreeMap::new(),
-            param_nbytes: BTreeMap::new(),
+            param_compute_dtypes: BTreeMap::new(),
+            param_bindings: BTreeMap::new(),
+            param_lowerings: BTreeMap::new(),
+            separate_storage_casts: false,
         };
         let mlir = emit_dense_decoder_cfg("test.decoder", &c).expect("mlir verify");
         assert!(
             mlir.contains("@token_embd_weight") && mlir.contains("tensor<32x64xbf16>"),
             "missing bf16 token embd global: {mlir}"
         );
+        assert!(mlir.contains(
+            "#stream.parameter.named<\"weights\"::\"weights::token_embd.weight::data\">"
+        ));
+        assert!(!mlir.contains("q4_linear"));
         assert!(
             mlir.contains("@blk0_attn_norm_weight") && mlir.contains("tensor<64xf16>"),
             "missing f16 attn norm global: {mlir}"
@@ -1831,8 +1801,10 @@ mod tests {
             has_qk_norm: true,
             param_keys: BTreeMap::new(),
             param_dtypes: BTreeMap::new(),
-            param_encodings: BTreeMap::new(),
-            param_nbytes: BTreeMap::new(),
+            param_compute_dtypes: BTreeMap::new(),
+            param_bindings: BTreeMap::new(),
+            param_lowerings: BTreeMap::new(),
+            separate_storage_casts: false,
         };
         let mlir = emit_dense_decoder_cfg("test.gqa", &c).expect("emit");
         assert!(mlir.contains("func.func private @attn_decode"));

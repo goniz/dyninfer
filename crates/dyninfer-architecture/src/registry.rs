@@ -1,6 +1,5 @@
 use crate::builder::{ArchitectureDefinition, ModelBuilder};
 use crate::config::ResolvedModelConfig;
-use crate::emit::EmitOutput;
 use crate::package::ArchitecturePackage;
 use dyninfer_checkpoint::infer_role;
 use dyninfer_checkpoint::{
@@ -164,15 +163,6 @@ impl ArchitectureRegistry {
             def.revision().to_string(),
         ))
     }
-
-    pub fn emit_executable(
-        &self,
-        id: &ArchitectureId,
-        package: &ArchitecturePackage,
-        catalog: &CheckpointCatalog,
-    ) -> Result<EmitOutput> {
-        self.require(id)?.emit_executable(package, catalog)
-    }
 }
 
 fn meta_model_type_candidates(meta: &MetadataMap) -> Vec<String> {
@@ -187,4 +177,94 @@ fn meta_model_type_candidates(meta: &MetadataMap) -> Vec<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{register_all, verify_architecture_catalog_conformance};
+    use dyninfer_checkpoint::{LogicalParameter, ParameterCatalog};
+    use dyninfer_core::{
+        ConventionId, LogicalTensorType, OperationKind, PhysicalEncoding, ScalarType, Shape,
+    };
+
+    fn fixture_for(package: &ArchitecturePackage) -> ParameterCatalog {
+        ParameterCatalog {
+            convention_id: ConventionId::new("test.canonical"),
+            parameters: package
+                .parameter_slots()
+                .iter()
+                .map(|slot| LogicalParameter {
+                    canonical_name: slot.canonical_name.clone(),
+                    role: slot.role.clone(),
+                    logical_type: LogicalTensorType {
+                        shape: Shape::new(vec![1; slot.expected_type.rank.unwrap_or(1)]),
+                        element_type: ScalarType::F32,
+                    },
+                    encoding: PhysicalEncoding::plain(ScalarType::F32),
+                    components: vec![],
+                    aliases: vec![slot.canonical_name.to_string()],
+                })
+                .collect(),
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    #[test]
+    fn built_in_architectures_pass_typed_graph_conformance() {
+        let mut registry = ArchitectureRegistry::new();
+        register_all(&mut registry);
+        for id in ["llama.decoder", "qwen3.decoder"] {
+            let package = registry
+                .build_package(
+                    &ArchitectureId::new(id),
+                    &MetadataMap::new(),
+                    &MetadataMap::new(),
+                )
+                .unwrap();
+            verify_architecture_catalog_conformance(&package.graph, &fixture_for(&package))
+                .unwrap();
+            assert!(
+                package
+                    .graph
+                    .operations
+                    .iter()
+                    .any(|operation| matches!(operation.kind, OperationKind::Attention { .. }))
+            );
+            assert!(
+                package
+                    .graph
+                    .exports
+                    .iter()
+                    .any(|export| export.name == "prefill")
+            );
+            assert!(
+                package
+                    .graph
+                    .exports
+                    .iter()
+                    .any(|export| export.name == "decode")
+            );
+        }
+    }
+
+    #[test]
+    fn qwen_graph_contains_per_head_qk_normalization() {
+        let mut registry = ArchitectureRegistry::new();
+        register_all(&mut registry);
+        let package = registry
+            .build_package(
+                &ArchitectureId::new("qwen3.decoder"),
+                &MetadataMap::new(),
+                &MetadataMap::new(),
+            )
+            .unwrap();
+        let count = package
+            .graph
+            .operations
+            .iter()
+            .filter(|operation| matches!(operation.kind, OperationKind::PerHeadRmsNorm { .. }))
+            .count();
+        assert_eq!(count, 2 * 28);
+    }
 }

@@ -180,11 +180,16 @@ fn ensure_model_files(snap: &Path, repo_id: &str) -> Result<()> {
     )))
 }
 
-/// Find `model.safetensors` (or the first `*.safetensors`) under a model directory.
+/// Find a complete SafeTensors checkpoint. A shard index is preferred over an
+/// individual shard so inspection sees the entire model schema.
 pub fn find_safetensors_checkpoint(model_dir: &Path) -> Result<PathBuf> {
     let preferred = model_dir.join("model.safetensors");
     if preferred.is_file() {
         return Ok(preferred);
+    }
+    let sharded = model_dir.join("model.safetensors.index.json");
+    if sharded.is_file() {
+        return Ok(sharded);
     }
     let mut found: Vec<PathBuf> = Vec::new();
     if let Ok(rd) = fs::read_dir(model_dir) {

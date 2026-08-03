@@ -7,24 +7,25 @@ mod container;
 mod convention;
 mod fixture;
 mod hf_names;
-mod materialize;
+mod mlx;
+mod sharded;
 
 pub use container::SafeTensorsContainer;
 pub use convention::DenseSafetensorsConvention;
 pub use fixture::{
-    fill_f32, tiny_gqa_plain_f32, tiny_gqa_rope_f32, tiny_llama_dense_f32, tiny_mha_rope_f32,
-    write_safetensors,
+    fill_f32, tiny_gqa_plain_f32, tiny_gqa_rope_f32, tiny_llama_dense_f32,
+    tiny_llama_mlx_affine_u4, tiny_mha_rope_f32, write_safetensors,
 };
 pub use hf_names::{hf_to_canonical, looks_like_hf_llama};
-pub use materialize::{
-    HostF32Parameters, decode_parameters_as_f32_host, materialize_f32_safetensors,
-    resolve_runtime_parameters,
-};
+pub use mlx::MlxSafeTensorsConvention;
+pub use sharded::ShardedSafeTensorsContainer;
 
 use dyninfer_checkpoint::BuiltinCheckpointSupport;
 
 /// Register SafeTensors support into a builtin registry.
 pub fn register(support: &mut BuiltinCheckpointSupport) {
+    support.register_container(ShardedSafeTensorsContainer);
     support.register_container(SafeTensorsContainer::default());
+    support.register_convention(MlxSafeTensorsConvention);
     support.register_convention(DenseSafetensorsConvention::default());
 }

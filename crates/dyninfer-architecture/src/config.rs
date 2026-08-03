@@ -90,6 +90,17 @@ impl ResolvedModelConfig {
             })
     }
 
+    pub fn get_f64(&self, key: &str) -> Result<f64> {
+        self.values
+            .get(key)
+            .and_then(|v| v.as_f64())
+            .ok_or_else(|| {
+                DynInferError::Config(ConfigError {
+                    message: format!("config field `{key}` missing or not f64"),
+                })
+            })
+    }
+
     pub fn num_layers(&self) -> Result<u32> {
         self.get_u32("num_layers")
             .or_else(|_| self.get_u32("n_layer"))

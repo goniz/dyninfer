@@ -1,9 +1,10 @@
-//! Content-addressed executable and parameter caches with atomic publication.
+//! Content-addressed executable cache with atomic publication.
 
 #![forbid(unsafe_code)]
 
 use dyninfer_core::{
-    BindingPlan, Digest, ExecutableManifest, ShapeProfile, TargetProfile, content_digest,
+    BindingPlan, Digest, ExecutableManifest, PrecisionPolicy, ShapeProfile, TargetProfile,
+    content_digest,
 };
 use dyninfer_error::{CacheError, DynInferError, Result};
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,7 @@ pub struct CacheKey {
     pub binding_plan_digest: String,
     pub checkpoint_schema: String,
     pub target_fingerprint: String,
+    pub precision_policy_digest: String,
     pub shape_profile_digest: String,
     pub kernel_registry_version: String,
     pub compiler_version: String,
@@ -61,7 +63,6 @@ impl ArtifactCache {
                 path: Some(root.display().to_string()),
             })
         })?;
-        fs::create_dir_all(root.join("parameters")).ok();
         fs::create_dir_all(root.join("locks")).ok();
         Ok(Self { root })
     }
@@ -320,6 +321,7 @@ pub struct CacheKeyInputs<'a> {
     pub binding: &'a BindingPlan,
     pub checkpoint_schema: &'a str,
     pub target: &'a TargetProfile,
+    pub precision_policy: &'a PrecisionPolicy,
     pub shape_profile: &'a ShapeProfile,
     pub kernel_registry_version: &'a str,
     pub compiler_version: &'a str,
@@ -336,6 +338,7 @@ pub fn make_cache_key(inputs: &CacheKeyInputs<'_>) -> Result<CacheKey> {
         binding_plan_digest: content_digest(inputs.binding)?.to_string(),
         checkpoint_schema: inputs.checkpoint_schema.into(),
         target_fingerprint: inputs.target.capability_fingerprint.to_string(),
+        precision_policy_digest: content_digest(inputs.precision_policy)?.to_string(),
         shape_profile_digest: shape_profile_digest(inputs.shape_profile)?.to_string(),
         kernel_registry_version: inputs.kernel_registry_version.into(),
         compiler_version: inputs.compiler_version.into(),
@@ -361,6 +364,7 @@ mod tests {
             binding_plan_digest: "bind".into(),
             checkpoint_schema: "abc".into(),
             target_fingerprint: "cpu".into(),
+            precision_policy_digest: "precision".into(),
             shape_profile_digest: "shape".into(),
             kernel_registry_version: "1".into(),
             compiler_version: "0.1.0-stub".into(),
@@ -385,6 +389,8 @@ mod tests {
                 total_bytes: 0,
             },
             target: TargetProfile::llvm_cpu_host(),
+            precision_policy: PrecisionPolicy::default(),
+            selected_kernels: vec![],
             shape_profile: ShapeProfile::default(),
             entrypoints: vec!["prefill".into(), "decode".into()],
             kv_cache: KvCacheDescriptor {
@@ -398,6 +404,8 @@ mod tests {
                 alignment: 64,
             },
             parameter_scope: "weights".into(),
+            parameter_components: vec![],
+            derived_parameters_required: false,
             vmfb_path: "model.vmfb".into(),
             prefill_window: 4,
             diagnostics: vec![],
@@ -405,6 +413,7 @@ mod tests {
         cache.publish(&key, b"VMFBSTUB", &manifest).unwrap();
         let hit = cache.lookup(&key).unwrap().expect("hit");
         assert_eq!(fs::read(hit.vmfb_path).unwrap(), b"VMFBSTUB");
+        assert!(!dir.path().join("parameters").exists());
     }
 
     #[test]
@@ -413,6 +422,15 @@ mod tests {
         let mut b = sample_key();
         a.resolved_config_digest = "rope_theta=10000".into();
         b.resolved_config_digest = "rope_theta=500000".into();
+        assert_ne!(a.digest().unwrap().as_str(), b.digest().unwrap().as_str());
+    }
+
+    #[test]
+    fn precision_policy_change_changes_cache_key() {
+        let mut a = sample_key();
+        let mut b = sample_key();
+        a.precision_policy_digest = "conservative-v1".into();
+        b.precision_policy_digest = "conservative-v2".into();
         assert_ne!(a.digest().unwrap().as_str(), b.digest().unwrap().as_str());
     }
 }

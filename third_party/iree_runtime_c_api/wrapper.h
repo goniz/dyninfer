@@ -13,28 +13,35 @@ extern "C" {
 
 typedef struct dyninfer_iree_session_t dyninfer_iree_session_t;
 
-// One host-owned parameter blob (e.g. bf16→f32 expanded weights).
-// |data| must remain valid for the lifetime of the session.
-typedef struct dyninfer_iree_host_param_t {
-  const char* key;
-  const void* data;
-  size_t length;
-} dyninfer_iree_host_param_t;
+// One original checkpoint file opened once and retained by the IREE parameter
+// provider for the session lifetime.
+typedef struct dyninfer_iree_parameter_file_t {
+  const char* path;
+} dyninfer_iree_parameter_file_t;
 
-// Create a persistent session: load VMFB (+ optional SafeTensors scope "weights").
+// One stable external parameter key backed by a contiguous range in an
+// original checkpoint file. No container parser or host staging is involved.
+typedef struct dyninfer_iree_file_param_t {
+  const char* key;
+  size_t source_file_index;
+  uint64_t offset;
+  uint64_t length;
+} dyninfer_iree_file_param_t;
+
+// Create a persistent session without external parameters (smoke modules).
 // |device_uri| is an IREE driver name: "hip", "local-task", "vulkan", …
-// Pass NULL / "" for local-task. |parameters_path| may be NULL.
+// Pass NULL / "" for local-task.
 // Returns 0 on success; non-zero on failure (see dyninfer_iree_last_error).
 int dyninfer_iree_session_create(const char* device_uri, const char* vmfb_path,
-                                 const char* parameters_path,
                                  dyninfer_iree_session_t** out_session);
 
-// Like dyninfer_iree_session_create, but binds |params| as in-memory host
-// allocations under scope "weights" (no parameter file). Used when the VMFB
-// expects promoted f32 weights while the checkpoint on disk is still bf16.
-int dyninfer_iree_session_create_with_host_params(
+// Creates a session with an explicit descriptor index over original checkpoint
+// files. Each file is opened once; entries may reference different files and
+// arbitrary container-independent byte ranges under scope "weights".
+int dyninfer_iree_session_create_with_file_params(
     const char* device_uri, const char* vmfb_path,
-    const dyninfer_iree_host_param_t* params, size_t param_count,
+    const dyninfer_iree_parameter_file_t* files, size_t file_count,
+    const dyninfer_iree_file_param_t* params, size_t param_count,
     dyninfer_iree_session_t** out_session);
 
 void dyninfer_iree_session_destroy(dyninfer_iree_session_t* session);

@@ -44,6 +44,33 @@ impl Weights {
             wout: fill_f32(V * H, 9),
         }
     }
+
+    fn tiny_mlx_affine_u4_fixture() -> Self {
+        let mut weights = Self::tiny_fixture();
+        weights.emb = affine_u4_roundtrip(&weights.emb, H);
+        weights.wq = affine_u4_roundtrip(&weights.wq, H);
+        weights.wk = affine_u4_roundtrip(&weights.wk, H);
+        weights.wv = affine_u4_roundtrip(&weights.wv, H);
+        weights.wo = affine_u4_roundtrip(&weights.wo, H);
+        weights.wgate = affine_u4_roundtrip(&weights.wgate, H);
+        weights.wup = affine_u4_roundtrip(&weights.wup, H);
+        weights.wdown = affine_u4_roundtrip(&weights.wdown, I);
+        weights.wout = affine_u4_roundtrip(&weights.wout, H);
+        weights
+    }
+
+    fn tiny_gguf_q4_0_fixture() -> Self {
+        let mut weights = Self::tiny_fixture();
+        weights.wq = gguf_q4_1_roundtrip(&weights.wq);
+        weights.wk = gguf_q4_0_roundtrip(&weights.wk);
+        weights.wv = gguf_q8_0_roundtrip(&weights.wv);
+        weights.wo = gguf_q4_0_roundtrip(&weights.wo);
+        weights.wgate = gguf_q4_0_roundtrip(&weights.wgate);
+        weights.wup = gguf_q4_0_roundtrip(&weights.wup);
+        weights.wdown = gguf_q4_0_roundtrip(&weights.wdown);
+        weights.wout = gguf_q4_0_roundtrip(&weights.wout);
+        weights
+    }
 }
 
 /// Reference logits for a padded 4-token window (matches `@prefill`).
@@ -53,6 +80,116 @@ pub fn tiny_llama_prefill_logits(tokens: &[u32]) -> Result<Vec<f32>> {
         window[i] = *t;
     }
     Ok(forward(&Weights::tiny_fixture(), &window))
+}
+
+/// Reference logits after the same MLX affine-U4 quantize/dequantize formula
+/// used by the mixed tiny checkpoint. Kept independent from the compiler path
+/// so nibble ordering and group indexing are checked end to end.
+pub fn tiny_llama_mlx_u4_prefill_logits(tokens: &[u32]) -> Result<Vec<f32>> {
+    let mut window = [0u32; S];
+    for (i, token) in tokens.iter().take(S).enumerate() {
+        window[i] = *token;
+    }
+    Ok(forward(&Weights::tiny_mlx_affine_u4_fixture(), &window))
+}
+
+/// Reference logits for the tiny GGUF fixture using the official Q4_0 block
+/// order (low nibbles are logical lanes 0..16, high nibbles are 16..32).
+pub fn tiny_llama_gguf_q4_0_prefill_logits(tokens: &[u32]) -> Result<Vec<f32>> {
+    let mut window = [0u32; S];
+    for (i, token) in tokens.iter().take(S).enumerate() {
+        window[i] = *token;
+    }
+    Ok(forward(&Weights::tiny_gguf_q4_0_fixture(), &window))
+}
+
+fn gguf_q4_0_roundtrip(values: &[f32]) -> Vec<f32> {
+    const BLOCK: usize = 32;
+    assert!(values.len().is_multiple_of(BLOCK));
+    let mut output = Vec::with_capacity(values.len());
+    for block in values.chunks_exact(BLOCK) {
+        let amax = block.iter().map(|value| value.abs()).fold(0.0, f32::max);
+        let packing_scale = if amax > 0.0 { amax / 7.0 } else { 0.0 };
+        // Quantization uses the f32 scale; dequantization uses the f16 value
+        // serialized into the GGUF block.
+        let stored_scale = half::f16::from_f32(packing_scale).to_f32();
+        let inv = if packing_scale > 0.0 {
+            1.0 / packing_scale
+        } else {
+            0.0
+        };
+        output.extend(block.iter().map(|value| {
+            let quantized = (*value * inv).round().clamp(-8.0, 7.0);
+            quantized * stored_scale
+        }));
+    }
+    output
+}
+
+fn gguf_q4_1_roundtrip(values: &[f32]) -> Vec<f32> {
+    const BLOCK: usize = 32;
+    assert!(values.len().is_multiple_of(BLOCK));
+    let mut output = Vec::with_capacity(values.len());
+    for block in values.chunks_exact(BLOCK) {
+        let minimum = block.iter().copied().fold(f32::INFINITY, f32::min);
+        let maximum = block.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let packing_scale = if maximum > minimum {
+            (maximum - minimum) / 15.0
+        } else {
+            0.0
+        };
+        let stored_scale = half::f16::from_f32(packing_scale).to_f32();
+        let stored_minimum = half::f16::from_f32(minimum).to_f32();
+        let inverse = if packing_scale > 0.0 {
+            1.0 / packing_scale
+        } else {
+            0.0
+        };
+        output.extend(block.iter().map(|value| {
+            let quantized = ((*value - minimum) * inverse).round().clamp(0.0, 15.0);
+            quantized * stored_scale + stored_minimum
+        }));
+    }
+    output
+}
+
+fn gguf_q8_0_roundtrip(values: &[f32]) -> Vec<f32> {
+    const BLOCK: usize = 32;
+    assert!(values.len().is_multiple_of(BLOCK));
+    let mut output = Vec::with_capacity(values.len());
+    for block in values.chunks_exact(BLOCK) {
+        let amax = block.iter().map(|value| value.abs()).fold(0.0, f32::max);
+        let packing_scale = if amax > 0.0 { amax / 127.0 } else { 0.0 };
+        let stored_scale = half::f16::from_f32(packing_scale).to_f32();
+        let inverse = if packing_scale > 0.0 {
+            1.0 / packing_scale
+        } else {
+            0.0
+        };
+        output.extend(block.iter().map(|value| {
+            let quantized = (*value * inverse).round().clamp(-127.0, 127.0);
+            quantized * stored_scale
+        }));
+    }
+    output
+}
+
+fn affine_u4_roundtrip(values: &[f32], columns: usize) -> Vec<f32> {
+    const GROUP: usize = 64;
+    assert!(columns.is_multiple_of(GROUP));
+    let mut output = Vec::with_capacity(values.len());
+    for row in values.chunks_exact(columns) {
+        for group in row.chunks_exact(GROUP) {
+            let min = group.iter().copied().fold(f32::INFINITY, f32::min);
+            let max = group.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let scale = ((max - min) / 15.0).max(1.0e-7);
+            output.extend(group.iter().map(|value| {
+                let quantized = ((*value - min) / scale).round().clamp(0.0, 15.0);
+                quantized * scale + min
+            }));
+        }
+    }
+    output
 }
 
 fn forward(w: &Weights, tokens: &[u32; S]) -> Vec<f32> {

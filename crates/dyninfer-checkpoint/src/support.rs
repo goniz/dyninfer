@@ -4,9 +4,7 @@ use crate::catalog::{CheckpointCatalog, DecodeContext, ParameterCatalog, RawChec
 use crate::fingerprint::schema_fingerprint_from_parameters;
 use crate::limits::InspectionLimits;
 use crate::source::{FileSource, RandomAccessSource};
-use crate::traits::{
-    CheckpointContainerReader, CheckpointConventionDecoder, ParameterMaterializer,
-};
+use crate::traits::{CheckpointContainerReader, CheckpointConventionDecoder};
 use dyninfer_error::{CheckpointValidationError, DynInferError, Result, UnsupportedContainerError};
 use std::path::Path;
 use std::sync::Arc;
@@ -17,7 +15,6 @@ use tracing::{debug, info_span};
 pub struct BuiltinCheckpointSupport {
     container_readers: Vec<Arc<dyn CheckpointContainerReader>>,
     convention_decoders: Vec<Arc<dyn CheckpointConventionDecoder>>,
-    materializers: Vec<Arc<dyn ParameterMaterializer>>,
 }
 
 impl BuiltinCheckpointSupport {
@@ -31,10 +28,6 @@ impl BuiltinCheckpointSupport {
 
     pub fn register_convention(&mut self, decoder: impl CheckpointConventionDecoder + 'static) {
         self.convention_decoders.push(Arc::new(decoder));
-    }
-
-    pub fn register_materializer(&mut self, materializer: impl ParameterMaterializer + 'static) {
-        self.materializers.push(Arc::new(materializer));
     }
 
     pub fn containers(&self) -> &[Arc<dyn CheckpointContainerReader>] {

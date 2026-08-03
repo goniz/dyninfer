@@ -15,6 +15,7 @@ rust_library(
 
 rust_test(
     name = "dyninfer-runtime_tests",
+    args = ["--test-threads=1"],
     crate = ":dyninfer-runtime",
     data = [
         "//bazel/iree:tools",

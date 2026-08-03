@@ -1,12 +1,12 @@
-//! Name matching, shape validation, and materialization planning.
+//! Name matching, shape validation, and direct component binding.
 
 #![forbid(unsafe_code)]
 
 use dyninfer_architecture::ArchitecturePackage;
 use dyninfer_checkpoint::{CheckpointCatalog, LogicalParameter};
 use dyninfer_core::{
-    BindingPlan, BindingTransform, MaterializationPolicy, MaterializationRequest, ParameterBinding,
-    ParameterRole, ParameterSlot, PhysicalEncoding, Shape,
+    BindingPlan, BindingTransform, ParameterBinding, ParameterComponentBinding, ParameterRole,
+    ParameterSlot, PhysicalEncoding, Shape,
 };
 use dyninfer_error::{BindingError, DynInferError, Result};
 use std::collections::BTreeMap;
@@ -40,19 +40,23 @@ impl Binder {
         let mut by_name: BTreeMap<&str, &LogicalParameter> = BTreeMap::new();
         for p in &catalog.parameters {
             by_name.insert(p.canonical_name.as_str(), p);
+        }
+        // Canonical names always win over aliases. This matters for tied
+        // embeddings: the synthesized output parameter references the same
+        // storage key, but must not shadow the canonical embedding parameter.
+        for p in &catalog.parameters {
             for alias in &p.aliases {
-                by_name.insert(alias.as_str(), p);
+                by_name.entry(alias.as_str()).or_insert(p);
             }
         }
 
         let mut bindings = Vec::new();
         let mut unresolved_optional = Vec::new();
-        let mut materializations = Vec::new();
         let mut tied_shapes: BTreeMap<String, (String, Shape)> = BTreeMap::new();
 
-        for slot in &architecture.parameter_slots {
+        for slot in architecture.parameter_slots() {
             match self.bind_slot(slot, &by_name)? {
-                Some((binding, mat)) => {
+                Some(binding) => {
                     if let Some(group) = &slot.tied_group {
                         let group_key = group.to_string();
                         let shape = binding.logical_shape.clone();
@@ -72,9 +76,6 @@ impl Binder {
                         } else {
                             tied_shapes.insert(group_key, (slot.id.to_string(), shape));
                         }
-                    }
-                    if let Some(m) = mat {
-                        materializations.push(m);
                     }
                     bindings.push(binding);
                 }
@@ -102,7 +103,6 @@ impl Binder {
             checkpoint_schema: catalog.schema_fingerprint.clone(),
             bindings,
             unresolved_optional_slots: unresolved_optional,
-            materializations,
         })
     }
 
@@ -110,7 +110,7 @@ impl Binder {
         &self,
         slot: &ParameterSlot,
         by_name: &BTreeMap<&str, &LogicalParameter>,
-    ) -> Result<Option<(ParameterBinding, Option<MaterializationRequest>)>> {
+    ) -> Result<Option<ParameterBinding>> {
         let Some(param) = by_name.get(slot.canonical_name.as_str()).copied() else {
             return Ok(None);
         };
@@ -143,7 +143,13 @@ impl Binder {
         // (not Other) that disagrees with the architecture slot.
         if !roles_compatible(&slot.role, &param.role) {
             return Err(DynInferError::Binding(BindingError {
-                message: "parameter role mismatch".into(),
+                message: format!(
+                    "parameter role mismatch: slot `{}` expects `{}`, checkpoint parameter `{}` is `{}`",
+                    slot.id,
+                    slot.role.as_str(),
+                    param.canonical_name,
+                    param.role.as_str()
+                ),
                 slot: Some(slot.id.to_string()),
                 checkpoint_key: Some(param.canonical_name.to_string()),
                 expected: Some(slot.role.as_str().into()),
@@ -157,35 +163,12 @@ impl Binder {
                 .element_types
                 .contains(&param.logical_type.element_type)
         {
-            // Encoding may remap logical type (e.g. Q4_0 -> f16); allow if encoding supported.
-            if !encoding_allowed(slot, &param.encoding) {
-                return Err(DynInferError::Binding(BindingError {
-                    message: "parameter element type mismatch".into(),
-                    slot: Some(slot.id.to_string()),
-                    checkpoint_key: Some(param.canonical_name.to_string()),
-                    expected: Some(format!("{:?}", slot.expected_type.element_types)),
-                    actual: Some(param.logical_type.element_type.to_string()),
-                }));
-            }
-        }
-
-        if !encoding_allowed(slot, &param.encoding) {
             return Err(DynInferError::Binding(BindingError {
-                message: "parameter encoding not supported for slot".into(),
+                message: "parameter element type mismatch".into(),
                 slot: Some(slot.id.to_string()),
                 checkpoint_key: Some(param.canonical_name.to_string()),
-                expected: Some(slot.supported_encodings.join("|")),
-                actual: Some(format!("{:?}", param.encoding)),
-            }));
-        }
-
-        if !param.encoding.is_supported_v1() {
-            return Err(DynInferError::Binding(BindingError {
-                message: "encoding is not supported in version 1".into(),
-                slot: Some(slot.id.to_string()),
-                checkpoint_key: Some(param.canonical_name.to_string()),
-                expected: Some("plain or gguf.q4_0".into()),
-                actual: Some(format!("{:?}", param.encoding)),
+                expected: Some(format!("{:?}", slot.expected_type.element_types)),
+                actual: Some(param.logical_type.element_type.to_string()),
             }));
         }
 
@@ -223,36 +206,6 @@ impl Binder {
                         }
                     }
                 }
-                PhysicalEncoding::BlockQuantized { codec, .. } if codec.as_str() == "gguf.q4_0" => {
-                    let Some(numel) = param.logical_type.shape.numel() else {
-                        return Err(DynInferError::Binding(BindingError {
-                            message: "parameter shape numel overflow".into(),
-                            slot: Some(slot.id.to_string()),
-                            checkpoint_key: Some(param.canonical_name.to_string()),
-                            expected: None,
-                            actual: Some(param.logical_type.shape.to_string()),
-                        }));
-                    };
-                    if !numel.is_multiple_of(32) {
-                        return Err(DynInferError::Binding(BindingError {
-                            message: "Q4_0 numel must be divisible by 32".into(),
-                            slot: Some(slot.id.to_string()),
-                            checkpoint_key: Some(param.canonical_name.to_string()),
-                            expected: Some("numel % 32 == 0".into()),
-                            actual: Some(format!("numel {numel}")),
-                        }));
-                    }
-                    let expected = (numel / 32) * 18;
-                    if storage_bytes != expected {
-                        return Err(DynInferError::Binding(BindingError {
-                            message: "Q4_0 storage byte length mismatch".into(),
-                            slot: Some(slot.id.to_string()),
-                            checkpoint_key: Some(param.canonical_name.to_string()),
-                            expected: Some(format!("{expected} bytes")),
-                            actual: Some(format!("{storage_bytes} bytes")),
-                        }));
-                    }
-                }
                 _ => {}
             }
         }
@@ -281,28 +234,34 @@ impl Binder {
             }
         }
 
-        let materialization = match &param.encoding {
-            PhysicalEncoding::Plain { .. } => MaterializationPolicy::DirectView,
-            PhysicalEncoding::BlockQuantized { .. } => MaterializationPolicy::DecodeOnTheFly,
-            _ => MaterializationPolicy::PrepackToCache,
-        };
-
-        let mat_req = if materialization == MaterializationPolicy::PrepackToCache {
-            Some(MaterializationRequest {
-                slot_id: slot.id.clone(),
-                policy: materialization,
-                reason: "unsupported direct encoding requires derived cache".into(),
-            })
-        } else {
-            None
-        };
-
         let key = param
             .components
             .first()
             .map(|c| c.key.clone())
             .unwrap_or_else(|| param.canonical_name.to_string());
 
+        let components = param
+            .components
+            .iter()
+            .map(|component| ParameterComponentBinding {
+                component_name: component.name.clone(),
+                external_key: format!(
+                    "{}::{}::{}",
+                    self.parameter_scope, param.canonical_name, component.name
+                ),
+                checkpoint_key: component.key.clone(),
+                source_file_index: component.source_file_index,
+                shape: component.shape.clone(),
+                storage_type: component.storage_type.clone(),
+                byte_lengths: component
+                    .byte_ranges
+                    .iter()
+                    .map(|range| range.length)
+                    .collect(),
+                alignment: component.alignment,
+                endianness: component.endianness.clone(),
+            })
+            .collect();
         let binding = ParameterBinding {
             slot_id: slot.id.clone(),
             canonical_name: slot.canonical_name.clone(),
@@ -310,14 +269,14 @@ impl Binder {
             encoding: param.encoding.clone(),
             logical_shape: param.logical_type.shape.clone(),
             logical_type: param.logical_type.element_type,
+            components,
             transform: BindingTransform::Identity,
-            materialization,
             scope: self.parameter_scope.clone(),
             parameter_key: key,
             storage_bytes,
             alignment,
         };
-        Ok(Some((binding, mat_req)))
+        Ok(Some(binding))
     }
 }
 
@@ -329,33 +288,37 @@ fn roles_compatible(slot: &ParameterRole, param: &ParameterRole) -> bool {
     }
 }
 
-fn encoding_allowed(slot: &ParameterSlot, encoding: &PhysicalEncoding) -> bool {
-    if slot.supported_encodings.is_empty() {
-        return encoding.is_supported_v1();
-    }
-    let name = match encoding {
-        PhysicalEncoding::Plain { .. } => "plain".to_string(),
-        PhysicalEncoding::BlockQuantized { codec, .. } => codec.to_string(),
-        PhysicalEncoding::GroupQuantized { packing, .. } => packing.clone(),
-        PhysicalEncoding::Opaque { codec, .. } => codec.to_string(),
-        PhysicalEncoding::Sparse { format, .. } => format.clone(),
-    };
-    slot.supported_encodings
-        .iter()
-        .any(|e| e == &name || e == "plain" && matches!(encoding, PhysicalEncoding::Plain { .. }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use dyninfer_architecture::{ArchitecturePackage, ResolvedModelConfig};
     use dyninfer_checkpoint::{CheckpointCatalog, ContainerIdentity, LogicalParameter};
     use dyninfer_core::{
-        ArchitectureId, CanonicalParameterName, ContainerFormatId, ConventionId, Digest,
-        LogicalTensorConstraint, LogicalTensorType, ParameterRole, ParameterSlotId,
-        PhysicalEncoding, ScalarType, SchemaFingerprint, Shape,
+        ArchitectureGraph, ArchitectureId, BlockLayoutField, CanonicalParameterName, CodecId,
+        ContainerFormatId, ConventionId, Digest, Endianness, LogicalTensorConstraint,
+        LogicalTensorType, ParameterRole, ParameterSlotId, PhysicalEncoding, ScalarType,
+        SchemaFingerprint, Shape, StorageElementType, TensorOrder,
     };
     use std::collections::BTreeMap;
+
+    fn package_with_slot(slot: ParameterSlot) -> ArchitecturePackage {
+        let id = ArchitectureId::new("llama.decoder");
+        ArchitecturePackage {
+            id: id.clone(),
+            revision: "0.1.0".into(),
+            graph: ArchitectureGraph {
+                version: 1,
+                architecture_id: id,
+                values: vec![],
+                operations: vec![],
+                parameter_slots: vec![slot],
+                exports: vec![],
+            },
+            resolved_config: ResolvedModelConfig {
+                values: BTreeMap::new(),
+            },
+        }
+    }
 
     #[test]
     fn binds_matching_name() {
@@ -368,19 +331,10 @@ mod tests {
                 shape: None,
                 element_types: vec![ScalarType::F32],
             },
-            supported_encodings: vec!["plain".into()],
             optional: false,
             tied_group: None,
         };
-        let arch = ArchitecturePackage {
-            id: ArchitectureId::new("llama.decoder"),
-            revision: "0.1.0".into(),
-            mlir_text: String::new(),
-            parameter_slots: vec![slot],
-            resolved_config: ResolvedModelConfig {
-                values: BTreeMap::new(),
-            },
-        };
+        let arch = package_with_slot(slot);
         let param = LogicalParameter {
             canonical_name: CanonicalParameterName::new("token_embd.weight"),
             role: ParameterRole::Embedding,
@@ -424,19 +378,10 @@ mod tests {
                 shape: None,
                 element_types: vec![ScalarType::F16],
             },
-            supported_encodings: vec!["plain".into(), "gguf.q4_0".into()],
             optional: false,
             tied_group: None,
         };
-        let arch = ArchitecturePackage {
-            id: ArchitectureId::new("llama.decoder"),
-            revision: "0.1.0".into(),
-            mlir_text: String::new(),
-            parameter_slots: vec![slot],
-            resolved_config: ResolvedModelConfig {
-                values: BTreeMap::new(),
-            },
-        };
+        let arch = package_with_slot(slot);
         let numel = 64u64 * 64;
         let nbytes = numel / 32 * 18;
         let param = LogicalParameter {
@@ -446,10 +391,36 @@ mod tests {
                 shape: Shape::new(vec![64, 64]),
                 element_type: ScalarType::F16,
             },
-            encoding: PhysicalEncoding::gguf_q4_0(),
+            encoding: PhysicalEncoding::BlockQuantized {
+                logical_type: ScalarType::F16,
+                block_shape: vec![32],
+                bytes_per_block: 18,
+                codec: CodecId::new("gguf.q4_0"),
+                codec_version: 1,
+                components: vec!["scale_f16".into(), "quants_u4".into()],
+                layout: vec![
+                    BlockLayoutField {
+                        name: "scale_f16".into(),
+                        byte_offset: 0,
+                        byte_length: 2,
+                        storage_type: StorageElementType::scalar(ScalarType::F16),
+                    },
+                    BlockLayoutField {
+                        name: "quants_u4".into(),
+                        byte_offset: 2,
+                        byte_length: 16,
+                        storage_type: StorageElementType::Opaque {
+                            codec: "packed.u4".into(),
+                        },
+                    },
+                ],
+                order: TensorOrder::RowMajor,
+                endianness: Endianness::Little,
+            },
             components: vec![dyninfer_core::StorageComponent {
                 name: "data".into(),
                 key: "blk.0.attn_q.weight".into(),
+                source_file_index: 0,
                 shape: Shape::new(vec![64, 64]),
                 storage_type: dyninfer_core::StorageElementType::Opaque {
                     codec: "gguf.q4_0".into(),
@@ -479,9 +450,9 @@ mod tests {
         };
         let plan = Binder::default().bind(&arch, &catalog).unwrap();
         assert_eq!(plan.bindings.len(), 1);
-        assert_eq!(
-            plan.bindings[0].materialization,
-            MaterializationPolicy::DecodeOnTheFly
-        );
+        assert!(matches!(
+            plan.bindings[0].transform,
+            BindingTransform::Identity
+        ));
     }
 }

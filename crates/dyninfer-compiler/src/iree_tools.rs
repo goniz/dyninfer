@@ -89,7 +89,14 @@ impl IreeTools {
 
     /// Compile MLIR text to VMFB bytes for the given HAL driver profile.
     pub fn compile_mlir(&self, mlir: &str, driver: &str) -> Result<Vec<u8>> {
-        self.compile_mlir_with_flags(mlir, &iree_compiler_sys::flags_for_driver(driver))
+        let flags = iree_compiler_sys::flags_for_driver(driver).map_err(|error| {
+            DynInferError::Compilation(CompilationError {
+                message: error.to_string(),
+                pass: Some("target.validate".into()),
+                diagnostics: vec![],
+            })
+        })?;
+        self.compile_mlir_with_flags(mlir, &flags)
     }
 
     /// Compile with explicit IREE flags (e.g. HIP + `--iree-rocm-target`).

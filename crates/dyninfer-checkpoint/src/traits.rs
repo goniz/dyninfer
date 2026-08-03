@@ -41,9 +41,3 @@ pub trait CheckpointConventionDecoder: Send + Sync {
         context: &DecodeContext,
     ) -> Result<ParameterCatalog>;
 }
-
-/// Optional materializer for derived parameter artifacts.
-pub trait ParameterMaterializer: Send + Sync {
-    fn id(&self) -> &str;
-    fn can_materialize(&self, encoding_name: &str) -> bool;
-}

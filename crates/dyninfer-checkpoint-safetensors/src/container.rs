@@ -216,10 +216,14 @@ impl CheckpointContainerReader for SafeTensorsContainer {
 
             entries.push(RawTensorEntry {
                 key: key.clone(),
+                source_file_index: 0,
                 shape: info.shape,
                 storage_type: StorageElementType::scalar(ty),
                 byte_ranges: vec![ByteRange::new(abs_offset, length)],
-                alignment: elem_size.max(1),
+                // SafeTensors offsets are relative to the end of a variable-size
+                // JSON header. The payload length is scalar-sized, but the
+                // absolute file offset is only guaranteed to be byte aligned.
+                alignment: 1,
                 endianness: Endianness::Little,
                 metadata: MetadataMap::new(),
             });
@@ -315,11 +319,8 @@ impl CheckpointContainerReader for SafeTensorsContainer {
         Ok(RuntimeProviderPlan {
             kind: "file-mapped-external-parameters".into(),
             scope: "weights".into(),
-            file_paths: index
-                .source_files
-                .iter()
-                .map(|f| f.path.display().to_string())
-                .collect(),
+            file_paths: index.source_files.iter().map(|f| f.path.clone()).collect(),
+            parameters: vec![],
             notes: vec!["SafeTensors dense tensors use direct byte ranges".into()],
         })
     }

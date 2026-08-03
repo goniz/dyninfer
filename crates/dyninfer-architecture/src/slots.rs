@@ -21,9 +21,6 @@ pub fn slot_opt(name: &str, role: ParameterRole, rank: usize, optional: bool) ->
             shape: None,
             element_types: vec![ScalarType::Bf16, ScalarType::F16, ScalarType::F32],
         },
-        // Q4_0 stays listed for forward-looking slot docs; binder rejects it
-        // until qkernel lowering lands (`PhysicalEncoding::is_supported_v1`).
-        supported_encodings: vec!["plain".into(), "gguf.q4_0".into()],
         optional,
         tied_group: None,
     }

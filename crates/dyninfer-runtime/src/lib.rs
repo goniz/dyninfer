@@ -13,8 +13,12 @@ mod session;
 mod stories_e2e;
 mod tokenizer_bpe;
 
-pub use builtins::{default_architecture_registry, default_checkpoint_support};
-pub use dyninfer_architecture::{LARGE_PREFILL_WINDOW, PREFILL_WINDOW, TINY_PREFILL_WINDOW};
+pub use builtins::{
+    default_architecture_registry, default_checkpoint_support, default_kernel_registry,
+    default_quantization_registry,
+};
+pub use dyninfer_compiler::{LARGE_PREFILL_WINDOW, PREFILL_WINDOW, TINY_PREFILL_WINDOW};
+pub use dyninfer_quantization::{CoverageReport, OperationCoverage};
 pub use generate::{
     GenerateConfig, GenerateOutput, GenerateStats, argmax, generate_greedy, load_tokenizer,
 };
@@ -23,7 +27,10 @@ pub use hf_hub::{
     hf_hub_cache_dir, hf_repo_folder_name, resolve_hf_snapshot,
 };
 pub use model::{LoadedModel, ModelLoader};
-pub use reference::{max_abs_err, tiny_llama_prefill_logits};
+pub use reference::{
+    max_abs_err, tiny_llama_gguf_q4_0_prefill_logits, tiny_llama_mlx_u4_prefill_logits,
+    tiny_llama_prefill_logits,
+};
 pub use session::{IreeSession, Logits};
 pub use tokenizer_bpe::BpeTokenizer;
 

@@ -87,43 +87,37 @@ pub fn revision() -> Result<String, ApiError> {
         .into_owned())
 }
 
-/// Default AMDGPU chip when compiling for HIP/ROCm without an explicit target.
-pub const DEFAULT_ROCM_TARGET: &str = "gfx1151";
-/// Default NVPTX arch when compiling for CUDA without an explicit target.
-pub const DEFAULT_CUDA_TARGET: &str = "sm_80";
-
 /// HAL/device flags for the dyninfer target driver name.
 ///
 /// `gpu_arch` is `--iree-rocm-target` / `--iree-cuda-target` /
-/// `--iree-vulkan-target` (e.g. `gfx1151`, `sm_80`). Defaults apply when
-/// omitted for HIP/CUDA/Vulkan.
+/// `--iree-vulkan-target` (e.g. `gfx1151`, `sm_80`). GPU architectures are
+/// mandatory: this API never guesses a compile target.
 ///
 /// For HIP, also sets `--iree-rocm-bc-dir` when platform bitcode can be found
 /// (required for in-process `libIREECompiler`; `iree-compile` finds it via
 /// `$ORIGIN`).
-pub fn flags_for_target(driver: &str, gpu_arch: Option<&str>) -> Vec<String> {
+pub fn flags_for_target(driver: &str, gpu_arch: Option<&str>) -> Result<Vec<String>, ApiError> {
+    let require_arch = || {
+        gpu_arch.filter(|s| !s.trim().is_empty()).ok_or_else(|| ApiError {
+            message: format!(
+                "exact GPU architecture is required for `{driver}` compilation; target guessing is disabled"
+            ),
+        })
+    };
     match driver {
         "vulkan" => {
             // Generic `--iree-hal-target-device=vulkan` alone uses Android
             // baseline SPIR-V, which fails to legalize ops like `vector.step`
             // on desktop matmul/attention. Always pin a GPU arch.
             //
-            // SPIR-V has no portable bf16; promote weight/global bf16 to f32
-            // at compile time. Runtime binds host-expanded f32 parameter bytes
-            // (see `decode_parameters_as_f32_host`) — no on-disk twin file.
-            let arch = gpu_arch
-                .filter(|s| !s.is_empty())
-                .unwrap_or(DEFAULT_ROCM_TARGET);
-            vec![
+            let arch = require_arch()?;
+            Ok(vec![
                 "--iree-hal-target-device=vulkan".into(),
                 format!("--iree-vulkan-target={arch}"),
-                "--iree-input-promote-bf16-to-f32".into(),
-            ]
+            ])
         }
         "hip" | "rocm" => {
-            let chip = gpu_arch
-                .filter(|s| !s.is_empty())
-                .unwrap_or(DEFAULT_ROCM_TARGET);
+            let chip = require_arch()?;
             let mut flags = vec![
                 "--iree-hal-target-device=hip".into(),
                 format!("--iree-rocm-target={chip}"),
@@ -132,22 +126,23 @@ pub fn flags_for_target(driver: &str, gpu_arch: Option<&str>) -> Vec<String> {
                 debug!(path = %bc.display(), "using ROCm bitcode dir");
                 flags.push(format!("--iree-rocm-bc-dir={}", bc.display()));
             }
-            flags
+            Ok(flags)
         }
         "cuda" => {
-            let arch = gpu_arch
-                .filter(|s| !s.is_empty())
-                .unwrap_or(DEFAULT_CUDA_TARGET);
-            vec![
+            let arch = require_arch()?;
+            Ok(vec![
                 "--iree-hal-target-device=cuda".into(),
                 format!("--iree-cuda-target={arch}"),
-            ]
+            ])
         }
-        _ => vec![
+        "local" | "local-task" | "local-sync" => Ok(vec![
             "--iree-hal-target-device=local".into(),
             "--iree-hal-local-target-device-backends=llvm-cpu".into(),
-            "--iree-llvmcpu-target-cpu=generic".into(),
-        ],
+            "--iree-llvmcpu-target-cpu=host".into(),
+        ]),
+        _ => Err(ApiError {
+            message: format!("unsupported IREE target driver `{driver}`"),
+        }),
     }
 }
 
@@ -231,8 +226,8 @@ fn runfiles_roots() -> Vec<std::path::PathBuf> {
     roots
 }
 
-/// Convenience wrapper: HIP/CUDA use their default GPU arches.
-pub fn flags_for_driver(driver: &str) -> Vec<String> {
+/// Convenience wrapper for drivers that do not require an architecture.
+pub fn flags_for_driver(driver: &str) -> Result<Vec<String>, ApiError> {
     flags_for_target(driver, None)
 }
 
@@ -404,7 +399,7 @@ module {
   }
 }
 "#;
-        let flags = flags_for_driver("local-task");
+        let flags = flags_for_driver("local-task").unwrap();
         match compile_mlir_to_vmfb(mlir, &flags) {
             Ok(vmfb) => {
                 assert!(!vmfb.is_empty());
@@ -427,7 +422,7 @@ module {
   }
 }
 "#;
-        let flags = flags_for_target("hip", Some("gfx1151"));
+        let flags = flags_for_target("hip", Some("gfx1151")).unwrap();
         if !flags.iter().any(|f| f.starts_with("--iree-rocm-bc-dir=")) {
             eprintln!("skipping: ROCm bitcode not found in runfiles");
             return;
@@ -435,5 +430,13 @@ module {
         let vmfb = compile_mlir_to_vmfb(mlir, &flags).expect("in-process HIP compile");
         assert!(!vmfb.is_empty());
         assert!(!vmfb.starts_with(b"DYNINFER_VMFB_STUB"));
+    }
+
+    #[test]
+    fn gpu_flags_require_exact_architecture() {
+        let error = flags_for_target("hip", None).unwrap_err();
+        assert!(error.message.contains("exact GPU architecture"));
+        let error = flags_for_target("cuda", Some("")).unwrap_err();
+        assert!(error.message.contains("target guessing is disabled"));
     }
 }

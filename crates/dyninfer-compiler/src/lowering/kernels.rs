@@ -1,4 +1,4 @@
-//! Dense-decoder helper kernels built with [`dyninfer_mlir::FuncBuilder`].
+//! Shared dense-decoder helper kernels built with [`dyninfer_mlir::FuncBuilder`].
 
 use dyninfer_error::Result;
 use dyninfer_mlir::{FuncBuilder, ModuleBuilder, Value};

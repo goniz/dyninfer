@@ -72,8 +72,28 @@ string_id!(
     ParameterSlotId
 );
 string_id!(
+    /// Stable identifier for a semantic operation in Architecture IR.
+    OperationId
+);
+string_id!(
+    /// Stable identifier for a tensor value in Architecture IR.
+    GraphValueId
+);
+string_id!(
+    /// Stable identifier for a selected production kernel.
+    KernelId
+);
+string_id!(
+    /// Stable identifier for a compiler lowering implementation.
+    LoweringId
+);
+string_id!(
     /// Quantization / packing codec identifier.
     CodecId
+);
+string_id!(
+    /// Stable physical encoding definition identifier.
+    EncodingId
 );
 string_id!(
     /// Group of tied parameters that must share storage.

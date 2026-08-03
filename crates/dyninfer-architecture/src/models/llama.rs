@@ -4,15 +4,14 @@
 //! Milestone-1 fixture. Q/K norms are optional (absent for classic Llama).
 
 use crate::naming::canonicalize_hf_family;
-use crate::ops::{DenseDecoderConfig, emit_dense_decoder_cfg};
 use crate::slots::field;
 use crate::{
-    ArchitectureDefinition, ArchitecturePackage, ConfigSchema, EmitOutput, ModelBuilder,
-    ModelModule, ResolvedModelConfig,
+    ArchitectureDefinition, ConfigSchema, DecoderBlockSpec, ModelBuilder, ModelModule,
+    ResolvedModelConfig,
 };
-use dyninfer_checkpoint::{CheckpointCatalog, ParameterCatalog};
+use dyninfer_checkpoint::ParameterCatalog;
 use dyninfer_core::ArchitectureId;
-use dyninfer_error::{CompilationError, DynInferError, Result};
+use dyninfer_error::Result;
 use std::sync::LazyLock;
 
 /// Declares which hyperparams this arch reads from `--set` / config.json / GGUF
@@ -68,16 +67,33 @@ impl ArchitectureDefinition for LlamaArchitecture {
 
     fn build(&self, config: &ResolvedModelConfig, m: &mut ModelBuilder) -> Result<ModelModule> {
         let num_layers = config.num_layers()?;
-        let _hidden = config.get_u32("hidden_size")?;
-        let _vocab = config.get_u32("vocab_size")?;
+        let hidden = config.get_u32("hidden_size")?;
+        let vocab = config.get_u32("vocab_size")?;
+        let block = DecoderBlockSpec {
+            hidden_size: hidden,
+            intermediate_size: config.get_u32("intermediate_size")?,
+            num_heads: config.get_u32("num_heads")?,
+            num_kv_heads: config.get_u32("num_kv_heads")?,
+            head_dim: config.get_u32("head_dim")?,
+            rms_norm_epsilon: config.get_f64("rms_norm_eps")?,
+            rope_theta: config
+                .values
+                .get("rope_theta")
+                .and_then(|value| value.as_f64()),
+        };
 
         let tokens = m.input_tokens("tokens")?;
-        let mut x = m.embedding(tokens, "token_embd.weight")?;
+        let mut x = m.embedding("token_embedding", tokens, "token_embd.weight", hidden)?;
         for layer in 0..num_layers {
-            x = m.dense_block(x, layer, /*has_qk_norm=*/ false)?;
+            x = m.decoder_block(x, layer, /*has_qk_norm=*/ false, &block)?;
         }
-        x = m.rms_norm(x, "output_norm.weight")?;
-        let logits = m.linear(x, "output.weight")?;
+        x = m.final_rms_norm(
+            "output_norm",
+            x,
+            "output_norm.weight",
+            block.rms_norm_epsilon,
+        )?;
+        let logits = m.output_projection("output_projection", x, "output.weight", vocab)?;
         m.export_prefill_and_decode(logits)?;
         m.finish()
     }
@@ -89,26 +105,5 @@ impl ArchitectureDefinition for LlamaArchitecture {
 
     fn sanitize_catalog(&self, catalog: &mut ParameterCatalog) {
         crate::naming::tie_output_to_embed(catalog);
-    }
-
-    fn emit_executable(
-        &self,
-        package: &ArchitecturePackage,
-        catalog: &CheckpointCatalog,
-    ) -> Result<EmitOutput> {
-        let cfg = DenseDecoderConfig::from_package(package, catalog);
-        if !cfg.supports_dense_emit() {
-            return Err(DynInferError::Compilation(CompilationError {
-                message: format!("llama.decoder cannot emit dense executable for {cfg:?}"),
-                pass: Some("emit".into()),
-                diagnostics: vec![],
-            }));
-        }
-        let mlir_text = emit_dense_decoder_cfg(package.id.as_str(), &cfg)?;
-        Ok(EmitOutput {
-            prefill_window: cfg.seq,
-            max_kv: cfg.max_kv,
-            mlir_text,
-        })
     }
 }

@@ -3,10 +3,10 @@
 #[cfg(test)]
 mod tests {
     use crate::{
-        CausalLanguageModel, GenerateConfig, ModelLoader, find_safetensors_checkpoint,
-        generate_greedy, load_tokenizer, resolve_hf_snapshot,
+        CausalLanguageModel, GenerateConfig, ModelLoader, find_gguf_checkpoint,
+        find_safetensors_checkpoint, generate_greedy, load_tokenizer, resolve_hf_snapshot,
     };
-    use dyninfer_architecture::LARGE_PREFILL_WINDOW;
+    use dyninfer_compiler::LARGE_PREFILL_WINDOW;
     use dyninfer_compiler::{CompileOptions, IreeTools};
     use dyninfer_core::{ArchitectureId, SessionConfig};
     use std::path::{Path, PathBuf};
@@ -36,6 +36,41 @@ mod tests {
             }
         }
         None
+    }
+
+    fn qwen3_gguf(filename: &str) -> Option<PathBuf> {
+        if let Ok(path) = std::env::var("DYNINFER_QWEN3_GGUF") {
+            let path = PathBuf::from(path);
+            if path.is_file()
+                && path
+                    .file_name()
+                    .is_some_and(|candidate| candidate == filename)
+            {
+                return Some(path);
+            }
+        }
+        let snapshot = resolve_hf_snapshot("unsloth/Qwen3-0.6B-GGUF", Some("main")).ok()?;
+        let preferred = snapshot.join(filename);
+        preferred.is_file().then_some(preferred)
+    }
+
+    fn qwen3_q4_0() -> Option<PathBuf> {
+        qwen3_gguf("Qwen3-0.6B-Q4_0.gguf").or_else(|| {
+            let snapshot = resolve_hf_snapshot("unsloth/Qwen3-0.6B-GGUF", Some("main")).ok()?;
+            find_gguf_checkpoint(&snapshot).ok()
+        })
+    }
+
+    fn qwen3_mlx_4bit() -> Option<PathBuf> {
+        if let Ok(path) = std::env::var("DYNINFER_QWEN3_MLX") {
+            let path = PathBuf::from(path);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+        let snapshot = resolve_hf_snapshot("mlx-community/Qwen3-0.6B-4bit", Some("main")).ok()?;
+        let index = snapshot.join("model.safetensors.index.json");
+        index.is_file().then_some(index)
     }
 
     #[test]
@@ -82,7 +117,7 @@ mod tests {
         assert!(plan.unresolved_optional_slots.is_empty());
         assert_eq!(
             plan.bindings.len() + plan.unresolved_optional_slots.len(),
-            package.parameter_slots.len()
+            package.parameter_slots().len()
         );
 
         let tok = load_tokenizer(&model_dir).unwrap();
@@ -94,8 +129,250 @@ mod tests {
         let _ = LARGE_PREFILL_WINDOW;
     }
 
-    /// Full compile + short greedy decode. Slow (~minutes); enable with
-    /// `DYNINFER_QWEN3_E2E=1`.
+    #[test]
+    fn qwen3_0_6b_dense_has_complete_kernel_coverage() {
+        let Some(model_dir) = qwen3_dir() else {
+            eprintln!("skipping: Qwen3-0.6B not in HF cache");
+            return;
+        };
+        let checkpoint = find_safetensors_checkpoint(&model_dir).unwrap();
+        let loader = ModelLoader::default();
+        let id = ArchitectureId::new("qwen3.decoder");
+        let report = loader
+            .kernel_coverage(&id, checkpoint, "cpu", &Default::default())
+            .unwrap();
+        report.require_complete().unwrap();
+        assert!(report.operations.len() > 1_000);
+    }
+
+    #[test]
+    fn unsloth_qwen3_q4_0_has_complete_mixed_direct_cpu_coverage() {
+        let Some(checkpoint) = qwen3_q4_0() else {
+            eprintln!("skipping: unsloth Qwen3-0.6B Q4_0 GGUF not in HF cache");
+            return;
+        };
+        let loader = ModelLoader::default();
+        let id = ArchitectureId::new("qwen3.decoder");
+        let report = loader
+            .kernel_coverage(&id, checkpoint, "cpu", &Default::default())
+            .unwrap();
+        assert_eq!(report.operations.len(), 1_240);
+        report.require_complete().unwrap();
+        let encodings: std::collections::BTreeSet<_> = report
+            .operations
+            .iter()
+            .filter_map(|operation| operation.encoding.as_ref())
+            .map(|encoding| encoding.id.as_str())
+            .collect();
+        assert!(encodings.contains("gguf.q4_0"));
+        assert!(encodings.contains("gguf.q4_1"));
+        assert!(encodings.contains("gguf.q6_k"));
+    }
+
+    /// Full mixed Q4_0/Q4_1/Q6_K compile + execution. Enable with
+    /// `DYNINFER_QWEN3_GGUF_E2E=1`; select the backend with
+    /// `DYNINFER_QWEN3_GGUF_TARGET` (cpu, hip, or vulkan).
+    #[test]
+    fn unsloth_qwen3_q4_0_compiles_and_executes_directly() {
+        if std::env::var_os("DYNINFER_QWEN3_GGUF_E2E").is_none() {
+            eprintln!("skipping: set DYNINFER_QWEN3_GGUF_E2E=1 to run full GGUF Qwen3");
+            return;
+        }
+        if !iree_available() {
+            eprintln!("skipping: IREE not available");
+            return;
+        }
+        let Some(checkpoint) = qwen3_q4_0() else {
+            eprintln!("skipping: unsloth Qwen3-0.6B Q4_0 GGUF not available");
+            return;
+        };
+        let target = std::env::var("DYNINFER_QWEN3_GGUF_TARGET").unwrap_or_else(|_| "cpu".into());
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("model.bundle");
+        let loader = ModelLoader::default();
+        let id = ArchitectureId::new("qwen3.decoder");
+        loader
+            .compile_to_bundle(
+                &id,
+                &checkpoint,
+                &target,
+                &bundle,
+                &CompileOptions {
+                    mode: "local-jit".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|error| panic!("compile direct GGUF Qwen3 on {target}: {error}"));
+
+        let model = loader.load_bundle(&bundle, &checkpoint).unwrap();
+        assert!(!model.manifest.derived_parameters_required);
+        assert!(!bundle.join("parameters").exists());
+        let mut session = model.create_session(SessionConfig::default()).unwrap();
+        let logits = session.prefill(&[9707]).unwrap();
+        assert_eq!(logits.values.len(), 151_936);
+        assert!(logits.values.iter().all(|value| value.is_finite()));
+        let next = logits
+            .values
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .unwrap()
+            .0 as u32;
+        let decoded = session.decode(next).unwrap();
+        assert!(decoded.values.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn unsloth_ud_variants_are_validated_as_mixed_per_tensor_schemas() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "Qwen3-0.6B-UD-IQ1_S.gguf",
+                &[
+                    "gguf.iq1_m",
+                    "gguf.iq1_s",
+                    "gguf.iq2_s",
+                    "gguf.iq2_xxs",
+                    "gguf.iq3_s",
+                    "gguf.iq3_xxs",
+                    "gguf.q2_k",
+                    "gguf.q5_k",
+                ],
+            ),
+            (
+                "Qwen3-0.6B-UD-Q4_K_XL.gguf",
+                &["gguf.iq4_xs", "gguf.q4_k", "gguf.q5_k"],
+            ),
+        ];
+        let loader = ModelLoader::default();
+        let id = ArchitectureId::new("qwen3.decoder");
+        let mut exercised = 0;
+        for (filename, expected_encodings) in cases {
+            let Some(checkpoint) = qwen3_gguf(filename) else {
+                continue;
+            };
+            exercised += 1;
+            let report = loader
+                .kernel_coverage(&id, checkpoint, "cpu", &Default::default())
+                .unwrap();
+            assert!(!report.is_complete());
+            assert!(
+                report
+                    .operations
+                    .iter()
+                    .all(|operation| operation.validation_error.is_none()),
+                "{filename} contains an unregistered or malformed encoding"
+            );
+            let actual: std::collections::BTreeSet<_> = report
+                .operations
+                .iter()
+                .filter(|operation| operation.selected.is_none())
+                .filter_map(|operation| operation.encoding.as_ref())
+                .map(|encoding| encoding.id.as_str())
+                .collect();
+            let expected: std::collections::BTreeSet<_> =
+                expected_encodings.iter().copied().collect();
+            assert_eq!(actual, expected, "unexpected mixed schema for {filename}");
+        }
+        if exercised == 0 {
+            eprintln!("skipping: Unsloth Qwen3 UD GGUFs not in HF cache");
+        }
+    }
+
+    #[test]
+    fn mlx_qwen3_4bit_has_complete_direct_grouped_cpu_coverage() {
+        let Some(checkpoint) = qwen3_mlx_4bit() else {
+            eprintln!("skipping: mlx-community Qwen3-0.6B-4bit not in HF cache");
+            return;
+        };
+        let loader = ModelLoader::default();
+        let id = ArchitectureId::new("qwen3.decoder");
+        let report = loader
+            .kernel_coverage(&id, checkpoint, "cpu", &Default::default())
+            .unwrap();
+        assert_eq!(report.operations.len(), 1_240);
+        report.require_complete().unwrap();
+        let mlx_requests: Vec<_> = report
+            .operations
+            .iter()
+            .filter(|operation| {
+                operation
+                    .encoding
+                    .as_ref()
+                    .is_some_and(|encoding| encoding.id.as_str() == "mlx.affine.u4")
+            })
+            .collect();
+        assert_eq!(mlx_requests.len(), 396);
+        assert!(mlx_requests.iter().all(|operation| {
+            operation.selected.as_ref().is_some_and(|selected| {
+                selected
+                    .descriptor
+                    .lowering
+                    .as_str()
+                    .starts_with("mlx.affine.u4.")
+            }) && operation.validation_error.is_none()
+                && operation.checkpoint_component_keys.len() == 3
+        }));
+    }
+
+    /// Full direct packed-U4 compile + short greedy decode. Enable with
+    /// `DYNINFER_QWEN3_MLX_E2E=1`; pass the checkpoint through Bazel with
+    /// `--test_env=DYNINFER_QWEN3_MLX=/absolute/path/to/index.json`. Select
+    /// cpu, hip, or vulkan with `DYNINFER_QWEN3_MLX_TARGET`.
+    #[test]
+    fn mlx_qwen3_0_6b_compiles_and_generates_without_materialization() {
+        if std::env::var_os("DYNINFER_QWEN3_MLX_E2E").is_none() {
+            eprintln!("skipping: set DYNINFER_QWEN3_MLX_E2E=1 to run full MLX Qwen3 compile");
+            return;
+        }
+        if !iree_available() {
+            eprintln!("skipping: IREE not available");
+            return;
+        }
+        let Some(checkpoint) = qwen3_mlx_4bit() else {
+            eprintln!("skipping: mlx-community Qwen3-0.6B-4bit not available");
+            return;
+        };
+        let model_dir = checkpoint.parent().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("model.bundle");
+        let loader = ModelLoader::default();
+        let id = ArchitectureId::new("qwen3.decoder");
+        let target = std::env::var("DYNINFER_QWEN3_MLX_TARGET").unwrap_or_else(|_| "cpu".into());
+        loader
+            .compile_to_bundle(
+                &id,
+                &checkpoint,
+                &target,
+                &bundle,
+                &CompileOptions {
+                    mode: "local-jit".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|error| panic!("compile direct MLX Qwen3-0.6B on {target}: {error}"));
+
+        let model = loader.load_bundle(&bundle, &checkpoint).unwrap();
+        assert!(!model.manifest.derived_parameters_required);
+        assert!(model.manifest.parameter_components.len() > model.binding.bindings.len());
+        assert!(!bundle.join("parameters").exists());
+        let tokenizer = load_tokenizer(model_dir).unwrap();
+        let output = generate_greedy(
+            &model,
+            &tokenizer,
+            "Hello",
+            &GenerateConfig {
+                max_new_tokens: 2,
+                eos_token_id: tokenizer.eos_id(),
+            },
+            SessionConfig::default(),
+        )
+        .expect("generate with direct MLX Qwen3-0.6B");
+        assert!(output.text.starts_with("Hello"));
+        assert!(output.token_ids.len() > 1);
+    }
+
+    /// Full compile + short greedy decode. Enable with `DYNINFER_QWEN3_E2E=1`;
+    /// select cpu, hip, or vulkan with `DYNINFER_QWEN3_TARGET`.
     #[test]
     fn qwen3_0_6b_compiles_and_generates() {
         if std::env::var_os("DYNINFER_QWEN3_E2E").is_none() {
@@ -118,18 +395,19 @@ mod tests {
         let loader = ModelLoader::default();
         let id = loader.resolve_architecture(None, &ckpt).unwrap();
         assert_eq!(id.as_str(), "qwen3.decoder");
+        let target = std::env::var("DYNINFER_QWEN3_TARGET").unwrap_or_else(|_| "cpu".into());
         loader
             .compile_to_bundle(
                 &id,
                 &ckpt,
-                "cpu",
+                &target,
                 &bundle,
                 &CompileOptions {
                     mode: "local-jit".into(),
                     ..Default::default()
                 },
             )
-            .expect("compile Qwen3-0.6B");
+            .unwrap_or_else(|error| panic!("compile dense Qwen3-0.6B on {target}: {error}"));
 
         let model = loader.load_bundle(&bundle, &ckpt).unwrap();
         assert_eq!(model.metadata().vocabulary_size, 151_936);

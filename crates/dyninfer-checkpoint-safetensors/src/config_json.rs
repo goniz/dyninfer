@@ -104,5 +104,21 @@ pub fn load_hf_config_metadata(checkpoint: &Path) -> MetadataMap {
         out.insert("tie_word_embeddings".into(), Value::from(v));
     }
 
+    let quantization = obj
+        .get("quantization_config")
+        .or_else(|| obj.get("quantization"))
+        .and_then(Value::as_object);
+    if let Some(quantization) = quantization {
+        if let Some(bits) = quantization.get("bits").and_then(Value::as_u64) {
+            out.insert("mlx.quantization.bits".into(), Value::from(bits));
+        }
+        if let Some(group_size) = quantization.get("group_size").and_then(Value::as_u64) {
+            out.insert(
+                "mlx.quantization.group_size".into(),
+                Value::from(group_size),
+            );
+        }
+    }
+
     out
 }

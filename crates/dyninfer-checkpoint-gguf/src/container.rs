@@ -305,6 +305,7 @@ impl CheckpointContainerReader for GgufContainer {
             );
             entries.push(RawTensorEntry {
                 key: dir.name,
+                source_file_index: 0,
                 shape: dir.shape,
                 storage_type: dir.gguf_type.storage_element_type(),
                 byte_ranges: vec![ByteRange::new(abs, nbytes)],
@@ -345,11 +346,8 @@ impl CheckpointContainerReader for GgufContainer {
         Ok(RuntimeProviderPlan {
             kind: "file-mapped-external-parameters".into(),
             scope: "weights".into(),
-            file_paths: index
-                .source_files
-                .iter()
-                .map(|f| f.path.display().to_string())
-                .collect(),
+            file_paths: index.source_files.iter().map(|f| f.path.clone()).collect(),
+            parameters: vec![],
             notes: vec!["GGUF tensors addressed by absolute file offsets".into()],
         })
     }

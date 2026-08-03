@@ -41,6 +41,20 @@ enum Commands {
         #[arg(long = "set", value_name = "KEY=VALUE")]
         set: Vec<String>,
     },
+    /// Validate per-operation production kernel coverage without compiling.
+    Coverage {
+        /// Architecture id, or `auto` to detect from checkpoint metadata.
+        #[arg(long, default_value = "auto")]
+        architecture: String,
+        #[arg(long)]
+        checkpoint: PathBuf,
+        #[arg(long, default_value = "auto")]
+        target: String,
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Compile architecture + checkpoint into a bundle.
     Compile {
         /// Architecture id, or `auto` to detect from config.json.
@@ -257,6 +271,52 @@ fn main() -> anyhow::Result<()> {
             }
             std::fs::write(&output, serde_json::to_vec_pretty(&plan)?)?;
             println!("wrote binding plan to {}", output.display());
+        }
+        Commands::Coverage {
+            architecture,
+            checkpoint,
+            target,
+            set,
+            json,
+        } => {
+            let loader = ModelLoader::default();
+            let id = loader.resolve_architecture(Some(&architecture), &checkpoint)?;
+            let overrides = parse_sets(&set)?;
+            let report = loader.kernel_coverage(&id, &checkpoint, &target, &overrides)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                let selected = report
+                    .operations
+                    .iter()
+                    .filter(|operation| operation.selected.is_some())
+                    .count();
+                println!(
+                    "coverage: {selected}/{} operation-mode requests",
+                    report.operations.len()
+                );
+                for operation in report.operations.iter().filter(|operation| {
+                    operation.selected.is_none() || operation.validation_error.is_some()
+                }) {
+                    println!(
+                        "  unsupported {} {:?} encoding={:?}: {}",
+                        operation.operation_id,
+                        operation.mode,
+                        operation.encoding,
+                        operation
+                            .validation_error
+                            .as_deref()
+                            .unwrap_or("no production candidate")
+                    );
+                    for rejected in &operation.rejected {
+                        println!(
+                            "    rejected {}: {:?}",
+                            rejected.candidate_id, rejected.reasons
+                        );
+                    }
+                }
+            }
+            report.require_complete()?;
         }
         Commands::Compile {
             architecture,

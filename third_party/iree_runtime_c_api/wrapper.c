@@ -7,7 +7,6 @@
 #include "iree/base/api.h"
 #include "iree/hal/api.h"
 #include "iree/io/file_handle.h"
-#include "iree/io/formats/parser_registry.h"
 #include "iree/io/parameter_index.h"
 #include "iree/io/parameter_index_provider.h"
 #include "iree/modules/io/parameters/module.h"
@@ -54,102 +53,77 @@ void dyninfer_iree_free(void* p) {
   (void)p;
 }
 
-static iree_status_t append_parameters_module(iree_runtime_session_t* session,
-                                             const char* parameters_path) {
-  if (!parameters_path || parameters_path[0] == '\0') {
-    return iree_ok_status();
+// Builds a container-independent parameter index over exact byte ranges in the
+// original checkpoint files. File handles are opened once here and retained by
+// index entries/provider/module for the session lifetime.
+static iree_status_t append_file_parameters_module(
+    iree_runtime_session_t* session,
+    const dyninfer_iree_parameter_file_t* files, size_t file_count,
+    const dyninfer_iree_file_param_t* params, size_t param_count) {
+  if (!files || file_count == 0 || !params || param_count == 0) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "file parameter descriptors are empty");
   }
 
   iree_allocator_t host_allocator =
       iree_runtime_session_host_allocator(session);
   iree_vm_instance_t* vm_instance =
       iree_runtime_instance_vm_instance(iree_runtime_session_instance(session));
-
-  iree_io_parameter_index_t* index = NULL;
-  IREE_RETURN_IF_ERROR(iree_io_parameter_index_create(host_allocator, &index));
-
-  iree_io_file_handle_t* file_handle = NULL;
-  iree_status_t status = iree_io_file_handle_open(
-      IREE_IO_FILE_MODE_READ, iree_make_cstring_view(parameters_path),
-      host_allocator, &file_handle);
-  if (iree_status_is_ok(status)) {
-    status = iree_io_parse_file_index(iree_make_cstring_view(parameters_path),
-                                      file_handle, index, host_allocator);
-  }
-  iree_io_file_handle_release(file_handle);
-
-  iree_io_parameter_provider_t* provider = NULL;
-  if (iree_status_is_ok(status)) {
-    status = iree_io_parameter_index_provider_create(
-        iree_make_cstring_view("weights"), index,
-        IREE_IO_PARAMETER_INDEX_PROVIDER_DEFAULT_MAX_CONCURRENT_OPERATIONS,
-        host_allocator, &provider);
-  }
-  iree_io_parameter_index_release(index);
-
-  iree_vm_module_t* module = NULL;
-  if (iree_status_is_ok(status)) {
-    status = iree_io_parameters_module_create(vm_instance, /*provider_count=*/1,
-                                             &provider, host_allocator, &module);
-  }
-  iree_io_parameter_provider_release(provider);
-
-  if (iree_status_is_ok(status)) {
-    status = iree_runtime_session_append_module(session, module);
-  }
-  iree_vm_module_release(module);
-  return status;
-}
-
-// Bind host-owned f32 (or other) blobs under scope "weights". Caller retains
-// ownership of |params[i].data| for the session lifetime.
-static iree_status_t append_host_parameters_module(
-    iree_runtime_session_t* session, const dyninfer_iree_host_param_t* params,
-    size_t param_count) {
-  if (!params || param_count == 0) {
-    return iree_ok_status();
+  iree_io_file_handle_t** handles =
+      (iree_io_file_handle_t**)calloc(file_count, sizeof(*handles));
+  if (!handles) {
+    return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
+                            "allocating %zu checkpoint file handles", file_count);
   }
 
-  iree_allocator_t host_allocator =
-      iree_runtime_session_host_allocator(session);
-  iree_vm_instance_t* vm_instance =
-      iree_runtime_instance_vm_instance(iree_runtime_session_instance(session));
-
-  iree_io_parameter_index_t* index = NULL;
-  IREE_RETURN_IF_ERROR(iree_io_parameter_index_create(host_allocator, &index));
-  iree_status_t status = iree_io_parameter_index_reserve(index, param_count);
-
-  for (size_t i = 0; iree_status_is_ok(status) && i < param_count; ++i) {
-    if (!params[i].key || !params[i].data || params[i].length == 0) {
+  iree_status_t status = iree_ok_status();
+  for (size_t i = 0; iree_status_is_ok(status) && i < file_count; ++i) {
+    if (!files[i].path || files[i].path[0] == '\0') {
       status = iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                                "host param %zu missing key/data", i);
+                                "checkpoint file %zu has no path", i);
       break;
     }
-    iree_io_file_handle_t* handle = NULL;
-    status = iree_io_file_handle_wrap_host_allocation(
-        IREE_IO_FILE_ACCESS_READ,
-        iree_make_byte_span((void*)params[i].data, params[i].length),
-        iree_io_file_handle_release_callback_null(), host_allocator, &handle);
-    if (!iree_status_is_ok(status)) break;
+    status = iree_io_file_handle_open(
+        IREE_IO_FILE_MODE_READ | IREE_IO_FILE_MODE_RANDOM_ACCESS,
+        iree_make_cstring_view(files[i].path), host_allocator, &handles[i]);
+  }
 
+  iree_io_parameter_index_t* index = NULL;
+  if (iree_status_is_ok(status)) {
+    status = iree_io_parameter_index_create(host_allocator, &index);
+  }
+  if (iree_status_is_ok(status)) {
+    status = iree_io_parameter_index_reserve(index, param_count);
+  }
+  for (size_t i = 0; iree_status_is_ok(status) && i < param_count; ++i) {
+    if (!params[i].key || params[i].key[0] == '\0' || params[i].length == 0 ||
+        params[i].source_file_index >= file_count ||
+        params[i].offset > UINT64_MAX - params[i].length) {
+      status = iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                                "invalid file parameter descriptor %zu", i);
+      break;
+    }
     iree_io_parameter_index_entry_t entry = {
         .key = iree_make_cstring_view(params[i].key),
         .metadata = iree_const_byte_span_empty(),
-        .length = (uint64_t)params[i].length,
+        .length = params[i].length,
         .type = IREE_IO_PARAMETER_INDEX_ENTRY_STORAGE_TYPE_FILE,
         .storage =
             {
                 .file =
                     {
-                        .handle = handle,
-                        .offset = 0,
+                        .handle = handles[params[i].source_file_index],
+                        .offset = params[i].offset,
                     },
             },
     };
     status = iree_io_parameter_index_add(index, &entry);
-    // Index retains the handle; drop our local ref.
-    iree_io_file_handle_release(handle);
   }
+
+  for (size_t i = 0; i < file_count; ++i) {
+    if (handles[i]) iree_io_file_handle_release(handles[i]);
+  }
+  free(handles);
 
   iree_io_parameter_provider_t* provider = NULL;
   if (iree_status_is_ok(status)) {
@@ -166,7 +140,6 @@ static iree_status_t append_host_parameters_module(
                                              &provider, host_allocator, &module);
   }
   iree_io_parameter_provider_release(provider);
-
   if (iree_status_is_ok(status)) {
     status = iree_runtime_session_append_module(session, module);
   }
@@ -175,9 +148,10 @@ static iree_status_t append_host_parameters_module(
 }
 
 static int session_create_common(const char* device_uri, const char* vmfb_path,
-                                 const char* parameters_path,
-                                 const dyninfer_iree_host_param_t* host_params,
-                                 size_t host_param_count,
+                                 const dyninfer_iree_parameter_file_t* files,
+                                 size_t file_count,
+                                 const dyninfer_iree_file_param_t* file_params,
+                                 size_t file_param_count,
                                  dyninfer_iree_session_t** out_session) {
   *out_session = NULL;
   g_last_error[0] = '\0';
@@ -226,11 +200,9 @@ static int session_create_common(const char* device_uri, const char* vmfb_path,
   }
 
   if (iree_status_is_ok(status)) {
-    if (host_params && host_param_count > 0) {
-      status = append_host_parameters_module(s->session, host_params,
-                                             host_param_count);
-    } else {
-      status = append_parameters_module(s->session, parameters_path);
+    if (files && file_count > 0 && file_params && file_param_count > 0) {
+      status = append_file_parameters_module(s->session, files, file_count,
+                                             file_params, file_param_count);
     }
   }
   if (iree_status_is_ok(status)) {
@@ -248,19 +220,20 @@ static int session_create_common(const char* device_uri, const char* vmfb_path,
 }
 
 int dyninfer_iree_session_create(const char* device_uri, const char* vmfb_path,
-                                 const char* parameters_path,
                                  dyninfer_iree_session_t** out_session) {
-  return session_create_common(device_uri, vmfb_path, parameters_path,
-                               /*host_params=*/NULL, /*host_param_count=*/0,
+  return session_create_common(device_uri, vmfb_path,
+                               /*files=*/NULL, /*file_count=*/0,
+                               /*file_params=*/NULL, /*file_param_count=*/0,
                                out_session);
 }
 
-int dyninfer_iree_session_create_with_host_params(
+int dyninfer_iree_session_create_with_file_params(
     const char* device_uri, const char* vmfb_path,
-    const dyninfer_iree_host_param_t* params, size_t param_count,
+    const dyninfer_iree_parameter_file_t* files, size_t file_count,
+    const dyninfer_iree_file_param_t* params, size_t param_count,
     dyninfer_iree_session_t** out_session) {
-  return session_create_common(device_uri, vmfb_path, /*parameters_path=*/NULL,
-                               params, param_count, out_session);
+  return session_create_common(device_uri, vmfb_path, files, file_count, params,
+                               param_count, out_session);
 }
 
 static iree_status_t allocate_i64_tensor(iree_runtime_session_t* session,

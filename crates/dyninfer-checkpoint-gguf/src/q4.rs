@@ -9,6 +9,8 @@ use std::io::Write;
 
 pub const Q4_0_BLOCK: usize = 32;
 pub const Q4_0_TYPE_SIZE: usize = 18; // f16 scale + 16 packed nibbles
+pub const Q4_1_TYPE_SIZE: usize = 20; // f16 scale + f16 minimum + 16 nibbles
+pub const Q8_0_TYPE_SIZE: usize = 34; // f16 scale + 32 signed bytes
 
 /// Pack row-major f32 weights into GGUF Q4_0 bytes (numel must be divisible by 32).
 pub fn pack_q4_0(weights: &[f32]) -> Result<Vec<u8>> {
@@ -30,22 +32,73 @@ pub fn pack_q4_0(weights: &[f32]) -> Result<Vec<u8>> {
         out.extend_from_slice(&scale_f16.to_le_bytes());
         let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
         let mut qs = [0u8; 16];
-        for (i, &w) in block.iter().enumerate() {
-            let mut q = (w * inv).round() as i32;
-            q = q.clamp(-8, 7);
-            let nibble = (q + 8) as u8;
-            if i % 2 == 0 {
-                qs[i / 2] = nibble;
-            } else {
-                qs[i / 2] |= nibble << 4;
-            }
+        // GGML stores values 0..16 in the low nibbles and values 16..32
+        // in the high nibbles of the same 16 bytes. It does not interleave
+        // adjacent logical values in one byte.
+        for i in 0..16 {
+            let low = ((block[i] * inv).round() as i32).clamp(-8, 7) + 8;
+            let high = ((block[i + 16] * inv).round() as i32).clamp(-8, 7) + 8;
+            qs[i] = low as u8 | ((high as u8) << 4);
         }
         out.extend_from_slice(&qs);
     }
     Ok(out)
 }
 
+fn pack_q4_1(weights: &[f32]) -> Result<Vec<u8>> {
+    if !weights.len().is_multiple_of(Q4_0_BLOCK) {
+        return Err(DynInferError::io(format!(
+            "Q4_1 pack: numel {} not divisible by {Q4_0_BLOCK}",
+            weights.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(weights.len() / Q4_0_BLOCK * Q4_1_TYPE_SIZE);
+    for block in weights.chunks_exact(Q4_0_BLOCK) {
+        let minimum = block.iter().copied().fold(f32::INFINITY, f32::min);
+        let maximum = block.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let scale = if maximum > minimum {
+            (maximum - minimum) / 15.0
+        } else {
+            0.0
+        };
+        out.extend_from_slice(&f16::from_f32(scale).to_le_bytes());
+        out.extend_from_slice(&f16::from_f32(minimum).to_le_bytes());
+        let inverse = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+        for lane in 0..16 {
+            let low = ((block[lane] - minimum) * inverse).round().clamp(0.0, 15.0) as u8;
+            let high = ((block[lane + 16] - minimum) * inverse)
+                .round()
+                .clamp(0.0, 15.0) as u8;
+            out.push(low | (high << 4));
+        }
+    }
+    Ok(out)
+}
+
+fn pack_q8_0(weights: &[f32]) -> Result<Vec<u8>> {
+    if !weights.len().is_multiple_of(Q4_0_BLOCK) {
+        return Err(DynInferError::io(format!(
+            "Q8_0 pack: numel {} not divisible by {Q4_0_BLOCK}",
+            weights.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(weights.len() / Q4_0_BLOCK * Q8_0_TYPE_SIZE);
+    for block in weights.chunks_exact(Q4_0_BLOCK) {
+        let amax = block.iter().map(|value| value.abs()).fold(0.0, f32::max);
+        let scale = if amax > 0.0 { amax / 127.0 } else { 0.0 };
+        out.extend_from_slice(&f16::from_f32(scale).to_le_bytes());
+        let inverse = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+        out.extend(
+            block
+                .iter()
+                .map(|value| ((*value * inverse).round() as i32).clamp(-127, 127) as i8 as u8),
+        );
+    }
+    Ok(out)
+}
+
 /// Dequantize GGUF Q4_0 packed bytes to f32 (reference / host path).
+#[cfg(test)]
 pub fn dequant_q4_0(packed: &[u8], numel: usize) -> Result<Vec<f32>> {
     if !numel.is_multiple_of(Q4_0_BLOCK) {
         return Err(DynInferError::io(format!(
@@ -66,8 +119,8 @@ pub fn dequant_q4_0(packed: &[u8], numel: usize) -> Result<Vec<f32>> {
         let scale = f16::from_le_bytes([packed[off], packed[off + 1]]).to_f32();
         let qs = &packed[off + 2..off + 18];
         for i in 0..Q4_0_BLOCK {
-            let byte = qs[i / 2];
-            let nibble = if i % 2 == 0 { byte & 0x0f } else { byte >> 4 };
+            let byte = qs[i % 16];
+            let nibble = if i < 16 { byte & 0x0f } else { byte >> 4 };
             out.push((nibble as i32 - 8) as f32 * scale);
         }
     }
@@ -169,7 +222,7 @@ pub fn fill_f32(n: usize, seed: u32) -> Vec<f32> {
     out
 }
 
-/// Tiny Llama-shaped GGUF: linear weights Q4_0, norms/embeddings F32.
+/// Tiny Llama-shaped mixed GGUF: Q4_0/Q4_1/Q8_0 linears and plain embedding.
 ///
 /// Dims match `tiny_llama_dense_f32` so the same architecture emit path applies.
 pub fn tiny_llama_q4_0() -> Result<Vec<u8>> {
@@ -203,11 +256,13 @@ pub fn tiny_llama_q4_0() -> Result<Vec<u8>> {
 
     let mut tensors = BTreeMap::new();
 
-    // Embeddings stay F32 (gather path); linears are Q4_0.
-    let emb = fill_f32((vocab * hidden) as usize, 1);
     tensors.insert(
         "token_embd.weight".into(),
-        (vec![vocab, hidden], GgufType::F32 as u32, f32_bytes(&emb)),
+        (
+            vec![vocab, hidden],
+            GgufType::F32 as u32,
+            f32_bytes(&fill_f32((vocab * hidden) as usize, 1)),
+        ),
     );
 
     let ones = vec![1.0f32; hidden as usize];
@@ -227,11 +282,12 @@ pub fn tiny_llama_q4_0() -> Result<Vec<u8>> {
         ("output.weight", 9, vocab, hidden),
     ] {
         let w = fill_f32((rows * cols) as usize, seed);
-        let packed = pack_q4_0(&w)?;
-        tensors.insert(
-            name.into(),
-            (vec![rows, cols], GgufType::Q4_0 as u32, packed),
-        );
+        let (kind, packed) = match name {
+            "blk.0.attn_q.weight" => (GgufType::Q4_1, pack_q4_1(&w)?),
+            "blk.0.attn_v.weight" => (GgufType::Q8_0, pack_q8_0(&w)?),
+            _ => (GgufType::Q4_0, pack_q4_0(&w)?),
+        };
+        tensors.insert(name.into(), (vec![rows, cols], kind as u32, packed));
     }
 
     tensors.insert(
@@ -292,6 +348,70 @@ mod tests {
                     == Some(GgufType::Q4_0 as u64)
             })
             .count();
-        assert!(q >= 8, "expected Q4_0 tensors, got {q}");
+        assert!(q >= 6, "expected mixed Q4_0 tensors, got {q}");
+        assert!(index.entries.iter().any(|entry| {
+            entry
+                .metadata
+                .get("gguf.type_code")
+                .and_then(|value| value.as_u64())
+                == Some(GgufType::Q8_0 as u64)
+        }));
+    }
+
+    #[test]
+    fn mixed_gguf_decodes_each_tensor_type_independently() {
+        use dyninfer_checkpoint::{
+            BuiltinCheckpointSupport, BytesSource, DecodeContext, InspectionLimits,
+        };
+        use dyninfer_core::PhysicalEncoding;
+        use std::sync::Arc;
+
+        let mut tensors = BTreeMap::new();
+        tensors.insert(
+            "dense.weight".into(),
+            (vec![32], GgufType::F32 as u32, vec![0; 32 * 4]),
+        );
+        tensors.insert(
+            "classic.weight".into(),
+            (vec![32], GgufType::Q4_0 as u32, vec![0; 18]),
+        );
+        tensors.insert(
+            "k_quant.weight".into(),
+            (vec![256], GgufType::Q6_K as u32, vec![0; 210]),
+        );
+        tensors.insert(
+            "ud_iq.weight".into(),
+            (vec![256], GgufType::IQ1_S as u32, vec![0; 50]),
+        );
+        let bytes = write_gguf(&tensors, &BTreeMap::new()).unwrap();
+        let source = Arc::new(BytesSource::new(bytes));
+        let mut support = BuiltinCheckpointSupport::new();
+        crate::register(&mut support);
+        let catalog = support
+            .inspect_source(
+                source,
+                &InspectionLimits::default(),
+                &DecodeContext::default(),
+            )
+            .unwrap();
+        assert_eq!(catalog.convention_id.as_str(), "gguf.mixed");
+        let codecs: BTreeMap<_, _> = catalog
+            .parameters
+            .iter()
+            .map(|parameter| {
+                let codec = match &parameter.encoding {
+                    PhysicalEncoding::Plain { storage_type, .. } => {
+                        format!("plain.{storage_type}")
+                    }
+                    PhysicalEncoding::BlockQuantized { codec, .. } => codec.to_string(),
+                    other => panic!("unexpected encoding: {other:?}"),
+                };
+                (parameter.canonical_name.to_string(), codec)
+            })
+            .collect();
+        assert_eq!(codecs.get("dense.weight").unwrap(), "plain.f32");
+        assert_eq!(codecs.get("classic.weight").unwrap(), "gguf.q4_0");
+        assert_eq!(codecs.get("k_quant.weight").unwrap(), "gguf.q6_k");
+        assert_eq!(codecs.get("ud_iq.weight").unwrap(), "gguf.iq1_s");
     }
 }

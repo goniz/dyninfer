@@ -1,0 +1,10 @@
+//! Shared semantic transformer lowerings owned by the compiler.
+
+mod dense_decoder;
+mod kernels;
+pub(super) mod parameter;
+
+pub use dense_decoder::{
+    DenseDecoderConfig, LARGE_MAX_KV, LARGE_PREFILL_WINDOW, PREFILL_MAX_KV, PREFILL_WINDOW,
+    TINY_MAX_KV, TINY_PREFILL_WINDOW, emit_dense_decoder_cfg,
+};

@@ -2,8 +2,12 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::{CausalLanguageModel, ModelLoader, max_abs_err, tiny_llama_prefill_logits};
-    use dyninfer_checkpoint_safetensors::tiny_llama_dense_f32;
+    use crate::{
+        CausalLanguageModel, ModelLoader, max_abs_err, tiny_llama_gguf_q4_0_prefill_logits,
+        tiny_llama_mlx_u4_prefill_logits, tiny_llama_prefill_logits,
+    };
+    use dyninfer_cache::ArtifactCache;
+    use dyninfer_checkpoint_safetensors::{tiny_llama_dense_f32, tiny_llama_mlx_affine_u4};
     use dyninfer_compiler::{CompileOptions, IreeTools, compile_add_smoke};
     use dyninfer_core::{ArchitectureId, SessionConfig, TargetProfile};
     use iree_runtime::{Context, Instance, Module};
@@ -51,7 +55,7 @@ mod tests {
         assert_eq!(package.resolved_config.num_layers().unwrap(), 1);
         assert_eq!(
             plan.bindings.len() + plan.unresolved_optional_slots.len(),
-            package.parameter_slots.len()
+            package.parameter_slots().len()
         );
 
         let bundle = dir.path().join("model.bundle");
@@ -73,6 +77,12 @@ mod tests {
         let model = loader.load_bundle(&bundle, &ckpt).unwrap();
         assert_eq!(model.metadata().vocabulary_size, 32);
         assert_eq!(model.manifest.kv_cache.max_sequence_length, 4);
+        assert!(!model.manifest.derived_parameters_required);
+        assert_eq!(
+            model.manifest.parameter_components.len(),
+            model.binding.bindings.len()
+        );
+        assert!(!bundle.join("parameters").exists());
         let mut session = model.create_session(SessionConfig::default()).unwrap();
 
         let tokens = [1u32, 2, 3, 0];
@@ -127,6 +137,275 @@ mod tests {
             .invoke_add(&[1.0, 2.0, 3.0, 4.0], &[10.0, 20.0, 30.0, 40.0])
             .unwrap();
         assert_eq!(sum, vec![11.0, 22.0, 33.0, 44.0]);
+    }
+
+    #[test]
+    fn schema_identical_values_reuse_vmfb_with_distinct_direct_parameters() {
+        if !iree_available() {
+            eprintln!("skipping: IREE not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint_a = dir.path().join("values-a.safetensors");
+        let checkpoint_b = dir.path().join("values-b.safetensors");
+        let values_a = tiny_llama_dense_f32();
+        let mut values_b = values_a.clone();
+        let header_len = u64::from_le_bytes(values_b[..8].try_into().unwrap()) as usize;
+        let header: serde_json::Value =
+            serde_json::from_slice(&values_b[8..8 + header_len]).unwrap();
+        let offsets = header["output.weight"]["data_offsets"].as_array().unwrap();
+        let start = 8 + header_len + offsets[0].as_u64().unwrap() as usize;
+        let end = 8 + header_len + offsets[1].as_u64().unwrap() as usize;
+        for value in values_b[start..end].chunks_exact_mut(4) {
+            value.copy_from_slice(&0.0f32.to_le_bytes());
+        }
+        fs::write(&checkpoint_a, values_a).unwrap();
+        fs::write(&checkpoint_b, values_b).unwrap();
+
+        let cache = ArtifactCache::open(dir.path().join("cache")).unwrap();
+        let loader = ModelLoader::default().with_cache(cache.clone());
+        let architecture = ArchitectureId::new("llama.decoder");
+        let bundle_a = dir.path().join("bundle-a");
+        let bundle_b = dir.path().join("bundle-b");
+        let options = CompileOptions {
+            mode: "local-jit".into(),
+            ..Default::default()
+        };
+        loader
+            .compile_to_bundle(&architecture, &checkpoint_a, "cpu", &bundle_a, &options)
+            .unwrap();
+        loader
+            .compile_to_bundle(&architecture, &checkpoint_b, "cpu", &bundle_b, &options)
+            .unwrap();
+        assert_eq!(cache.list().unwrap().len(), 1);
+        assert_eq!(
+            fs::read(bundle_a.join("executables/model.vmfb")).unwrap(),
+            fs::read(bundle_b.join("executables/model.vmfb")).unwrap()
+        );
+
+        let tokens = [1u32, 2, 3, 0];
+        let model_a = loader.load_bundle(&bundle_a, &checkpoint_a).unwrap();
+        let model_b = loader.load_bundle(&bundle_b, &checkpoint_b).unwrap();
+        let logits_a = model_a
+            .create_session(SessionConfig::default())
+            .unwrap()
+            .prefill(&tokens)
+            .unwrap();
+        let logits_b = model_b
+            .create_session(SessionConfig::default())
+            .unwrap()
+            .prefill(&tokens)
+            .unwrap();
+        assert_ne!(logits_a.values, logits_b.values);
+    }
+
+    #[test]
+    fn bundle_with_different_target_fingerprint_is_rejected_before_invocation() {
+        if !iree_available() {
+            eprintln!("skipping: IREE not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = dir.path().join("tiny.safetensors");
+        fs::write(&checkpoint, tiny_llama_dense_f32()).unwrap();
+        let bundle = dir.path().join("bundle");
+        let loader = ModelLoader::default();
+        loader
+            .compile_to_bundle(
+                &ArchitectureId::new("llama.decoder"),
+                &checkpoint,
+                "cpu",
+                &bundle,
+                &CompileOptions {
+                    mode: "local-jit".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let manifest_path = bundle.join("manifest.json");
+        let mut manifest: dyninfer_core::ExecutableManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest.target.capability_fingerprint =
+            dyninfer_core::Digest::from_bytes(b"different-local-target");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let error = match loader.load_bundle(&bundle, &checkpoint) {
+            Ok(_) => panic!("mismatched target fingerprint was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), "E_CACHE");
+        assert!(error.to_string().contains("target fingerprint"));
+    }
+
+    #[test]
+    fn tiny_mlx_u4_matches_independent_dequantized_reference() {
+        if !iree_available() {
+            eprintln!("skipping: IREE not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = dir.path().join("tiny-mlx-u4.safetensors");
+        fs::write(&checkpoint, tiny_llama_mlx_affine_u4()).unwrap();
+
+        let loader = ModelLoader::default();
+        let architecture = ArchitectureId::new("llama.decoder");
+        let coverage = loader
+            .kernel_coverage(&architecture, &checkpoint, "cpu", &Default::default())
+            .unwrap();
+        coverage.require_complete().unwrap();
+        let quantized: Vec<_> = coverage
+            .operations
+            .iter()
+            .filter(|operation| {
+                operation
+                    .encoding
+                    .as_ref()
+                    .is_some_and(|encoding| encoding.id.as_str() == "mlx.affine.u4")
+            })
+            .collect();
+        assert_eq!(quantized.len(), 18);
+        assert!(quantized.iter().all(|operation| {
+            operation.selected.is_some()
+                && operation.validation_error.is_none()
+                && operation.checkpoint_component_keys.len() == 3
+        }));
+
+        let bundle = dir.path().join("model.bundle");
+        loader
+            .compile_to_bundle(
+                &architecture,
+                &checkpoint,
+                "cpu",
+                &bundle,
+                &CompileOptions {
+                    mode: "local-jit".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("compile direct MLX affine U4 fixture");
+        let model = loader.load_bundle(&bundle, &checkpoint).unwrap();
+        assert!(!model.manifest.derived_parameters_required);
+        assert_eq!(model.manifest.parameter_components.len(), 30);
+        assert!(!bundle.join("parameters").exists());
+
+        let tokens = [1u32, 2, 3, 0];
+        let mut session = model.create_session(SessionConfig::default()).unwrap();
+        let logits = session.prefill(&tokens).unwrap();
+        let reference = tiny_llama_mlx_u4_prefill_logits(&tokens).unwrap();
+        let error = max_abs_err(&logits.values, &reference).unwrap();
+        assert!(
+            error < 1.0e-3,
+            "MLX affine U4 logits diverged: max_abs_err={error}\ngot={:?}\nref={:?}",
+            &logits.values[..8],
+            &reference[..8]
+        );
+    }
+
+    #[test]
+    fn gguf_q4_provider_keeps_original_packed_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = dir.path().join("tiny-q4.gguf");
+        fs::write(
+            &checkpoint,
+            dyninfer_checkpoint_gguf::tiny_llama_q4_0().unwrap(),
+        )
+        .unwrap();
+        let loader = ModelLoader::default();
+        let id = ArchitectureId::new("llama.decoder");
+        let (_package, catalog, binding) =
+            loader.bind(&id, &checkpoint, &Default::default()).unwrap();
+        let provider =
+            dyninfer_checkpoint::build_runtime_provider_plan(&catalog, &binding).unwrap();
+
+        let q4_parameter = catalog
+            .parameters
+            .iter()
+            .find(|parameter| {
+                matches!(
+                    &parameter.encoding,
+                    dyninfer_core::PhysicalEncoding::BlockQuantized { codec, .. }
+                        if codec.as_str() == "gguf.q4_0"
+                )
+            })
+            .unwrap();
+        let component = &q4_parameter.components[0];
+        let range = &component.byte_ranges[0];
+        let descriptor = provider
+            .parameters
+            .iter()
+            .find(|descriptor| descriptor.aliases.contains(&component.key))
+            .unwrap();
+        assert_eq!(descriptor.offset, range.offset);
+        assert_eq!(descriptor.length, range.length);
+        assert_eq!(descriptor.source_file_index, 0);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        let entries = provider
+            .parameters
+            .iter()
+            .map(|descriptor| iree_runtime::FileParameterDescriptor {
+                key: descriptor.external_key.clone(),
+                source_file_index: descriptor.source_file_index as usize,
+                offset: descriptor.offset,
+                length: descriptor.length,
+            })
+            .collect();
+        let storage =
+            iree_runtime::FileParameterStorage::new(provider.file_paths.clone(), entries).unwrap();
+        assert_eq!(storage.file_count(), 1);
+        assert_eq!(storage.entry_count(), provider.parameters.len());
+    }
+
+    #[test]
+    fn tiny_gguf_q4_0_matches_independent_dequantized_reference() {
+        if !iree_available() {
+            eprintln!("skipping: IREE not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = dir.path().join("tiny-q4.gguf");
+        fs::write(
+            &checkpoint,
+            dyninfer_checkpoint_gguf::tiny_llama_q4_0().unwrap(),
+        )
+        .unwrap();
+        let loader = ModelLoader::default();
+        let architecture = ArchitectureId::new("llama.decoder");
+        let target = std::env::var("DYNINFER_TINY_GGUF_TARGET").unwrap_or_else(|_| "cpu".into());
+        let bundle = dir.path().join("bundle");
+        loader
+            .compile_to_bundle(
+                &architecture,
+                &checkpoint,
+                &target,
+                &bundle,
+                &CompileOptions {
+                    mode: "local-jit".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|error| {
+                panic!("compile direct mixed GGUF fixture on {target}: {error}")
+            });
+        let model = loader.load_bundle(&bundle, &checkpoint).unwrap();
+        assert!(!model.manifest.derived_parameters_required);
+        assert!(!bundle.join("parameters").exists());
+
+        let tokens = [1u32, 2, 3, 0];
+        let mut session = model.create_session(SessionConfig::default()).unwrap();
+        let logits = session.prefill(&tokens).unwrap();
+        let reference = tiny_llama_gguf_q4_0_prefill_logits(&tokens).unwrap();
+        let error = max_abs_err(&logits.values, &reference).unwrap();
+        assert!(
+            error < 1.0e-3,
+            "GGUF Q4_0 logits diverged: max_abs_err={error}\ngot={:?}\nref={:?}",
+            &logits.values[..8],
+            &reference[..8]
+        );
     }
 
     #[test]

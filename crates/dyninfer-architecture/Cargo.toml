@@ -10,7 +10,6 @@ license.workspace = true
 dyninfer-checkpoint = { workspace = true }
 dyninfer-core = { workspace = true }
 dyninfer-error = { workspace = true }
-dyninfer-mlir = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

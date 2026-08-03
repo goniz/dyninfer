@@ -1,0 +1,15 @@
+[package]
+name = "dyninfer-quantization"
+description = "Physical encoding definitions, validation, and kernel candidates"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dyninfer-checkpoint = { workspace = true }
+dyninfer-core = { workspace = true }
+dyninfer-error = { workspace = true }
+dyninfer-kernel-registry = { workspace = true }
+dyninfer-mlir = { workspace = true }
+serde = { workspace = true }
