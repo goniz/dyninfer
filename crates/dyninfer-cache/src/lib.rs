@@ -62,6 +62,7 @@ impl ArtifactCache {
             })
         })?;
         fs::create_dir_all(root.join("parameters")).ok();
+        fs::create_dir_all(root.join("locks")).ok();
         Ok(Self { root })
     }
 
@@ -72,22 +73,7 @@ impl ArtifactCache {
     pub fn lookup(&self, key: &CacheKey) -> Result<Option<CacheEntry>> {
         let _span = info_span!("cache.lookup").entered();
         let digest = key.digest()?;
-        let dir = self.entry_dir(&digest);
-        let manifest_path = dir.join("manifest.json");
-        let vmfb_path = dir.join("model.vmfb");
-        if manifest_path.is_file() && vmfb_path.is_file() {
-            let size_bytes = fs::metadata(&vmfb_path).map(|m| m.len()).unwrap_or(0);
-            debug!(digest = %digest.short(), "cache hit");
-            return Ok(Some(CacheEntry {
-                digest,
-                key: key.clone(),
-                manifest_path,
-                vmfb_path,
-                size_bytes,
-            }));
-        }
-        debug!(digest = %digest.short(), "cache miss");
-        Ok(None)
+        Ok(self.entry_if_complete(&digest, key))
     }
 
     pub fn publish(
@@ -98,35 +84,70 @@ impl ArtifactCache {
     ) -> Result<CacheEntry> {
         let digest = key.digest()?;
         let dir = self.entry_dir(&digest);
-        let staging = self.root.join(format!(".staging-{}", digest.short()));
-        let _ = fs::remove_dir_all(&staging);
-        fs::create_dir_all(&staging).map_err(|e| cache_io(&digest, &staging, e))?;
 
-        let vmfb_path = staging.join("model.vmfb");
-        {
-            let mut f = fs::File::create(&vmfb_path).map_err(|e| cache_io(&digest, &vmfb_path, e))?;
-            f.write_all(vmfb).map_err(|e| cache_io(&digest, &vmfb_path, e))?;
-            f.sync_all().ok();
+        // Coordinate concurrent publishers for the same digest (spec §19.3).
+        let _lock = self.acquire_publish_lock(&digest)?;
+
+        if let Some(existing) = self.entry_if_complete(&digest, key) {
+            return Ok(existing);
         }
-        let manifest_path = staging.join("manifest.json");
-        let json = serde_json::to_vec_pretty(manifest)?;
-        fs::write(&manifest_path, json).map_err(|e| cache_io(&digest, &manifest_path, e))?;
 
-        let key_path = staging.join("key.json");
-        fs::write(&key_path, serde_json::to_vec_pretty(key)?).map_err(|e| cache_io(&digest, &key_path, e))?;
-
-        if dir.exists() {
-            fs::remove_dir_all(&dir).ok();
+        // Unique staging path so concurrent publishers cannot clobber each other.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let staging = self.root.join(format!(
+            ".staging-{}-{}-{}",
+            digest.as_str(),
+            std::process::id(),
+            nanos
+        ));
+        if let Err(e) = fs::create_dir_all(&staging) {
+            return Err(cache_io(&digest, &staging, e));
         }
-        fs::rename(&staging, &dir).map_err(|e| cache_io(&digest, &dir, e))?;
 
-        Ok(CacheEntry {
-            digest: digest.clone(),
-            key: key.clone(),
-            manifest_path: dir.join("manifest.json"),
-            vmfb_path: dir.join("model.vmfb"),
-            size_bytes: vmfb.len() as u64,
-        })
+        let publish_result = (|| -> Result<CacheEntry> {
+            let vmfb_path = staging.join("model.vmfb");
+            {
+                let mut f =
+                    fs::File::create(&vmfb_path).map_err(|e| cache_io(&digest, &vmfb_path, e))?;
+                f.write_all(vmfb)
+                    .map_err(|e| cache_io(&digest, &vmfb_path, e))?;
+                f.sync_all().ok();
+            }
+            let manifest_path = staging.join("manifest.json");
+            let json = serde_json::to_vec_pretty(manifest)?;
+            fs::write(&manifest_path, json).map_err(|e| cache_io(&digest, &manifest_path, e))?;
+
+            let key_path = staging.join("key.json");
+            fs::write(&key_path, serde_json::to_vec_pretty(key)?)
+                .map_err(|e| cache_io(&digest, &key_path, e))?;
+
+            // Never delete a complete destination (avoids reader gaps). Only
+            // rename into place when the final dir is absent.
+            if let Some(existing) = self.entry_if_complete(&digest, key) {
+                return Ok(existing);
+            }
+            if dir.exists() {
+                // Incomplete leftover from a crash — safe to replace under lock.
+                fs::remove_dir_all(&dir).map_err(|e| cache_io(&digest, &dir, e))?;
+            }
+            fs::rename(&staging, &dir).map_err(|e| cache_io(&digest, &dir, e))?;
+
+            Ok(CacheEntry {
+                digest: digest.clone(),
+                key: key.clone(),
+                manifest_path: dir.join("manifest.json"),
+                vmfb_path: dir.join("model.vmfb"),
+                size_bytes: vmfb.len() as u64,
+            })
+        })();
+
+        if staging.exists() {
+            let _ = fs::remove_dir_all(&staging);
+        }
+        publish_result
     }
 
     pub fn list(&self) -> Result<Vec<CacheEntry>> {
@@ -190,6 +211,89 @@ impl ArtifactCache {
 
     fn entry_dir(&self, digest: &Digest) -> PathBuf {
         self.root.join("executables").join(digest.as_str())
+    }
+
+    fn entry_if_complete(&self, digest: &Digest, key: &CacheKey) -> Option<CacheEntry> {
+        let dir = self.entry_dir(digest);
+        let manifest_path = dir.join("manifest.json");
+        let vmfb_path = dir.join("model.vmfb");
+        if manifest_path.is_file() && vmfb_path.is_file() {
+            let size_bytes = fs::metadata(&vmfb_path).map(|m| m.len()).unwrap_or(0);
+            debug!(digest = %digest.short(), "cache hit");
+            Some(CacheEntry {
+                digest: digest.clone(),
+                key: key.clone(),
+                manifest_path,
+                vmfb_path,
+                size_bytes,
+            })
+        } else {
+            debug!(digest = %digest.short(), "cache miss");
+            None
+        }
+    }
+
+    fn lock_path(&self, digest: &Digest) -> PathBuf {
+        self.root.join("locks").join(format!("{}.lock", digest.as_str()))
+    }
+
+    /// Exclusive create-new lock file with stale-PID recovery.
+    fn acquire_publish_lock(&self, digest: &Digest) -> Result<PublishLockGuard> {
+        let path = self.lock_path(digest);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| cache_io(digest, parent, e))?;
+        }
+        for _ in 0..500 {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut f) => {
+                    let _ = writeln!(f, "{}", std::process::id());
+                    let _ = f.sync_all();
+                    return Ok(PublishLockGuard { path });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if self.lock_is_stale(&path) {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => return Err(cache_io(digest, &path, e)),
+            }
+        }
+        Err(DynInferError::Cache(CacheError {
+            message: "timed out waiting for cache publish lock".into(),
+            digest: Some(digest.to_string()),
+            path: Some(path.display().to_string()),
+        }))
+    }
+
+    fn lock_is_stale(&self, path: &Path) -> bool {
+        // Treat locks older than 5 minutes as abandoned (crash / kill -9).
+        const STALE_SECS: u64 = 300;
+        let Ok(meta) = fs::metadata(path) else {
+            return true;
+        };
+        let Ok(modified) = meta.modified() else {
+            return true;
+        };
+        let Ok(age) = modified.elapsed() else {
+            return true;
+        };
+        age.as_secs() >= STALE_SECS
+    }
+}
+
+struct PublishLockGuard {
+    path: PathBuf,
+}
+
+impl Drop for PublishLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
     }
 }
 
