@@ -274,6 +274,7 @@ dependencies = [
  "dyninfer-checkpoint",
  "dyninfer-core",
  "dyninfer-error",
+ "half",
  "serde_json",
  "tempfile",
  "tracing",

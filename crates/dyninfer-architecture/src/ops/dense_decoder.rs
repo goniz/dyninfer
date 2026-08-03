@@ -27,7 +27,7 @@
 use crate::ArchitecturePackage;
 use crate::ops::kernels;
 use dyninfer_checkpoint::CheckpointCatalog;
-use dyninfer_core::{ScalarType, StorageElementType};
+use dyninfer_core::{PhysicalEncoding, ScalarType, StorageElementType};
 use dyninfer_error::Result;
 use dyninfer_mlir::{FuncBuilder, ModuleBuilder};
 use std::collections::BTreeMap;
@@ -74,6 +74,10 @@ pub struct DenseDecoderConfig {
     pub param_keys: BTreeMap<String, String>,
     /// Canonical slot name → on-disk scalar dtype from the checkpoint catalog.
     pub param_dtypes: BTreeMap<String, ScalarType>,
+    /// Canonical slot name → physical encoding (plain vs gguf.q4_0).
+    pub param_encodings: BTreeMap<String, PhysicalEncoding>,
+    /// Canonical slot name → packed storage bytes (Q4_0).
+    pub param_nbytes: BTreeMap<String, u64>,
 }
 
 impl DenseDecoderConfig {
@@ -157,6 +161,8 @@ impl DenseDecoderConfig {
             .any(|p| p.canonical_name.as_str().contains("attn_q_norm.weight"));
         let mut param_keys = BTreeMap::new();
         let mut param_dtypes = BTreeMap::new();
+        let mut param_encodings = BTreeMap::new();
+        let mut param_nbytes = BTreeMap::new();
         for p in &catalog.parameters {
             let key = p
                 .components
@@ -164,21 +170,37 @@ impl DenseDecoderConfig {
                 .map(|c| c.key.clone())
                 .unwrap_or_else(|| p.canonical_name.to_string());
             param_keys.insert(p.canonical_name.to_string(), key);
+            param_encodings.insert(p.canonical_name.to_string(), p.encoding.clone());
             if let Some(ty) = catalog_param_dtype(p) {
                 param_dtypes.insert(p.canonical_name.to_string(), ty);
+            }
+            let nbytes = p
+                .components
+                .iter()
+                .flat_map(|c| c.byte_ranges.iter())
+                .map(|r| r.length)
+                .fold(0u64, |a, b| a.saturating_add(b));
+            if nbytes > 0 {
+                param_nbytes.insert(p.canonical_name.to_string(), nbytes);
             }
         }
         Self {
             vocab,
             hidden,
-            intermediate: u(&["intermediate_size"], hidden * 2),
+            intermediate: u(
+                &["intermediate_size", "llama.feed_forward_length"],
+                hidden * 2,
+            ),
             num_heads,
             num_kv_heads,
             head_dim,
             num_layers,
             seq,
             max_kv: max_kv.max(seq),
-            rms_norm_eps: f(&["rms_norm_eps"], 1e-5),
+            rms_norm_eps: f(
+                &["rms_norm_eps", "llama.attention.layer_norm_rms_epsilon"],
+                1e-5,
+            ),
             // `rope_theta <= 0` in metadata/overrides disables RoPE (bisect / ablations).
             rope_theta: if is_synthetic {
                 None
@@ -190,6 +212,8 @@ impl DenseDecoderConfig {
             has_qk_norm,
             param_keys,
             param_dtypes,
+            param_encodings,
+            param_nbytes,
         }
     }
 
@@ -207,6 +231,15 @@ impl DenseDecoderConfig {
             .get(canonical)
             .copied()
             .unwrap_or(ScalarType::F32)
+    }
+
+    fn param_is_q4_0(&self, canonical: &str) -> bool {
+        self.param_encodings.get(canonical).is_some_and(|e| {
+            matches!(
+                e,
+                PhysicalEncoding::BlockQuantized { codec, .. } if codec.as_str() == "gguf.q4_0"
+            )
+        })
     }
 
     /// True for the synthetic Milestone-1 fixture (`tiny_llama_dense_f32`):
@@ -294,7 +327,14 @@ fn emit_global(
     shape: &str,
 ) -> Result<()> {
     let key = c.param_key(canonical);
-    let wt = mlir_ty(c.param_dtype(canonical));
+    // Q4_0 is host-dequantized to f32 before bind (portable qkernel decode);
+    // the VMFB sees dense f32 parameters. Device-side SCF dequant lives in
+    // `ops/qkernel.rs` for the fused lowering path.
+    let wt = if c.param_is_q4_0(canonical) {
+        mlir_ty(ScalarType::F32)
+    } else {
+        mlir_ty(c.param_dtype(canonical))
+    };
     builder.util_global_parameter(sym, &key, &format!("tensor<{shape}x{wt}>"))
 }
 
@@ -307,7 +347,11 @@ fn emit_load_compute(
     canonical: &str,
     shape: &str,
 ) {
-    let storage = c.param_dtype(canonical);
+    let storage = if c.param_is_q4_0(canonical) {
+        ScalarType::F32
+    } else {
+        c.param_dtype(canonical)
+    };
     let wt = mlir_ty(storage);
     let ct = mlir_ty(COMPUTE_DTYPE);
     match storage {
@@ -1456,6 +1500,8 @@ mod tests {
             has_qk_norm: true,
             param_keys: BTreeMap::new(),
             param_dtypes: BTreeMap::from([("token_embd.weight".into(), ScalarType::Bf16)]),
+            param_encodings: BTreeMap::new(),
+            param_nbytes: BTreeMap::new(),
         };
         assert!(c.supports_dense_emit());
         assert_eq!(c.q_dim(), 2048);
@@ -1482,6 +1528,8 @@ mod tests {
             has_qk_norm: false,
             param_keys: BTreeMap::new(),
             param_dtypes: BTreeMap::new(),
+            param_encodings: BTreeMap::new(),
+            param_nbytes: BTreeMap::new(),
         };
         assert!(c.supports_dense_emit());
         assert!(c.is_synthetic_fixture());
@@ -1517,6 +1565,8 @@ mod tests {
             has_qk_norm: false,
             param_keys: BTreeMap::new(),
             param_dtypes,
+            param_encodings: BTreeMap::new(),
+            param_nbytes: BTreeMap::new(),
         };
         let mlir = emit_dense_decoder_cfg("test.decoder", &c).expect("mlir verify");
         assert!(
@@ -1558,6 +1608,8 @@ mod tests {
             has_qk_norm: true,
             param_keys: BTreeMap::new(),
             param_dtypes: BTreeMap::new(),
+            param_encodings: BTreeMap::new(),
+            param_nbytes: BTreeMap::new(),
         };
         let mlir = emit_dense_decoder_cfg("test.gqa", &c).expect("emit");
         assert!(mlir.contains("func.func private @attn_decode"));

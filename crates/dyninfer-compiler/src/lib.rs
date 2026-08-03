@@ -22,11 +22,11 @@ use dyninfer_error::{CompilationError, Diagnostic, DynInferError, Result, Severi
 use serde::{Deserialize, Serialize};
 use tracing::{info, info_span};
 
-pub const COMPILER_VERSION: &str = "0.1.25-iree-3.11.0-mlir-builder";
+pub const COMPILER_VERSION: &str = "0.1.26-iree-3.11.0-q4-qkernel";
 /// Pinned IREE pip / source revision identity for executable cache keys (spec §19.1).
 pub const IREE_REVISION: &str = "3.11.0+e4a3b0405d7d";
 /// Kernel registry policy version included in executable cache keys.
-pub const KERNEL_REGISTRY_VERSION: &str = "1";
+pub const KERNEL_REGISTRY_VERSION: &str = "2";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CompileOptions {
@@ -261,24 +261,29 @@ impl ModelCompiler for LocalCompiler {
     }
 }
 
-/// Refuse encodings that advertise DecodeOnTheFly / qkernel without a lowering.
+/// Refuse encodings without an executable lowering path.
 fn validate_binding_for_compile(plan: &BindingPlan) -> Result<()> {
     for b in &plan.bindings {
         if !b.encoding.is_supported_v1() {
             return Err(DynInferError::Compilation(CompilationError {
                 message: format!(
-                    "binding for `{}` uses unsupported encoding {:?}; \
-                     Q4_0 / DecodeOnTheFly requires qkernel lowering",
+                    "binding for `{}` uses unsupported encoding {:?}",
                     b.canonical_name, b.encoding
                 ),
                 pass: Some("binding.validate".into()),
                 diagnostics: vec![],
             }));
         }
-        if matches!(b.materialization, MaterializationPolicy::DecodeOnTheFly) {
+        if matches!(b.materialization, MaterializationPolicy::DecodeOnTheFly)
+            && !matches!(
+                &b.encoding,
+                dyninfer_core::PhysicalEncoding::BlockQuantized { codec, .. }
+                    if codec.as_str() == "gguf.q4_0"
+            )
+        {
             return Err(DynInferError::Compilation(CompilationError {
                 message: format!(
-                    "binding for `{}` requests DecodeOnTheFly but no qkernel path exists",
+                    "binding for `{}` requests DecodeOnTheFly for unsupported encoding",
                     b.canonical_name
                 ),
                 pass: Some("binding.validate".into()),

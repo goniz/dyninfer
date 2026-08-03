@@ -1046,7 +1046,7 @@ Only the following crates MAY contain unrestricted unsafe blocks:
 
 Other crates MUST use `#![forbid(unsafe_code)]` unless an exception is documented in an architecture decision record.
 
-**Bound Model IR note (v0):** Architecture packages currently retain a graph sketch in `mlir_text` (notes + slots). Executable VMFB MLIR is still emitted by architecture-specific dense-decoder paths. The canonical Architecture IR → Bound Model IR → qkernel lowering pipeline remains Milestone work; the binder/compiler already reject encodings that would require that path.
+**Bound Model IR note (v0):** Architecture packages currently retain a graph sketch in `mlir_text` (notes + slots). Executable VMFB MLIR is still emitted by architecture-specific dense-decoder paths. GGUF Q4_0 uses the portable qkernel path: host-side block dequant (`dyninfer-checkpoint-gguf`) into f32 parameters consumed by the dense decoder; device-fused SCF dequant helpers live in `dyninfer-architecture::ops::qkernel` for the next specialization step.
 
 ---
 

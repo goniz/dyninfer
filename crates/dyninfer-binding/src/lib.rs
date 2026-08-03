@@ -180,18 +180,11 @@ impl Binder {
         }
 
         if !param.encoding.is_supported_v1() {
-            let message = if param.encoding.is_planned_v1() {
-                "encoding gguf.q4_0 requires qkernel lowering (Milestone 2); \
-                 refuse to bind rather than silently emit dense f32"
-                    .into()
-            } else {
-                "encoding is not supported in version 1".into()
-            };
             return Err(DynInferError::Binding(BindingError {
-                message,
+                message: "encoding is not supported in version 1".into(),
                 slot: Some(slot.id.to_string()),
                 checkpoint_key: Some(param.canonical_name.to_string()),
-                expected: Some("plain".into()),
+                expected: Some("plain or gguf.q4_0".into()),
                 actual: Some(format!("{:?}", param.encoding)),
             }));
         }
@@ -204,9 +197,33 @@ impl Binder {
             .fold(0u64, |a, b| a.saturating_add(b));
 
         // For plain encodings with declared storage, bytes must match numel * elem size.
-        if let PhysicalEncoding::Plain { storage_type, .. } = &param.encoding {
-            if !param.components.is_empty() {
-                if let Some(elem) = storage_type.size_bytes() {
+        // Q4_0 packed size is numel/32*18.
+        if !param.components.is_empty() {
+            match &param.encoding {
+                PhysicalEncoding::Plain { storage_type, .. } => {
+                    if let Some(elem) = storage_type.size_bytes() {
+                        let Some(numel) = param.logical_type.shape.numel() else {
+                            return Err(DynInferError::Binding(BindingError {
+                                message: "parameter shape numel overflow".into(),
+                                slot: Some(slot.id.to_string()),
+                                checkpoint_key: Some(param.canonical_name.to_string()),
+                                expected: None,
+                                actual: Some(param.logical_type.shape.to_string()),
+                            }));
+                        };
+                        let expected = numel.saturating_mul(u64::from(elem));
+                        if storage_bytes != expected {
+                            return Err(DynInferError::Binding(BindingError {
+                                message: "parameter storage byte length mismatch".into(),
+                                slot: Some(slot.id.to_string()),
+                                checkpoint_key: Some(param.canonical_name.to_string()),
+                                expected: Some(format!("{expected} bytes")),
+                                actual: Some(format!("{storage_bytes} bytes")),
+                            }));
+                        }
+                    }
+                }
+                PhysicalEncoding::BlockQuantized { codec, .. } if codec.as_str() == "gguf.q4_0" => {
                     let Some(numel) = param.logical_type.shape.numel() else {
                         return Err(DynInferError::Binding(BindingError {
                             message: "parameter shape numel overflow".into(),
@@ -216,10 +233,19 @@ impl Binder {
                             actual: Some(param.logical_type.shape.to_string()),
                         }));
                     };
-                    let expected = numel.saturating_mul(u64::from(elem));
+                    if !numel.is_multiple_of(32) {
+                        return Err(DynInferError::Binding(BindingError {
+                            message: "Q4_0 numel must be divisible by 32".into(),
+                            slot: Some(slot.id.to_string()),
+                            checkpoint_key: Some(param.canonical_name.to_string()),
+                            expected: Some("numel % 32 == 0".into()),
+                            actual: Some(format!("numel {numel}")),
+                        }));
+                    }
+                    let expected = (numel / 32) * 18;
                     if storage_bytes != expected {
                         return Err(DynInferError::Binding(BindingError {
-                            message: "parameter storage byte length mismatch".into(),
+                            message: "Q4_0 storage byte length mismatch".into(),
                             slot: Some(slot.id.to_string()),
                             checkpoint_key: Some(param.canonical_name.to_string()),
                             expected: Some(format!("{expected} bytes")),
@@ -227,6 +253,7 @@ impl Binder {
                         }));
                     }
                 }
+                _ => {}
             }
         }
 
@@ -387,11 +414,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_q4_0_until_qkernel() {
+    fn binds_q4_0_weights() {
         let slot = ParameterSlot {
-            id: ParameterSlotId::new("tok"),
-            canonical_name: CanonicalParameterName::new("token_embd.weight"),
-            role: ParameterRole::Embedding,
+            id: ParameterSlotId::new("q"),
+            canonical_name: CanonicalParameterName::new("blk.0.attn_q.weight"),
+            role: ParameterRole::AttentionQ,
             expected_type: LogicalTensorConstraint {
                 rank: Some(2),
                 shape: None,
@@ -410,16 +437,28 @@ mod tests {
                 values: BTreeMap::new(),
             },
         };
+        let numel = 64u64 * 64;
+        let nbytes = numel / 32 * 18;
         let param = LogicalParameter {
-            canonical_name: CanonicalParameterName::new("token_embd.weight"),
-            role: ParameterRole::Embedding,
+            canonical_name: CanonicalParameterName::new("blk.0.attn_q.weight"),
+            role: ParameterRole::AttentionQ,
             logical_type: LogicalTensorType {
-                shape: Shape::new(vec![32, 16]),
+                shape: Shape::new(vec![64, 64]),
                 element_type: ScalarType::F16,
             },
             encoding: PhysicalEncoding::gguf_q4_0(),
-            components: vec![],
-            aliases: vec!["token_embd.weight".into()],
+            components: vec![dyninfer_core::StorageComponent {
+                name: "data".into(),
+                key: "blk.0.attn_q.weight".into(),
+                shape: Shape::new(vec![64, 64]),
+                storage_type: dyninfer_core::StorageElementType::Opaque {
+                    codec: "gguf.q4_0".into(),
+                },
+                byte_ranges: vec![dyninfer_core::ByteRange::new(0, nbytes)],
+                alignment: 32,
+                endianness: dyninfer_core::Endianness::Little,
+            }],
+            aliases: vec!["blk.0.attn_q.weight".into()],
         };
         let catalog = CheckpointCatalog {
             container: ContainerIdentity {
@@ -435,14 +474,14 @@ mod tests {
             schema_fingerprint: SchemaFingerprint {
                 digest: Digest::from_bytes(b"x"),
                 entry_count: 1,
-                total_bytes: 0,
+                total_bytes: nbytes,
             },
         };
-        let err = Binder::default().bind(&arch, &catalog).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("qkernel") || msg.contains("gguf.q4_0"),
-            "unexpected error: {msg}"
+        let plan = Binder::default().bind(&arch, &catalog).unwrap();
+        assert_eq!(plan.bindings.len(), 1);
+        assert_eq!(
+            plan.bindings[0].materialization,
+            MaterializationPolicy::DecodeOnTheFly
         );
     }
 }

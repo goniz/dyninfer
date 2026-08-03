@@ -2,6 +2,7 @@
 
 mod dense_decoder;
 mod kernels;
+mod qkernel;
 
 pub use dense_decoder::{
     COMPUTE_DTYPE, DenseDecoderConfig, LARGE_PREFILL_WINDOW, PREFILL_WINDOW, TINY_PREFILL_WINDOW,

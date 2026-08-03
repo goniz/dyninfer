@@ -258,21 +258,36 @@ impl ModelLoader {
         }
 
         let _span = info_span!("parameters.open").entered();
-        let (parameters, device) = if needs_host_f32_params(&manifest.target.driver) {
-            let host = dyninfer_checkpoint_safetensors::decode_parameters_as_f32_host(&catalog)?;
-            let storage = HostParameterStorage::from_f32_entries(host.entries)?;
-            (
-                RuntimeParameters::Host(Arc::new(storage)),
-                Some(manifest.target.runtime_device().to_string()),
-            )
-        } else {
-            let params_path =
-                dyninfer_checkpoint_safetensors::resolve_runtime_parameters(&catalog)?;
-            (
-                RuntimeParameters::File(params_path),
-                Some(manifest.target.runtime_device().to_string()),
-            )
-        };
+        let is_gguf = catalog.container.format_id.as_str() == "gguf"
+            || catalog.convention_id.as_str().starts_with("gguf");
+        let has_q4 = catalog
+            .parameters
+            .iter()
+            .any(|p| matches!(&p.encoding, dyninfer_core::PhysicalEncoding::BlockQuantized { codec, .. } if codec.as_str() == "gguf.q4_0"));
+
+        let (parameters, device) =
+            if needs_host_f32_params(&manifest.target.driver) || is_gguf || has_q4 {
+                // Vulkan promote and GGUF Q4_0 both bind host f32 blobs (qkernel
+                // dequant runs on the host for the portable Milestone-2 path).
+                let host_entries = if is_gguf || has_q4 {
+                    dyninfer_checkpoint_gguf::decode_parameters_as_f32_host(&catalog)?
+                } else {
+                    dyninfer_checkpoint_safetensors::decode_parameters_as_f32_host(&catalog)?
+                        .entries
+                };
+                let storage = HostParameterStorage::from_f32_entries(host_entries)?;
+                (
+                    RuntimeParameters::Host(Arc::new(storage)),
+                    Some(manifest.target.runtime_device().to_string()),
+                )
+            } else {
+                let params_path =
+                    dyninfer_checkpoint_safetensors::resolve_runtime_parameters(&catalog)?;
+                (
+                    RuntimeParameters::File(params_path),
+                    Some(manifest.target.runtime_device().to_string()),
+                )
+            };
 
         // Eagerly validate that the VMFB + parameters can open; discard the
         // probe context so create_session still gets an independent KV.
