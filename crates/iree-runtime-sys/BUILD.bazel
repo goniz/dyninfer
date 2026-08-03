@@ -41,5 +41,10 @@ rust_test(
     rustc_env = {
         "IREE_RUNTIME_BINDINGS": "$(execpath :iree_runtime_bindings)",
     },
-    deps = all_crate_deps(normal_dev = True),
+    # Must match the library: without --cfg=bazel the Cargo stub FFI is
+    # compiled and fails under Rust 2024 (`unsafe extern` required).
+    rustc_flags = ["--cfg=bazel"],
+    deps = all_crate_deps(normal_dev = True) + [
+        "//third_party/iree_runtime_c_api:iree_runtime_c_api",
+    ],
 )

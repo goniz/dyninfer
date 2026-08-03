@@ -32,7 +32,8 @@ pub mod bindings {
         pub length: usize,
     }
 
-    extern "C" {
+    // Rust 2024 requires `unsafe extern` for FFI blocks.
+    unsafe extern "C" {
         pub fn dyninfer_iree_session_create(
             device_uri: *const c_char,
             vmfb_path: *const c_char,
