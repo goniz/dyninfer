@@ -2,7 +2,9 @@
 
 #![forbid(unsafe_code)]
 
-use dyninfer_core::{content_digest, Digest, ExecutableManifest, ShapeProfile, TargetProfile};
+use dyninfer_core::{
+    content_digest, BindingPlan, Digest, ExecutableManifest, ShapeProfile, TargetProfile,
+};
 use dyninfer_error::{CacheError, DynInferError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -11,14 +13,22 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info_span};
 
+/// Inputs that specialize a VMFB (spec §19.1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheKey {
     pub architecture_id: String,
     pub architecture_revision: String,
+    /// Digest of architecture package content that affects codegen (slots + IR).
+    pub architecture_digest: String,
+    pub resolved_config_digest: String,
+    pub binding_plan_digest: String,
     pub checkpoint_schema: String,
     pub target_fingerprint: String,
     pub shape_profile_digest: String,
+    pub kernel_registry_version: String,
     pub compiler_version: String,
+    pub iree_revision: String,
+    pub compile_options_digest: String,
 }
 
 impl CacheKey {
@@ -195,21 +205,36 @@ pub fn shape_profile_digest(profile: &ShapeProfile) -> Result<Digest> {
     content_digest(profile)
 }
 
-pub fn make_cache_key(
-    architecture_id: &str,
-    architecture_revision: &str,
-    checkpoint_schema: &str,
-    target: &TargetProfile,
-    shape_profile: &ShapeProfile,
-    compiler_version: &str,
-) -> Result<CacheKey> {
+/// Inputs required to build a §19.1-compliant executable cache key.
+pub struct CacheKeyInputs<'a> {
+    pub architecture_id: &'a str,
+    pub architecture_revision: &'a str,
+    pub architecture_digest: Digest,
+    pub resolved_config_digest: Digest,
+    pub binding: &'a BindingPlan,
+    pub checkpoint_schema: &'a str,
+    pub target: &'a TargetProfile,
+    pub shape_profile: &'a ShapeProfile,
+    pub kernel_registry_version: &'a str,
+    pub compiler_version: &'a str,
+    pub iree_revision: &'a str,
+    pub compile_options_digest: Digest,
+}
+
+pub fn make_cache_key(inputs: &CacheKeyInputs<'_>) -> Result<CacheKey> {
     Ok(CacheKey {
-        architecture_id: architecture_id.into(),
-        architecture_revision: architecture_revision.into(),
-        checkpoint_schema: checkpoint_schema.into(),
-        target_fingerprint: target.capability_fingerprint.to_string(),
-        shape_profile_digest: shape_profile_digest(shape_profile)?.to_string(),
-        compiler_version: compiler_version.into(),
+        architecture_id: inputs.architecture_id.into(),
+        architecture_revision: inputs.architecture_revision.into(),
+        architecture_digest: inputs.architecture_digest.to_string(),
+        resolved_config_digest: inputs.resolved_config_digest.to_string(),
+        binding_plan_digest: content_digest(inputs.binding)?.to_string(),
+        checkpoint_schema: inputs.checkpoint_schema.into(),
+        target_fingerprint: inputs.target.capability_fingerprint.to_string(),
+        shape_profile_digest: shape_profile_digest(inputs.shape_profile)?.to_string(),
+        kernel_registry_version: inputs.kernel_registry_version.into(),
+        compiler_version: inputs.compiler_version.into(),
+        iree_revision: inputs.iree_revision.into(),
+        compile_options_digest: inputs.compile_options_digest.to_string(),
     })
 }
 
@@ -220,18 +245,28 @@ mod tests {
         ArchitectureId, KvCacheDescriptor, KvCacheLayout, ScalarType, SchemaFingerprint, ShapeProfile,
     };
 
+    fn sample_key() -> CacheKey {
+        CacheKey {
+            architecture_id: "llama.decoder".into(),
+            architecture_revision: "0.1.0".into(),
+            architecture_digest: "arch".into(),
+            resolved_config_digest: "cfg".into(),
+            binding_plan_digest: "bind".into(),
+            checkpoint_schema: "abc".into(),
+            target_fingerprint: "cpu".into(),
+            shape_profile_digest: "shape".into(),
+            kernel_registry_version: "1".into(),
+            compiler_version: "0.1.0-stub".into(),
+            iree_revision: "3.11.0".into(),
+            compile_options_digest: "opts".into(),
+        }
+    }
+
     #[test]
     fn publish_and_lookup_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let cache = ArtifactCache::open(dir.path()).unwrap();
-        let key = CacheKey {
-            architecture_id: "llama.decoder".into(),
-            architecture_revision: "0.1.0".into(),
-            checkpoint_schema: "abc".into(),
-            target_fingerprint: "cpu".into(),
-            shape_profile_digest: "shape".into(),
-            compiler_version: "0.1.0-stub".into(),
-        };
+        let key = sample_key();
         let manifest = ExecutableManifest {
             format: "dyninfer.bundle".into(),
             version: 1,
@@ -263,5 +298,14 @@ mod tests {
         cache.publish(&key, b"VMFBSTUB", &manifest).unwrap();
         let hit = cache.lookup(&key).unwrap().expect("hit");
         assert_eq!(fs::read(hit.vmfb_path).unwrap(), b"VMFBSTUB");
+    }
+
+    #[test]
+    fn config_change_changes_cache_key() {
+        let mut a = sample_key();
+        let mut b = sample_key();
+        a.resolved_config_digest = "rope_theta=10000".into();
+        b.resolved_config_digest = "rope_theta=500000".into();
+        assert_ne!(a.digest().unwrap().as_str(), b.digest().unwrap().as_str());
     }
 }

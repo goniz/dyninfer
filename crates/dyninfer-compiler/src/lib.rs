@@ -22,7 +22,11 @@ use dyninfer_error::{CompilationError, Diagnostic, DynInferError, Result, Severi
 use serde::{Deserialize, Serialize};
 use tracing::{info, info_span};
 
-pub const COMPILER_VERSION: &str = "0.1.24-iree-3.11.0-mlir-builder";
+pub const COMPILER_VERSION: &str = "0.1.25-iree-3.11.0-mlir-builder";
+/// Pinned IREE pip / source revision identity for executable cache keys (spec §19.1).
+pub const IREE_REVISION: &str = "3.11.0+e4a3b0405d7d";
+/// Kernel registry policy version included in executable cache keys.
+pub const KERNEL_REGISTRY_VERSION: &str = "1";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CompileOptions {

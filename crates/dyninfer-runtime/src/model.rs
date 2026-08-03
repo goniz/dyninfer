@@ -2,13 +2,17 @@ use crate::session::IreeSession;
 use crate::{CausalLanguageModel, ModelSession};
 use dyninfer_architecture::{ArchitecturePackage, ArchitectureRegistry};
 use dyninfer_binding::Binder;
-use dyninfer_cache::{make_cache_key, ArtifactCache};
+use dyninfer_cache::{make_cache_key, ArtifactCache, CacheKeyInputs};
 use dyninfer_checkpoint::{
     BuiltinCheckpointSupport, CheckpointCatalog, DecodeContext, InspectionLimits,
 };
-use dyninfer_compiler::{CompileOptions, CompileRequest, LocalCompiler, ModelCompiler, COMPILER_VERSION};
+use dyninfer_compiler::{
+    CompileOptions, CompileRequest, LocalCompiler, ModelCompiler, COMPILER_VERSION, IREE_REVISION,
+    KERNEL_REGISTRY_VERSION,
+};
 use dyninfer_core::{
-    ArchitectureId, BindingPlan, ExecutableManifest, ModelMetadata, SessionConfig, ShapeProfile,
+    content_digest, ArchitectureId, BindingPlan, ExecutableManifest, ModelMetadata, SessionConfig,
+    ShapeProfile,
 };
 use dyninfer_error::{CacheError, DynInferError, Result};
 use dyninfer_target::TargetDiscovery;
@@ -190,14 +194,7 @@ impl ModelLoader {
             .emit_executable(architecture_id, &package, &catalog)?;
 
         if let Some(cache) = &self.cache {
-            let key = make_cache_key(
-                package.id.as_str(),
-                &package.revision,
-                catalog.schema_fingerprint.digest.as_str(),
-                &target,
-                &shape,
-                COMPILER_VERSION,
-            )?;
+            let key = cache_key_for(&package, &catalog, &plan, &target, &shape, options)?;
             if let Some(hit) = cache.lookup(&key)? {
                 return self.materialize_bundle_from_cache(&hit.vmfb_path, &hit.manifest_path, &plan, output);
             }
@@ -217,14 +214,7 @@ impl ModelLoader {
         })?;
 
         if let Some(cache) = &self.cache {
-            let key = make_cache_key(
-                package.id.as_str(),
-                &package.revision,
-                catalog.schema_fingerprint.digest.as_str(),
-                &target,
-                &shape,
-                COMPILER_VERSION,
-            )?;
+            let key = cache_key_for(&package, &catalog, &plan, &target, &shape, options)?;
             cache.publish(&key, &output_compile.executable.bytes, &output_compile.manifest)?;
         }
 
@@ -387,4 +377,37 @@ impl ModelLoader {
 /// parameter blobs must be host-expanded f32 (checkpoint file stays bf16).
 fn needs_host_f32_params(driver: &str) -> bool {
     matches!(driver, "vulkan")
+}
+
+fn cache_key_for(
+    package: &ArchitecturePackage,
+    catalog: &CheckpointCatalog,
+    plan: &BindingPlan,
+    target: &dyninfer_core::TargetProfile,
+    shape: &ShapeProfile,
+    options: &CompileOptions,
+) -> Result<dyninfer_cache::CacheKey> {
+    // Architecture IR + slots digest (mlir_text may be empty sketch; slots matter).
+    let architecture_digest = content_digest(&(
+        &package.id,
+        &package.revision,
+        &package.mlir_text,
+        &package.parameter_slots,
+    ))?;
+    let resolved_config_digest = content_digest(&package.resolved_config)?;
+    let compile_options_digest = content_digest(options)?;
+    make_cache_key(&CacheKeyInputs {
+        architecture_id: package.id.as_str(),
+        architecture_revision: &package.revision,
+        architecture_digest,
+        resolved_config_digest,
+        binding: plan,
+        checkpoint_schema: catalog.schema_fingerprint.digest.as_str(),
+        target,
+        shape_profile: shape,
+        kernel_registry_version: KERNEL_REGISTRY_VERSION,
+        compiler_version: COMPILER_VERSION,
+        iree_revision: IREE_REVISION,
+        compile_options_digest,
+    })
 }

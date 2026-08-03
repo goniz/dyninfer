@@ -51,6 +51,9 @@ pub struct KernelRegistry {
 }
 
 impl KernelRegistry {
+    /// Bump when candidate set / selection policy changes (feeds cache keys).
+    pub const VERSION: &'static str = "1";
+
     pub fn version_1() -> Self {
         let mut reg = Self::default();
         reg.register(KernelCandidateDescriptor {
