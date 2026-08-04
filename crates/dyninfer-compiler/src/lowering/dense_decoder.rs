@@ -501,8 +501,11 @@ fn emit_paged_fused_chunk(
     for _pi in 0..num_pages {
         f.result_ty(&page_ty);
     }
+    // Thread valid_count as SSA into layer_page. util.global load of the
+    // scalar across outlined private calls has been unreliable on Vulkan
+    // (wrong mask / diluted logits) even though HIP/CPU often tolerate it.
     f.op_asm(format!(
-        "  func.call @{begin}(%tokens, %last, %start_pos) : (tensor<{s}xi64>, tensor<i64>, tensor<i64>) -> ()\n"
+        "  %valid = func.call @{begin}(%tokens, %last, %start_pos) : (tensor<{s}xi64>, tensor<i64>, tensor<i64>) -> (tensor<i64>)\n"
     ));
     let mut page_ssas: Vec<String> = (0..num_pages).map(|pi| format!("page{pi}")).collect();
     for layer in 0..layers {
@@ -531,7 +534,7 @@ fn emit_paged_fused_chunk(
                 r#"  %pi{layer}_{pi}_i64 = arith.constant {pi} : i64
   %pi{layer}_{pi}_e = tensor.empty() : tensor<i64>
   %pi{layer}_{pi}_t = tensor.insert %pi{layer}_{pi}_i64 into %pi{layer}_{pi}_e[] : tensor<i64>
-  %{page_out}, %{out_next}, %{max_next}, %{sum_next} = func.call @{layer_page}(%{page_in}, %pi{layer}_{pi}_t, %start_pos, %layer{layer}_t, %query{layer}, %chunk_k{layer}, %chunk_v{layer}, %{out_ssa}, %{max_ssa}, %{sum_ssa}) : ({page_ty}, tensor<i64>, tensor<i64>, tensor<i64>, {qg_ty}, {kv3_ty}, {kv3_ty}, {qg_ty}, {row_ty}, {row_ty}) -> ({page_ty}, {qg_ty}, {row_ty}, {row_ty})
+  %{page_out}, %{out_next}, %{max_next}, %{sum_next} = func.call @{layer_page}(%{page_in}, %pi{layer}_{pi}_t, %start_pos, %layer{layer}_t, %query{layer}, %chunk_k{layer}, %chunk_v{layer}, %valid, %{out_ssa}, %{max_ssa}, %{sum_ssa}) : ({page_ty}, tensor<i64>, tensor<i64>, tensor<i64>, {qg_ty}, {kv3_ty}, {kv3_ty}, tensor<i64>, {qg_ty}, {row_ty}, {row_ty}) -> ({page_ty}, {qg_ty}, {row_ty}, {row_ty})
 "#
             ));
             next_pages.push(page_out);
@@ -572,6 +575,7 @@ fn emit_paged_chunk_begin(
     f.arg("tokens", format!("tensor<{s}xi64>"));
     f.arg("last", "tensor<i64>");
     f.arg("start_pos", "tensor<i64>");
+    f.result_ty("tensor<i64>");
     emit_load_compute(
         &mut f,
         c,
@@ -608,7 +612,7 @@ fn emit_paged_chunk_begin(
         ));
     }
     f.op_asm(format!(
-        "  %last64 = tensor.extract %last[] : tensor<i64>\n  %one64 = arith.constant 1 : i64\n  %valid64 = arith.addi %last64, %one64 : i64\n  %valid_e = tensor.empty() : tensor<i64>\n  %valid = tensor.insert %valid64 into %valid_e[] : tensor<i64>\n  util.global.store %h_acc{s}, @{hidden_global} : {hidden_ty}\n  util.global.store %start_pos, @{start_global} : tensor<i64>\n  util.global.store %valid, @{valid_global} : tensor<i64>\n  return",
+        "  %last64 = tensor.extract %last[] : tensor<i64>\n  %one64 = arith.constant 1 : i64\n  %valid64 = arith.addi %last64, %one64 : i64\n  %valid_e = tensor.empty() : tensor<i64>\n  %valid = tensor.insert %valid64 into %valid_e[] : tensor<i64>\n  util.global.store %h_acc{s}, @{hidden_global} : {hidden_ty}\n  util.global.store %start_pos, @{start_global} : tensor<i64>\n  util.global.store %valid, @{valid_global} : tensor<i64>\n  return %valid : tensor<i64>",
         hidden_global = variant.global("hidden"),
         start_global = variant.global("start_pos"),
         valid_global = variant.global("valid_count"),
@@ -792,6 +796,7 @@ fn emit_paged_layer_page(
     f.arg("query", &qg_ty);
     f.arg("chunk_k", &kv3_ty);
     f.arg("chunk_v", &kv3_ty);
+    f.arg("valid_t", "tensor<i64>");
     f.arg("out", &qg_ty);
     f.arg("max", &row_ty);
     f.arg("sum", &row_ty);
@@ -809,7 +814,6 @@ fn emit_paged_layer_page(
   %page_size = arith.constant {page} : index
   %page_start = arith.muli %pi, %page_size : index
   %page_end = arith.addi %page_start, %page_size : index
-  %valid_t = util.global.load @{valid_global} : tensor<i64>
   %valid64 = tensor.extract %valid_t[] : tensor<i64>
   %valid = arith.index_cast %valid64 : i64 to index
   %chunk_end = arith.addi %start, %valid : index
@@ -821,43 +825,17 @@ fn emit_paged_layer_page(
     %old_vs = tensor.extract_slice %page[%layer, 1, 0, 0, 0] [1, 1, {page}, {nkv}, {d}] [1, 1, 1, 1, 1] : {page_ty} to {page_slice_ty}
     %old_k = tensor.collapse_shape %old_ks [[0, 1, 2], [3], [4]] : {page_slice_ty} into {page_seq_ty}
     %old_v = tensor.collapse_shape %old_vs [[0, 1, 2], [3], [4]] : {page_slice_ty} into {page_seq_ty}
-    %c0i = arith.constant 0 : index
-    %new_k = linalg.generic {{
-        indexing_maps = [affine_map<(p, h, d) -> (p, h, d)>],
-        iterator_types = ["parallel", "parallel", "parallel"]}}
-      outs(%old_k : {page_seq_ty}) {{
-      ^bb0(%old: f32):
-        %pidx = linalg.index 0 : index
-        %hidx = linalg.index 1 : index
-        %didx = linalg.index 2 : index
-        %absolute = arith.addi %page_start, %pidx : index
-        %after_start = arith.cmpi uge, %absolute, %start : index
-        %before_end = arith.cmpi ult, %absolute, %chunk_end : index
-        %replace = arith.andi %after_start, %before_end : i1
-        %source_raw = arith.subi %absolute, %start : index
-        %source = arith.select %replace, %source_raw, %c0i : index
-        %value = tensor.extract %chunk_k[%source, %hidx, %didx] : {kv3_ty}
-        %result = arith.select %replace, %value, %old : f32
-        linalg.yield %result : f32
-    }} -> {page_seq_ty}
-    %new_v = linalg.generic {{
-        indexing_maps = [affine_map<(p, h, d) -> (p, h, d)>],
-        iterator_types = ["parallel", "parallel", "parallel"]}}
-      outs(%old_v : {page_seq_ty}) {{
-      ^bb0(%old: f32):
-        %pidx = linalg.index 0 : index
-        %hidx = linalg.index 1 : index
-        %didx = linalg.index 2 : index
-        %absolute = arith.addi %page_start, %pidx : index
-        %after_start = arith.cmpi uge, %absolute, %start : index
-        %before_end = arith.cmpi ult, %absolute, %chunk_end : index
-        %replace = arith.andi %after_start, %before_end : i1
-        %source_raw = arith.subi %absolute, %start : index
-        %source = arith.select %replace, %source_raw, %c0i : index
-        %value = tensor.extract %chunk_v[%source, %hidx, %didx] : {kv3_ty}
-        %result = arith.select %replace, %value, %old : f32
-        linalg.yield %result : f32
-    }} -> {page_seq_ty}
+    // Contiguous overlap write — avoids `linalg.index` → `vector.step` hazards
+    // on Vulkan SPIR-V inside this fused module.
+    %ov_lo = arith.maxui %page_start, %start : index
+    %ov_hi = arith.minui %page_end, %chunk_end : index
+    %ov_len = arith.subi %ov_hi, %ov_lo : index
+    %dst = arith.subi %ov_lo, %page_start : index
+    %src = arith.subi %ov_lo, %start : index
+    %k_src = tensor.extract_slice %chunk_k[%src, 0, 0] [%ov_len, {nkv}, {d}] [1, 1, 1] : {kv3_ty} to tensor<?x{nkv}x{d}xf32>
+    %v_src = tensor.extract_slice %chunk_v[%src, 0, 0] [%ov_len, {nkv}, {d}] [1, 1, 1] : {kv3_ty} to tensor<?x{nkv}x{d}xf32>
+    %new_k = tensor.insert_slice %k_src into %old_k[%dst, 0, 0] [%ov_len, {nkv}, {d}] [1, 1, 1] : tensor<?x{nkv}x{d}xf32> into {page_seq_ty}
+    %new_v = tensor.insert_slice %v_src into %old_v[%dst, 0, 0] [%ov_len, {nkv}, {d}] [1, 1, 1] : tensor<?x{nkv}x{d}xf32> into {page_seq_ty}
     %ke = tensor.expand_shape %new_k [[0, 1, 2], [3], [4]] output_shape [1, 1, {page}, {nkv}, {d}] : {page_seq_ty} into {expanded_ty}
     %ve = tensor.expand_shape %new_v [[0, 1, 2], [3], [4]] output_shape [1, 1, {page}, {nkv}, {d}] : {page_seq_ty} into {expanded_ty}
     %pk = tensor.insert_slice %ke into %page[%layer, 0, 0, 0, 0] [1, 1, {page}, {nkv}, {d}] [1, 1, 1, 1, 1] : {expanded_ty} into {page_ty}
@@ -879,7 +857,6 @@ fn emit_paged_layer_page(
   %next:3 = func.call @{attention_helper}(%query, %kh, %vh, %scale, %mask, %out, %max, %sum) : ({qg_ty}, {page_head_ty}, {page_head_ty}, {scale_ty}, {mask_ty}, {qg_ty}, {row_ty}, {row_ty}) -> ({qg_ty}, {row_ty}, {row_ty})
   return %page_updated, %next#0, %next#1, %next#2 : {page_ty}, {qg_ty}, {row_ty}, {row_ty}"#,
         scale = 1.0 / (d as f32).sqrt(),
-        valid_global = variant.global("valid_count"),
     ));
     f.finish(module)
 }
