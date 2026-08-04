@@ -595,7 +595,7 @@ Work in dependency order. Keep the tree runnable at the end of each phase, but p
   projection independently for prefill and decode. Never alias NVFP4 to GGUF
   MXFP4, affine U4, or another 4-bit encoding.
 - TODO: Add explicitly separate direct packed NVFP4 software candidates for
-  HIP and Vulkan (and CPU only if it meets the production bar). These backends
+  HIP (and CPU only if it meets the production bar). These backends
   must implement the same per-tensor mixed-schema contract without claiming
   native NVFP4 tensor-core acceleration; keep them out of production selection
   until differential correctness, temporary-memory, and throughput gates pass.
@@ -604,13 +604,11 @@ Work in dependency order. Keep the tree runnable at the end of each phase, but p
 Implemented baseline (2026-08-03): mixed GGUF Q4_0/Q4_1/Q8_0/Q6_K and MLX affine
 U4 have strict per-operation implementations for embedding, linear, and output
 projection in prefill and decode. Real Qwen3-0.6B checkpoints compile and run
-directly on CPU, HIP, and Vulkan. Unsloth UD-Q4_K_XL and UD-IQ1_S remain mixed
+directly on CPU and HIP. Unsloth UD-Q4_K_XL and UD-IQ1_S remain mixed
 schema test cases and reject only their still-unimplemented IQ/K encodings.
 GPU MLX currently uses an on-device dequantization dispatch boundary before the
 F32 contraction; fused sub-byte GPU contraction and full GPU performance
-qualification remain follow-up work. Vulkan execution also exposes an upstream
-IREE SPIR-V validation warning for `NoSignedWrap`, documented in the
-quantization qualification notes.
+qualification remain follow-up work.
 
 ### Phase 8: delete fallback/materialization paths
 

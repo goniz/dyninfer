@@ -62,7 +62,7 @@ enum Commands {
         architecture: String,
         #[arg(long)]
         checkpoint: PathBuf,
-        /// Execution target: `auto` (probe IREE HAL), `cpu`, `vulkan`, `rocm`/`hip`/`cuda`, or `rocm:gfxXXXX` / `cuda:sm_XX`.
+        /// Execution target: `auto` (probe IREE HAL), `cpu`, `rocm`/`hip`/`cuda`, or `rocm:gfxXXXX` / `cuda:sm_XX`.
         #[arg(long, default_value = "auto")]
         target: String,
         #[arg(long, default_value = "local-jit")]
@@ -106,7 +106,7 @@ enum Commands {
         /// Explicit checkpoint path (`.safetensors` or `.gguf`). Overrides discovery.
         #[arg(long)]
         checkpoint: Option<PathBuf>,
-        /// Execution target: `auto` (probe IREE HAL), `cpu`, `vulkan`, `rocm`/`hip`/`cuda`, or `rocm:gfxXXXX` / `cuda:sm_XX`.
+        /// Execution target: `auto` (probe IREE HAL), `cpu`, `rocm`/`hip`/`cuda`, or `rocm:gfxXXXX` / `cuda:sm_XX`.
         #[arg(long, default_value = "auto")]
         target: String,
         #[arg(long, default_value = "Once upon a time")]
@@ -134,7 +134,7 @@ enum Commands {
     },
     /// Compile and run the trivial `@add` smoke module through real IREE.
     Smoke {
-        /// Execution target: `auto` (probe IREE HAL), `cpu`, `vulkan`, `rocm`/`hip`/`cuda`, or `rocm:gfxXXXX` / `cuda:sm_XX`.
+        /// Execution target: `auto` (probe IREE HAL), `cpu`, `rocm`/`hip`/`cuda`, or `rocm:gfxXXXX` / `cuda:sm_XX`.
         #[arg(long, default_value = "auto")]
         target: String,
     },

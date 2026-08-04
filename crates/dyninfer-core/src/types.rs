@@ -252,7 +252,7 @@ pub struct TargetProfile {
     pub architecture: Option<String>,
     pub features: Vec<String>,
     pub capability_fingerprint: Digest,
-    /// Full HAL device URI from discovery (`vulkan://GPU-…`, `hip://0`, …).
+    /// Full HAL device URI from discovery (`hip://GPU-…`, `cuda://0`, …).
     /// When set, the runtime MUST open this device instead of the driver default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_uri: Option<String>,
@@ -291,36 +291,6 @@ impl TargetProfile {
                 "--iree-llvmcpu-target-cpu=host".into(),
             ],
             verified: host_triple() != "unknown",
-        };
-        profile.refresh_fingerprint();
-        profile
-    }
-
-    /// Vulkan SPIR-V target with an exact architecture reported by discovery.
-    /// An empty architecture produces an unverified profile that compilation
-    /// must reject.
-    pub fn vulkan(chip: &str) -> Self {
-        let architecture = nonempty(chip);
-        let mut profile = Self {
-            driver: "vulkan".into(),
-            device_id: Some(0),
-            triple: None,
-            architecture: architecture.clone(),
-            features: architecture
-                .iter()
-                .map(|chip| format!("vulkan-target={chip}"))
-                .chain(std::iter::once("spirv".into()))
-                .collect(),
-            capability_fingerprint: Digest::from_bytes(b"pending"),
-            device_uri: None,
-            device_name: None,
-            subgroup_size: None,
-            max_workgroup_invocations: None,
-            executable_target_flags: architecture
-                .as_ref()
-                .map(|chip| vulkan_executable_flags(chip))
-                .unwrap_or_default(),
-            verified: architecture.is_some(),
         };
         profile.refresh_fingerprint();
         profile
@@ -441,7 +411,7 @@ impl TargetProfile {
 
     pub fn is_compile_ready(&self) -> bool {
         self.verified
-            && (!matches!(self.driver.as_str(), "cuda" | "hip" | "rocm" | "vulkan")
+            && (!matches!(self.driver.as_str(), "cuda" | "hip" | "rocm")
                 || self.architecture.is_some())
     }
 
@@ -471,20 +441,9 @@ impl TargetProfile {
         }
     }
 
-    /// Vulkan GPU arch for `--iree-vulkan-target`, if this is a Vulkan profile.
-    pub fn vulkan_target(&self) -> Option<&str> {
-        if self.driver == "vulkan" {
-            self.architecture.as_deref()
-        } else {
-            None
-        }
-    }
-
     /// GPU arch string passed to IREE compile (`gfx*` / `sm_*`), if any.
     pub fn gpu_compile_arch(&self) -> Option<&str> {
-        self.rocm_target()
-            .or_else(|| self.cuda_target())
-            .or_else(|| self.vulkan_target())
+        self.rocm_target().or_else(|| self.cuda_target())
     }
 
     fn refresh_fingerprint(&mut self) {
@@ -516,29 +475,6 @@ fn nonempty(value: &str) -> Option<String> {
     (!value.trim().is_empty()).then(|| value.trim().to_string())
 }
 
-/// Basename looked up on `PATH` by IREE's executable preprocessor.
-pub const VULKAN_LDS_CLAMP_TOOL: &str = "dyninfer-clamp-vulkan-lds";
-
-/// IREE compile flags for a Vulkan chip.
-///
-/// AMD `gfx*` Vulkan devices expose 32 KiB workgroup memory (CU mode), while
-/// IREE's known `gfx*` targets inherit the HIP WGP budget of 64 KiB. Without a
-/// clamp, SPIR-V matmul promotion can emit kernels that fail Vulkan validation
-/// (`shared memory N > 32768`) and produce garbage outputs. The preprocess tool
-/// rewrites the target attr before executable configuration; the tool name must
-/// be space-free so in-process `ireeCompilerSessionSetFlags` accepts it.
-pub fn vulkan_executable_flags(chip: &str) -> Vec<String> {
-    let mut flags = vec![
-        "--iree-hal-target-device=vulkan".into(),
-        format!("--iree-vulkan-target={chip}"),
-    ];
-    if chip.starts_with("gfx") {
-        flags.push(format!(
-            "--iree-hal-preprocess-executables-with={VULKAN_LDS_CLAMP_TOOL}"
-        ));
-    }
-    flags
-}
 fn cuda_sm(architecture: &str) -> Option<u32> {
     architecture
         .strip_prefix("sm_")
@@ -765,24 +701,5 @@ mod tests {
             a.capability_fingerprint,
             different_arch.capability_fingerprint
         );
-    }
-
-    #[test]
-    fn vulkan_amd_flags_clamp_workgroup_memory_to_device_limit() {
-        let flags = vulkan_executable_flags("gfx1151");
-        assert!(flags.iter().any(|f| f.contains("--iree-vulkan-target=gfx1151")));
-        assert!(flags.iter().any(|f| {
-            f.contains("iree-hal-preprocess-executables-with")
-                && f.contains(VULKAN_LDS_CLAMP_TOOL)
-        }));
-        let profile = TargetProfile::vulkan("gfx1151");
-        assert!(profile.executable_target_flags.iter().any(|f| {
-            f.contains("iree-hal-preprocess-executables-with")
-                && f.contains(VULKAN_LDS_CLAMP_TOOL)
-        }));
-
-        // Non-AMD Vulkan targets keep the stock IREE budget.
-        let mali = vulkan_executable_flags("valhall4");
-        assert!(mali.iter().all(|f| !f.contains("preprocess-executables")));
     }
 }

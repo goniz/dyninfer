@@ -22,7 +22,7 @@ Implementation is tracking [`spec.md`](spec.md). The shared dense pipeline is in
 - Full Cargo workspace (`dyninfer` CLI + 18 crates)
 - Dense/sharded/MLX SafeTensors and mixed per-tensor GGUF schema decoding
 - Direct Qwen3 inference for dense, MLX affine U4, and mixed
-  GGUF Q4_0/Q4_1/Q8_0/Q6_K weights on CPU, HIP, and Vulkan
+  GGUF Q4_0/Q4_1/Q8_0/Q6_K weights on CPU and HIP
 - Typed Llama/Qwen3 Architecture IR and Bound Model IR
 - Strict per-operation kernel coverage and exact local-target specialization
 - Direct multi-file/component IREE parameter descriptors over original files
@@ -65,10 +65,10 @@ operation/encoding/local-target combination lacks a qualified production
 kernel. Q4_0, Q4_1, Q8_0, and Q6_K have direct kernels, and the popular
 `Qwen3-0.6B-Q4_0.gguf` from
 `unsloth/Qwen3-0.6B-GGUF` is executable today: its Q4_0, Q4_1, and Q6_K
-tensors are selected independently and consumed directly on CPU, HIP, and
-Vulkan. UD-Q4_K_XL and UD-IQ1_S are parsed as mixed per-tensor schemas but
+tensors are selected independently and consumed directly on CPU and HIP.
+UD-Q4_K_XL and UD-IQ1_S are parsed as mixed per-tensor schemas but
 remain intentionally rejected until kernels exist for every IQ/K encoding
-they use. MLX affine U4 SafeTensors are executable on the same three backends.
+they use. MLX affine U4 SafeTensors are executable on the same backends.
 
 ```bash
 hf download unsloth/Qwen3-0.6B-GGUF Qwen3-0.6B-Q4_0.gguf \
@@ -80,7 +80,7 @@ bazel run //crates/dyninfer-cli:dyninfer -- coverage \
   --target cpu --json
 ```
 
-Use `--target rocm` or `--target vulkan` for the locally discovered GPU.
+Use `--target rocm` for the locally discovered GPU.
 Target selection never falls back to CPU. See
 [`docs/quantization/gguf-q4.md`](docs/quantization/gguf-q4.md) and
 [`docs/quantization/mlx-affine-u4.md`](docs/quantization/mlx-affine-u4.md)
@@ -124,7 +124,7 @@ optionally run `./scripts/bootstrap_iree.sh` (venv fallback); prefer Bazel.
 dyninfer checkpoint inspect model.gguf --json
 dyninfer bind --checkpoint model.safetensors --output binding.json   # auto arch
 dyninfer compile --checkpoint model.safetensors --target auto --output model.bundle
-dyninfer smoke                        # --target auto probes IREE (cuda/hip ≻ vulkan ≻ cpu)
+dyninfer smoke                        # --target auto probes IREE (cuda/hip ≻ cpu)
 dyninfer smoke --target rocm          # force the locally detected HIP device; no guessed chip
 dyninfer generate --hf ORG/NAME --prompt "Hello"
 dyninfer run --bundle model.bundle --checkpoint model.safetensors --prompt "Hello"

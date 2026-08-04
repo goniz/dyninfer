@@ -79,22 +79,7 @@ impl ParameterLowerings {
         match (storage, compute) {
             (ScalarType::F16 | ScalarType::Bf16, ScalarType::F32)
             | (ScalarType::F32, ScalarType::F32) => {
-                if config.separate_storage_casts && storage != compute {
-                    let converted = format!("{ssa}_converted");
-                    kernels::load_compute(
-                        function,
-                        &converted,
-                        symbol,
-                        &storage_ty,
-                        &compute_ty,
-                        shape,
-                    );
-                    function.op_asm(format!(
-                        "  %{ssa} = util.optimization_barrier %{converted} : tensor<{shape}x{compute_ty}>\n"
-                    ));
-                } else {
-                    kernels::load_compute(function, ssa, symbol, &storage_ty, &compute_ty, shape);
-                }
+                kernels::load_compute(function, ssa, symbol, &storage_ty, &compute_ty, shape);
                 Ok(())
             }
             _ => Err(no_lowering(

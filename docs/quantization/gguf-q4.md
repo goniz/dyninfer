@@ -2,7 +2,7 @@
 
 The executable GGUF baseline is deliberately per tensor. It supports direct
 Q4_0, Q4_1, Q8_0, and Q6_K embedding, linear, and output-projection operations in
-both prefill and decode on IREE CPU, HIP, and Vulkan targets. There is no
+both prefill and decode on IREE CPU and HIP targets. There is no
 model-wide quantization selection and no host dequantization fallback.
 
 ## Layouts
@@ -30,8 +30,7 @@ created.
 all three layouts. Its 1,240 operation-mode requests have complete strict
 coverage. Full-model Bazel tests compile it, bind original GGUF byte ranges,
 run a one-token prefill, select the next token, and run decode with finite
-151,936-element logits on CPU, HIP (`gfx1151` on the qualification host), and
-Vulkan.
+151,936-element logits on CPU and HIP (`gfx1151` on the qualification host).
 
 The tiny Q4_0/Q4_1/Q8_0 fixture compares the executable against an independent
 dequantized Rust reference with `max_abs_err < 1e-3`. Provider tests also prove
@@ -49,11 +48,3 @@ The UD variants are not treated as a single quantization family:
 Compilation rejects these models with per-operation coverage diagnostics. It
 does not silently substitute Q4_0, dense weights, CPU execution, or a scalar
 reference decoder.
-
-## Vulkan qualification note
-
-The current IREE revision emits `NoSignedWrap` SPIR-V decorations without
-declaring `SPV_KHR_no_integer_wrap_decoration`, which Vulkan validation layers
-report during shader-module creation. The qualification device still compiles
-and executes the complete model successfully. This is tracked as a compiler
-validation issue rather than hidden or interpreted as warning-free support.

@@ -18,7 +18,7 @@ bazel build //bazel/iree:runtime_cc
 ```
 
 HAL drivers enabled by default in [`.bazelrc`](../../.bazelrc):
-`hip`, `local-sync`, `local-task`, `null`, `vulkan`
+`hip`, `local-sync`, `local-task`, `null`
 (AMDGPU device-bitcode / CUDA host drivers off — override the
 `enabled_drivers` flag if you need them).
 

@@ -89,9 +89,9 @@ pub fn revision() -> Result<String, ApiError> {
 
 /// HAL/device flags for the dyninfer target driver name.
 ///
-/// `gpu_arch` is `--iree-rocm-target` / `--iree-cuda-target` /
-/// `--iree-vulkan-target` (e.g. `gfx1151`, `sm_80`). GPU architectures are
-/// mandatory: this API never guesses a compile target.
+/// `gpu_arch` is `--iree-rocm-target` / `--iree-cuda-target` (e.g. `gfx1151`,
+/// `sm_80`). GPU architectures are mandatory: this API never guesses a compile
+/// target.
 ///
 /// For HIP, also sets `--iree-rocm-bc-dir` when platform bitcode can be found
 /// (required for in-process `libIREECompiler`; `iree-compile` finds it via
@@ -105,26 +105,6 @@ pub fn flags_for_target(driver: &str, gpu_arch: Option<&str>) -> Result<Vec<Stri
         })
     };
     match driver {
-        "vulkan" => {
-            // Generic `--iree-hal-target-device=vulkan` alone uses Android
-            // baseline SPIR-V, which fails to legalize ops like `vector.step`
-            // on desktop matmul/attention. Always pin a GPU arch.
-            //
-            // AMD gfx*: clamp IREE's 64 KiB HIP-WGP budget down to Vulkan's
-            // 32 KiB CU-mode limit before SPIR-V tiling (same as
-            // `dyninfer_core::vulkan_executable_flags`).
-            let arch = require_arch()?;
-            let mut flags = vec![
-                "--iree-hal-target-device=vulkan".into(),
-                format!("--iree-vulkan-target={arch}"),
-            ];
-            if arch.starts_with("gfx") {
-                flags.push(
-                    "--iree-hal-preprocess-executables-with=dyninfer-clamp-vulkan-lds".into(),
-                );
-            }
-            Ok(flags)
-        }
         "hip" | "rocm" => {
             let chip = require_arch()?;
             let mut flags = vec![

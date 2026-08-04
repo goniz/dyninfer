@@ -171,7 +171,7 @@ mod tests {
 
     /// Full mixed Q4_0/Q4_1/Q6_K compile + execution. Enable with
     /// `DYNINFER_QWEN3_GGUF_E2E=1`; select the backend with
-    /// `DYNINFER_QWEN3_GGUF_TARGET` (cpu, hip, or vulkan).
+    /// `DYNINFER_QWEN3_GGUF_TARGET` (cpu or hip).
     #[test]
     fn unsloth_qwen3_q4_0_compiles_and_executes_directly() {
         if std::env::var_os("DYNINFER_QWEN3_GGUF_E2E").is_none() {
@@ -317,7 +317,7 @@ mod tests {
     /// Full direct packed-U4 compile + short greedy decode. Enable with
     /// `DYNINFER_QWEN3_MLX_E2E=1`; pass the checkpoint through Bazel with
     /// `--test_env=DYNINFER_QWEN3_MLX=/absolute/path/to/index.json`. Select
-    /// cpu, hip, or vulkan with `DYNINFER_QWEN3_MLX_TARGET`.
+    /// cpu or hip with `DYNINFER_QWEN3_MLX_TARGET`.
     #[test]
     fn mlx_qwen3_0_6b_compiles_and_generates_without_materialization() {
         if std::env::var_os("DYNINFER_QWEN3_MLX_E2E").is_none() {
@@ -374,7 +374,7 @@ mod tests {
     }
 
     /// Full compile + short greedy decode. Enable with `DYNINFER_QWEN3_E2E=1`;
-    /// select cpu, hip, or vulkan with `DYNINFER_QWEN3_TARGET`.
+    /// select cpu or hip with `DYNINFER_QWEN3_TARGET`.
     #[test]
     fn qwen3_0_6b_compiles_and_generates() {
         if std::env::var_os("DYNINFER_QWEN3_E2E").is_none() {
@@ -492,10 +492,10 @@ mod tests {
         assert!(metrics.allocated_bytes < 1024 * 1024 * 1024);
     }
 
-    /// Prefill logit parity: CPU paged vs a GPU target. Catches Vulkan
+    /// Prefill logit parity: CPU paged vs a GPU target. Catches GPU
     /// correctness bugs that still produce finite logits. Enable with
     /// `DYNINFER_QWEN3_PAGED_PARITY=1`; optional
-    /// `DYNINFER_QWEN3_PAGED_PARITY_TARGET` (default vulkan).
+    /// `DYNINFER_QWEN3_PAGED_PARITY_TARGET` (default hip).
     #[test]
     fn qwen3_paged_cpu_vs_gpu_prefill_parity() {
         if std::env::var_os("DYNINFER_QWEN3_PAGED_PARITY").is_none() {
@@ -511,8 +511,8 @@ mod tests {
             return;
         };
         let ckpt = find_safetensors_checkpoint(&model_dir).unwrap();
-        let gpu = std::env::var("DYNINFER_QWEN3_PAGED_PARITY_TARGET")
-            .unwrap_or_else(|_| "vulkan".into());
+        let gpu =
+            std::env::var("DYNINFER_QWEN3_PAGED_PARITY_TARGET").unwrap_or_else(|_| "hip".into());
         let loader = ModelLoader::default();
         let id = ArchitectureId::new("qwen3.decoder");
         let overrides = dyninfer_core::MetadataMap::from([
@@ -586,10 +586,10 @@ mod tests {
         );
     }
 
-    /// Paged KV short generate (catches Vulkan shared-memory / garbage-token
+    /// Paged KV short generate (catches shared-memory / garbage-token
     /// regressions that finite-logit checks miss). Enable with
     /// `DYNINFER_QWEN3_PAGED_GENERATE_E2E=1`; select backend with
-    /// `DYNINFER_QWEN3_PAGED_GENERATE_TARGET` (cpu, hip, or vulkan).
+    /// `DYNINFER_QWEN3_PAGED_GENERATE_TARGET` (cpu or hip).
     #[test]
     fn qwen3_paged_short_generate() {
         if std::env::var_os("DYNINFER_QWEN3_PAGED_GENERATE_E2E").is_none() {
@@ -612,7 +612,7 @@ mod tests {
         let loader = ModelLoader::default();
         let id = ArchitectureId::new("qwen3.decoder");
         let target =
-            std::env::var("DYNINFER_QWEN3_PAGED_GENERATE_TARGET").unwrap_or_else(|_| "vulkan".into());
+            std::env::var("DYNINFER_QWEN3_PAGED_GENERATE_TARGET").unwrap_or_else(|_| "hip".into());
         let overrides = dyninfer_core::MetadataMap::from([
             ("max_kv".into(), serde_json::json!(1024)),
         ]);
@@ -670,7 +670,7 @@ mod tests {
             out.token_ids,
             out.text
         );
-        // Refuse the known Vulkan garbage loop pattern.
+        // Refuse the known garbage loop pattern.
         assert!(
             !out.text.contains("odable"),
             "paged generate produced garbage text on {target}: {}",

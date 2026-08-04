@@ -1,7 +1,6 @@
 # MLX affine U4 qualification
 
-`mlx.affine.u4` is production-enabled for local IREE CPU, HIP, and Vulkan
-backends. CPU selection requires AVX2; GPU selection requires an exactly
+`mlx.affine.u4` is production-enabled for local IREE CPU and HIP backends. CPU selection requires AVX2; GPU selection requires an exactly
 discovered local device and compile target. The checkpoint contract is unsigned
 four-bit lanes packed least-significant lane first in U32 words, plus one scale
 and one bias per group. Dequantization is `value = lane * scale + bias`.
@@ -20,8 +19,8 @@ and one bias per group. Dequantization is `value = lane * scale + bias`.
   parameter directory or dense external shadow tensors. Its manifest contains
   707 original components and sets `derived_parameters_required=false`.
 - The same real checkpoint completes short Qwen3 prefill/decode tests through
-  CPU, HIP (`gfx1151` on the qualification host), and Vulkan. No backend retry
-  or CPU fallback is permitted.
+  CPU and HIP (`gfx1151` on the qualification host). No backend retry or CPU
+  fallback is permitted.
 
 GPU dequantization is a device dispatch separated from the F32 contraction.
 This is the initial reliable IREE path: checkpoint storage remains packed and
@@ -48,14 +47,8 @@ different bit width, group formula, or serialized layout.
 
 ## GPU qualification
 
-The HIP and Vulkan registrations currently have functional qualification on
-the same Qwen3 model: complete strict coverage, direct parameter binding,
-successful compile, finite prefill/decode logits, and no host or persistent
-dense materialization. Throughput and temporary-memory benchmarks remain
-required before claiming parity with a native fused U4 GPU kernel.
-
-With the repository's current IREE revision, Vulkan validation layers may
-report that emitted `NoSignedWrap` decorations omit
-`SPV_KHR_no_integer_wrap_decoration`. Execution succeeds on the qualification
-device, but this compiler-side validation issue should be resolved before a
-warning-free Vulkan release gate is claimed.
+The HIP registration currently has functional qualification on the same Qwen3
+model: complete strict coverage, direct parameter binding, successful compile,
+finite prefill/decode logits, and no host or persistent dense materialization.
+Throughput and temporary-memory benchmarks remain required before claiming
+parity with a native fused U4 GPU kernel.
