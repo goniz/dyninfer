@@ -459,30 +459,15 @@ fn emit_paged_chunk_begin(
             "  %h_acc{s} = iree_linalg_ext.gather dimension_map = [0] ins(%emb_t, %tokens : tensor<{v}x{h}xf32>, tensor<{s}xi64>) outs(%h_acc0 : {hidden_ty}) -> {hidden_ty}\n"
         ));
     } else {
-        for pos in 0..s {
-            f.op_asm(format!(
-                "  %c{pos}i = arith.constant {pos} : index\n  %t{pos} = tensor.extract %tokens[%c{pos}i] : tensor<{s}xi64>\n  %i{pos} = arith.index_cast %t{pos} : i64 to index\n"
-            ));
-            if !parameters.emit_embedding_call(
-                &mut f,
-                c,
-                &format!("r{pos}"),
-                &format!("i{pos}"),
-                "emb_t",
-                variant.mode(),
-            )? {
-                unreachable!("plain embeddings use the gather path");
-            }
-            let prev = if pos == 0 {
-                "h_acc0".to_string()
-            } else {
-                format!("h_acc{pos}")
-            };
-            let next = format!("h_acc{}", pos + 1);
-            f.op_asm(format!(
-                "  %{next} = tensor.insert_slice %r{pos} into %{prev}[{pos}, 0] [1, {h}] [1, 1] : tensor<1x{h}xf32> into {hidden_ty}\n"
-            ));
+        f.op_asm(format!(
+            "  %c0i = arith.constant 0 : index\n  %c1i = arith.constant 1 : index\n  %csi = arith.constant {s} : index\n  %h_acc{s} = scf.for %p = %c0i to %csi step %c1i iter_args(%acc = %h_acc0) -> ({hidden_ty}) {{\n  %t = tensor.extract %tokens[%p] : tensor<{s}xi64>\n  %i = arith.index_cast %t : i64 to index\n"
+        ));
+        if !parameters.emit_embedding_call(&mut f, c, "r", "i", "emb_t", variant.mode())? {
+            unreachable!("plain embeddings use the gather path");
         }
+        f.op_asm(format!(
+            "  %next = tensor.insert_slice %r into %acc[%p, 0] [1, {h}] [1, 1] : tensor<1x{h}xf32> into {hidden_ty}\n  scf.yield %next : {hidden_ty}\n  }}\n"
+        ));
     }
     f.op_asm(format!(
         "  %last64 = tensor.extract %last[] : tensor<i64>\n  %one64 = arith.constant 1 : i64\n  %valid64 = arith.addi %last64, %one64 : i64\n  %valid_e = tensor.empty() : tensor<i64>\n  %valid = tensor.insert %valid64 into %valid_e[] : tensor<i64>\n  util.global.store %h_acc{s}, @{hidden_global} : {hidden_ty}\n  util.global.store %start_pos, @{start_global} : tensor<i64>\n  util.global.store %valid, @{valid_global} : tensor<i64>\n  return",
