@@ -50,7 +50,10 @@ pub const LARGE_MAX_KV: u32 = 256;
 /// Larger models pass a host `attn_bias` for padded KV slots.
 pub const TINY_MAX_KV: u32 = 4;
 pub const PAGED_KV_PAGE_SIZE: u32 = 256;
-pub const PAGED_PREFILL_CHUNK_SIZE: u32 = 2048;
+/// Prefill specializes a static chunk width. Values >= 1024 currently corrupt
+/// short-prompt greedy decode on HIP (flash and portable); 512 stays correct
+/// and long prompts are covered by multiple chunks.
+pub const PAGED_PREFILL_CHUNK_SIZE: u32 = 512;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DenseDecoderConfig {
@@ -735,7 +738,7 @@ fn emit_paged_layer_page(
   %ve2 = tensor.empty() : {page_head_ty}
   %kh = linalg.transpose ins(%kseq : {page_seq_ty}) outs(%ke2 : {page_head_ty}) permutation = [1, 0, 2]
   %vh = linalg.transpose ins(%vseq : {page_seq_ty}) outs(%ve2 : {page_head_ty}) permutation = [1, 0, 2]
-  %mask = func.call @{mask_helper}(%start_pos, %pi) : (tensor<i64>, index) -> {mask_ty}
+  %mask = func.call @{mask_helper}(%start_pos, %pi, %valid_t) : (tensor<i64>, index, tensor<i64>) -> {mask_ty}
   %query = util.global.load @{query_global} : {qg_ty}
   %out = util.global.load @{output_global} : {qg_ty}
   %max = util.global.load @{max_global} : {row_ty}

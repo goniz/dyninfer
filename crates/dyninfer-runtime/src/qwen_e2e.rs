@@ -363,6 +363,8 @@ mod tests {
             &GenerateConfig {
                 max_new_tokens: 2,
                 eos_token_id: tokenizer.eos_id(),
+                apply_chat_template: false,
+                ..Default::default()
             },
             SessionConfig::default(),
         )
@@ -428,6 +430,8 @@ mod tests {
             &GenerateConfig {
                 max_new_tokens: 8,
                 eos_token_id: eos,
+                apply_chat_template: false,
+                ..Default::default()
             },
             SessionConfig::default(),
         )

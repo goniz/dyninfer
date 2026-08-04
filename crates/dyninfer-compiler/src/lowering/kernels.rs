@@ -94,23 +94,29 @@ pub fn emit_iree_online_attention_page(
     f.result_ty(&row_ty);
     let (padding, q_input, mask_input, output_input, max_input, sum_input, result_slices) =
         if query_len == 1 {
+            // WMMA decode tiles are 16-wide; pad extra query rows so they do not
+            // participate in softmax (mask=-inf) or seed row_max with 0.
             (
                 format!(
                     r#"  %zero16 = arith.constant 0.0 : f16
   %zero32 = arith.constant 0.0 : f32
+  %neg16 = arith.constant 0xFC00 : f16
+  %neg32 = arith.constant -3.40282347E+38 : f32
   %q_pad_e = tensor.empty() : {q_kernel_ty}
   %mask_pad_e = tensor.empty() : {mask_kernel_ty}
   %output_pad_e = tensor.empty() : {output_kernel_ty}
-  %row_pad_e = tensor.empty() : {row_kernel_ty}
+  %row_max_pad_e = tensor.empty() : {row_kernel_ty}
+  %row_sum_pad_e = tensor.empty() : {row_kernel_ty}
   %q_pad = linalg.fill ins(%zero16 : f16) outs(%q_pad_e : {q_kernel_ty}) -> {q_kernel_ty}
-  %mask_pad = linalg.fill ins(%zero16 : f16) outs(%mask_pad_e : {mask_kernel_ty}) -> {mask_kernel_ty}
+  %mask_pad = linalg.fill ins(%neg16 : f16) outs(%mask_pad_e : {mask_kernel_ty}) -> {mask_kernel_ty}
   %output_pad = linalg.fill ins(%zero32 : f32) outs(%output_pad_e : {output_kernel_ty}) -> {output_kernel_ty}
-  %row_pad = linalg.fill ins(%zero32 : f32) outs(%row_pad_e : {row_kernel_ty}) -> {row_kernel_ty}
+  %row_max_pad = linalg.fill ins(%neg32 : f32) outs(%row_max_pad_e : {row_kernel_ty}) -> {row_kernel_ty}
+  %row_sum_pad = linalg.fill ins(%zero32 : f32) outs(%row_sum_pad_e : {row_kernel_ty}) -> {row_kernel_ty}
   %q_kernel = tensor.insert_slice %q_flat into %q_pad[0, 0, 0] [{kv_heads}, {flash_queries}, {head_dim}] [1, 1, 1] : {q_flat_ty} into {q_kernel_ty}
   %mask_kernel = tensor.insert_slice %mask_flat into %mask_pad[0, 0, 0] [{kv_heads}, {flash_queries}, {page_size}] [1, 1, 1] : {mask_flat_ty} into {mask_kernel_ty}
   %output_kernel = tensor.insert_slice %output_flat into %output_pad[0, 0, 0] [{kv_heads}, {flash_queries}, {head_dim}] [1, 1, 1] : {output_flat_ty} into {output_kernel_ty}
-  %max_kernel = tensor.insert_slice %max_flat into %row_pad[0, 0] [{kv_heads}, {flash_queries}] [1, 1] : {row_flat_ty} into {row_kernel_ty}
-  %sum_kernel = tensor.insert_slice %sum_flat into %row_pad[0, 0] [{kv_heads}, {flash_queries}] [1, 1] : {row_flat_ty} into {row_kernel_ty}
+  %max_kernel = tensor.insert_slice %max_flat into %row_max_pad[0, 0] [{kv_heads}, {flash_queries}] [1, 1] : {row_flat_ty} into {row_kernel_ty}
+  %sum_kernel = tensor.insert_slice %sum_flat into %row_sum_pad[0, 0] [{kv_heads}, {flash_queries}] [1, 1] : {row_flat_ty} into {row_kernel_ty}
 "#
                 ),
                 "q_kernel",
@@ -341,41 +347,38 @@ pub fn emit_paged_causal_mask(
     gqa_group: u32,
 ) -> Result<()> {
     let mask_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}x{page_size}xf32>");
-    let query_positions = (0..query_len)
-        .map(|value| value.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let key_positions = (0..page_size)
-        .map(|value| value.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
     let mut f = module.func_private(name);
     f.arg("start_pos", "tensor<i64>");
     f.arg("page_index", "index");
+    // Host/chunk valid length: only keys in `[start, start+valid)` are written.
+    f.arg("valid_count", "tensor<i64>");
     f.result_ty(&mask_ty);
+    // Use linalg.index instead of giant dense<[0..N]> constants — those break
+    // HIP codegen once the prefill chunk grows past ~512.
     f.op_asm(format!(
         r#"  %start64 = tensor.extract %start_pos[] : tensor<i64>
+  %valid64 = tensor.extract %valid_count[] : tensor<i64>
+  %seq_end = arith.addi %start64, %valid64 : i64
   %page64 = arith.index_cast %page_index : index to i64
   %page_size64 = arith.constant {page_size} : i64
   %page_start = arith.muli %page64, %page_size64 : i64
-  %query_positions = arith.constant dense<[{query_positions}]> : tensor<{query_len}xi64>
-  %key_positions = arith.constant dense<[{key_positions}]> : tensor<{page_size}xi64>
   %zero = arith.constant 0.0 : f32
   %neg = arith.constant -3.40282347E+38 : f32
   %empty = tensor.empty() : {mask_ty}
   %mask = linalg.generic {{
-      indexing_maps = [
-        affine_map<(kh, g, q, k) -> (q)>,
-        affine_map<(kh, g, q, k) -> (k)>,
-        affine_map<(kh, g, q, k) -> (kh, g, q, k)>
-      ],
+      indexing_maps = [affine_map<(kh, g, q, k) -> (kh, g, q, k)>],
       iterator_types = ["parallel", "parallel", "parallel", "parallel"]}}
-    ins(%query_positions, %key_positions : tensor<{query_len}xi64>, tensor<{page_size}xi64>)
     outs(%empty : {mask_ty}) {{
-    ^bb0(%q: i64, %k: i64, %o: f32):
-      %abs_q = arith.addi %start64, %q : i64
-      %abs_k = arith.addi %page_start, %k : i64
-      %visible = arith.cmpi ule, %abs_k, %abs_q : i64
+    ^bb0(%o: f32):
+      %q = linalg.index 2 : index
+      %k = linalg.index 3 : index
+      %q64 = arith.index_cast %q : index to i64
+      %k64 = arith.index_cast %k : index to i64
+      %abs_q = arith.addi %start64, %q64 : i64
+      %abs_k = arith.addi %page_start, %k64 : i64
+      %causal = arith.cmpi ule, %abs_k, %abs_q : i64
+      %written = arith.cmpi ult, %abs_k, %seq_end : i64
+      %visible = arith.andi %causal, %written : i1
       %value = arith.select %visible, %zero, %neg : f32
       linalg.yield %value : f32
   }} -> {mask_ty}
@@ -481,6 +484,26 @@ mod online_attention_tests {
         assert!(text.contains("iree_linalg_ext.online_attention"));
         assert!(text.contains("math.powf"));
         assert!(!text.contains("tensor<8x4096x4096"));
+    }
+
+    #[test]
+    fn decode_flash_pads_masked_rows_with_neg_inf() {
+        let mut module = ModuleBuilder::new().unwrap();
+        emit_iree_online_attention_page(&mut module, "decode_flash_pad", 1, 256, 8, 2, 128)
+            .unwrap();
+        let text = module.finish().unwrap().mlir_text;
+        assert!(
+            text.contains("0xFC00 : f16"),
+            "padded decode mask rows must be f16 -inf"
+        );
+        assert!(
+            text.contains("-3.40282347E+38 : f32"),
+            "padded decode row_max must be -inf"
+        );
+        // Regression: filling pad mask/max with 0 lets dummy WMMA rows attend.
+        assert!(!text.contains(
+            "linalg.fill ins(%zero16 : f16) outs(%mask_pad_e"
+        ));
     }
 
     #[test]
