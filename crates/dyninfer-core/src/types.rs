@@ -318,12 +318,7 @@ impl TargetProfile {
             max_workgroup_invocations: None,
             executable_target_flags: architecture
                 .as_ref()
-                .map(|chip| {
-                    vec![
-                        "--iree-hal-target-device=vulkan".into(),
-                        format!("--iree-vulkan-target={chip}"),
-                    ]
-                })
+                .map(|chip| vulkan_executable_flags(chip))
                 .unwrap_or_default(),
             verified: architecture.is_some(),
         };
@@ -521,6 +516,29 @@ fn nonempty(value: &str) -> Option<String> {
     (!value.trim().is_empty()).then(|| value.trim().to_string())
 }
 
+/// Basename looked up on `PATH` by IREE's executable preprocessor.
+pub const VULKAN_LDS_CLAMP_TOOL: &str = "dyninfer-clamp-vulkan-lds";
+
+/// IREE compile flags for a Vulkan chip.
+///
+/// AMD `gfx*` Vulkan devices expose 32 KiB workgroup memory (CU mode), while
+/// IREE's known `gfx*` targets inherit the HIP WGP budget of 64 KiB. Without a
+/// clamp, SPIR-V matmul promotion can emit kernels that fail Vulkan validation
+/// (`shared memory N > 32768`) and produce garbage outputs. The preprocess tool
+/// rewrites the target attr before executable configuration; the tool name must
+/// be space-free so in-process `ireeCompilerSessionSetFlags` accepts it.
+pub fn vulkan_executable_flags(chip: &str) -> Vec<String> {
+    let mut flags = vec![
+        "--iree-hal-target-device=vulkan".into(),
+        format!("--iree-vulkan-target={chip}"),
+    ];
+    if chip.starts_with("gfx") {
+        flags.push(format!(
+            "--iree-hal-preprocess-executables-with={VULKAN_LDS_CLAMP_TOOL}"
+        ));
+    }
+    flags
+}
 fn cuda_sm(architecture: &str) -> Option<u32> {
     architecture
         .strip_prefix("sm_")
@@ -747,5 +765,24 @@ mod tests {
             a.capability_fingerprint,
             different_arch.capability_fingerprint
         );
+    }
+
+    #[test]
+    fn vulkan_amd_flags_clamp_workgroup_memory_to_device_limit() {
+        let flags = vulkan_executable_flags("gfx1151");
+        assert!(flags.iter().any(|f| f.contains("--iree-vulkan-target=gfx1151")));
+        assert!(flags.iter().any(|f| {
+            f.contains("iree-hal-preprocess-executables-with")
+                && f.contains(VULKAN_LDS_CLAMP_TOOL)
+        }));
+        let profile = TargetProfile::vulkan("gfx1151");
+        assert!(profile.executable_target_flags.iter().any(|f| {
+            f.contains("iree-hal-preprocess-executables-with")
+                && f.contains(VULKAN_LDS_CLAMP_TOOL)
+        }));
+
+        // Non-AMD Vulkan targets keep the stock IREE budget.
+        let mali = vulkan_executable_flags("valhall4");
+        assert!(mali.iter().all(|f| !f.contains("preprocess-executables")));
     }
 }

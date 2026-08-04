@@ -54,6 +54,20 @@ pub const PAGED_KV_PAGE_SIZE: u32 = 256;
 /// short-prompt greedy decode on HIP (flash and portable); 512 stays correct
 /// and long prompts are covered by multiple chunks.
 pub const PAGED_PREFILL_CHUNK_SIZE: u32 = 512;
+/// Vulkan portable attention + SPIR-V promotion is far more sensitive to chunk
+/// width than HIP/CPU. Keep a smaller specialized width so score/mask tiles
+/// stay within the 32 KiB workgroup-memory budget and avoid the garbage-token
+/// loops seen at 512.
+pub const PAGED_PREFILL_CHUNK_SIZE_VULKAN: u32 = 64;
+
+/// Prefill chunk width for the active target.
+pub fn paged_prefill_chunk_size(driver: &str) -> u32 {
+    if driver == "vulkan" {
+        PAGED_PREFILL_CHUNK_SIZE_VULKAN
+    } else {
+        PAGED_PREFILL_CHUNK_SIZE
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DenseDecoderConfig {
@@ -70,8 +84,9 @@ pub struct DenseDecoderConfig {
     pub max_kv: u32,
     /// Runtime-owned paged KV shared by split prefill/decode modules (ABI v6).
     pub paged_kv: bool,
-    /// HIP uses IREE's fused online-attention op; portable backends retain the
-    /// page-local linalg fallback until their code generators support it.
+    /// HIP uses IREE's fused online-attention op with WMMA flash configs;
+    /// Vulkan/CPU keep the portable page-local linalg fallback (SPIR-V cannot
+    /// lower `LLVMGPUVectorDistribute` / `WMMAR3_*`).
     pub iree_flash_attention: bool,
     pub rms_norm_eps: f32,
     pub rope_theta: Option<f32>,
@@ -92,6 +107,10 @@ pub struct DenseDecoderConfig {
     /// widening when it is fused into a contraction. Keep that conversion in
     /// its own device dispatch; other backends retain the fused path.
     pub separate_storage_casts: bool,
+    /// Vulkan fused paged modules cannot legalize `vector.step` from
+    /// `linalg.index` in the causal mask; materialize positions as dense
+    /// constants instead. HIP must not use dense constants (breaks codegen).
+    pub dense_index_constants: bool,
 }
 
 impl DenseDecoderConfig {
@@ -224,8 +243,11 @@ impl DenseDecoderConfig {
             seq,
             max_kv: max_kv.max(seq),
             paged_kv,
-            // Flash is fine once chunk KV is SSA-threaded; empty future pages are
-            // fully masked and portable/flash both no-op correctly for those.
+            // IREE online attention (`iree_linalg_ext.online_attention`) is
+            // emitted only for HIP: the flash configs hardcode
+            // `LLVMGPUVectorDistribute` + `WMMAR3_*` MMA layouts that SPIR-V
+            // / Vulkan cannot lower. Other backends use portable page-local
+            // linalg attention (`emit_online_attention_page`).
             iree_flash_attention: bound.target.driver == "hip",
             rms_norm_eps: f(
                 &["rms_norm_eps", "llama.attention.layer_norm_rms_epsilon"],
@@ -245,7 +267,10 @@ impl DenseDecoderConfig {
             param_compute_dtypes,
             param_bindings,
             param_lowerings,
+            // Vulkan requires separate BF16/F16 casts and dense causal-mask
+            // indices (`vector.step` / fused bitcast fail otherwise).
             separate_storage_casts: bound.target.driver == "vulkan",
+            dense_index_constants: bound.target.driver == "vulkan",
         }
     }
 
@@ -516,14 +541,8 @@ fn emit_paged_fused_chunk(
         }
         page_ssas = next_pages;
         f.op_asm(format!(
-            r#"  util.global.store %{out_ssa}, @{output_global} : {qg_ty}
-  util.global.store %{max_ssa}, @{max_global} : {row_ty}
-  util.global.store %{sum_ssa}, @{sum_global} : {row_ty}
-  func.call @{finish}() : () -> ()
-"#,
-            output_global = variant.global("attn_output"),
-            max_global = variant.global("attn_max"),
-            sum_global = variant.global("attn_sum"),
+            r#"  func.call @{finish}(%{out_ssa}, %{sum_ssa}) : ({qg_ty}, {row_ty}) -> ()
+"#
         ));
     }
     let page_rets = page_ssas
@@ -890,6 +909,8 @@ fn emit_paged_layer_finish(
     let linear_hi = variant.helper("linear_hi");
     let linear_ih = variant.helper("linear_ih");
     let mut f = module.func_private(&variant.function(&format!("layer_finish_{layer}")));
+    f.arg("out", &qg_ty);
+    f.arg("sum", &row_ty);
     for (ssa, sym, canonical, shape) in [
         (
             "wo",
@@ -926,8 +947,6 @@ fn emit_paged_layer_finish(
     }
     f.op_asm(format!(
         r#"  %hidden = util.global.load @{hidden_global} : {hidden_ty}
-  %out = util.global.load @{output_global} : {qg_ty}
-  %sum = util.global.load @{sum_global} : {row_ty}
   %norm_e = tensor.empty() : {qg_ty}
   %norm = linalg.generic {{
       indexing_maps = [
@@ -946,8 +965,6 @@ fn emit_paged_layer_finish(
   %ctx = tensor.collapse_shape %ctx4 [[0], [1, 2, 3]] : tensor<{s}x{nkv}x{g}x{d}xf32> into tensor<{s}x{q}xf32>
 "#,
         hidden_global = variant.global("hidden"),
-        output_global = variant.global("attn_output"),
-        sum_global = variant.global("attn_sum"),
     ));
     emit_linear_call(
         &mut f,
@@ -1441,7 +1458,7 @@ fn emit_helpers(
                 PAGED_KV_PAGE_SIZE,
                 nkv,
                 g,
-                c.separate_storage_casts,
+                c.dense_index_constants,
             )?;
             if let Some(theta) = c.rope_theta {
                 kernels::emit_rope_chunk(module, "apply_rope_q_chunk", s, nh, d, theta)?;
@@ -1523,7 +1540,7 @@ fn emit_paged_decode_helpers(module: &mut ModuleBuilder, c: &DenseDecoderConfig)
         PAGED_KV_PAGE_SIZE,
         nkv,
         g,
-        c.separate_storage_casts,
+        c.dense_index_constants,
     )?;
     if let Some(theta) = c.rope_theta {
         kernels::emit_rope_chunk(module, "apply_rope_q_chunk_tok", s, nh, d, theta)?;
@@ -2719,6 +2736,7 @@ mod tests {
             param_bindings: BTreeMap::new(),
             param_lowerings: BTreeMap::new(),
             separate_storage_casts: false,
+            dense_index_constants: false,
         };
         assert!(c.supports_dense_emit());
         assert_eq!(c.q_dim(), 2048);
@@ -2751,6 +2769,7 @@ mod tests {
             param_bindings: BTreeMap::new(),
             param_lowerings: BTreeMap::new(),
             separate_storage_casts: false,
+            dense_index_constants: false,
         };
         assert!(c.supports_dense_emit());
         assert!(c.is_synthetic_fixture());
@@ -2814,6 +2833,7 @@ mod tests {
             param_bindings: BTreeMap::new(),
             param_lowerings: BTreeMap::new(),
             separate_storage_casts: false,
+            dense_index_constants: false,
         };
         let mlir = emit_dense_decoder_cfg("test.decoder", &c).expect("mlir verify");
         assert!(
@@ -2865,6 +2885,7 @@ mod tests {
             param_bindings: BTreeMap::new(),
             param_lowerings: BTreeMap::new(),
             separate_storage_casts: false,
+            dense_index_constants: false,
         };
         let mlir = emit_dense_decoder_cfg("test.gqa", &c).expect("emit");
         assert!(mlir.contains("func.func private @attn_decode"));

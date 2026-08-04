@@ -110,11 +110,20 @@ pub fn flags_for_target(driver: &str, gpu_arch: Option<&str>) -> Result<Vec<Stri
             // baseline SPIR-V, which fails to legalize ops like `vector.step`
             // on desktop matmul/attention. Always pin a GPU arch.
             //
+            // AMD gfx*: clamp IREE's 64 KiB HIP-WGP budget down to Vulkan's
+            // 32 KiB CU-mode limit before SPIR-V tiling (same as
+            // `dyninfer_core::vulkan_executable_flags`).
             let arch = require_arch()?;
-            Ok(vec![
+            let mut flags = vec![
                 "--iree-hal-target-device=vulkan".into(),
                 format!("--iree-vulkan-target={arch}"),
-            ])
+            ];
+            if arch.starts_with("gfx") {
+                flags.push(
+                    "--iree-hal-preprocess-executables-with=dyninfer-clamp-vulkan-lds".into(),
+                );
+            }
+            Ok(flags)
         }
         "hip" | "rocm" => {
             let chip = require_arch()?;

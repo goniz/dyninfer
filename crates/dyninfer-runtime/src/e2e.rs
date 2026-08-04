@@ -586,7 +586,11 @@ mod tests {
             .unwrap();
         let model = loader.load_bundle(&bundle, &ckpt).unwrap();
         assert_eq!(model.manifest.version, 6);
-        assert_eq!(model.manifest.prefill_window, 512);
+        assert!(
+            model.manifest.prefill_window == 512 || model.manifest.prefill_window == 64,
+            "unexpected prefill_window {}",
+            model.manifest.prefill_window
+        );
 
         let mut session = model.create_session(SessionConfig::default()).unwrap();
         let tokens: Vec<u32> = (0..257).map(|index| 1 + index % 30).collect();
@@ -611,6 +615,32 @@ mod tests {
         let metrics = session.kv_cache_metrics().unwrap();
         assert_eq!(metrics.page_count, 4); // ceil(1024/256) for ABI v6 fixed arity
         assert!(metrics.allocated_bytes > 0);
+
+        // Multi-step greedy decode must stay finite and not collapse into a
+        // single repeating token (the Vulkan shared-memory bug surfaced as an
+        // `odable`-style loop with finite but garbage logits).
+        let mut greedy_tokens = Vec::with_capacity(16);
+        let mut logits = logits;
+        for _ in 0..16 {
+            let token = logits
+                .values
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                .map(|(index, _)| index as u32)
+                .unwrap();
+            greedy_tokens.push(token);
+            logits = session.decode(token).unwrap();
+            let bad = logits.values.iter().filter(|v| !v.is_finite()).count();
+            assert_eq!(bad, 0, "decode produced non-finite logits");
+        }
+        let unique: std::collections::BTreeSet<_> = greedy_tokens.iter().copied().collect();
+        assert!(
+            unique.len() >= 3,
+            "greedy decode collapsed to {:?}; expected token diversity",
+            greedy_tokens
+        );
+
         session.reset().unwrap();
         assert_eq!(session.kv_cache_metrics().unwrap().page_count, 0);
     }

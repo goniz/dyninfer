@@ -491,4 +491,96 @@ mod tests {
         assert_eq!(metrics.page_count, 17);
         assert!(metrics.allocated_bytes < 1024 * 1024 * 1024);
     }
+
+    /// Paged KV short generate (catches Vulkan shared-memory / garbage-token
+    /// regressions that finite-logit checks miss). Enable with
+    /// `DYNINFER_QWEN3_PAGED_GENERATE_E2E=1`; select backend with
+    /// `DYNINFER_QWEN3_PAGED_GENERATE_TARGET` (cpu, hip, or vulkan).
+    #[test]
+    fn qwen3_paged_short_generate() {
+        if std::env::var_os("DYNINFER_QWEN3_PAGED_GENERATE_E2E").is_none() {
+            eprintln!(
+                "skipping: set DYNINFER_QWEN3_PAGED_GENERATE_E2E=1 for paged generate qualification"
+            );
+            return;
+        }
+        if !iree_available() {
+            eprintln!("skipping: IREE not available");
+            return;
+        }
+        let Some(model_dir) = qwen3_dir() else {
+            eprintln!("skipping: Qwen3-0.6B not available");
+            return;
+        };
+        let ckpt = find_safetensors_checkpoint(&model_dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("paged-gen.bundle");
+        let loader = ModelLoader::default();
+        let id = ArchitectureId::new("qwen3.decoder");
+        let target =
+            std::env::var("DYNINFER_QWEN3_PAGED_GENERATE_TARGET").unwrap_or_else(|_| "vulkan".into());
+        let overrides = dyninfer_core::MetadataMap::from([
+            ("max_kv".into(), serde_json::json!(1024)),
+        ]);
+        loader
+            .compile_to_bundle_with_overrides(
+                &id,
+                &ckpt,
+                &target,
+                &bundle,
+                &CompileOptions {
+                    mode: "local-jit".into(),
+                    ..Default::default()
+                },
+                &overrides,
+            )
+            .unwrap_or_else(|error| panic!("compile paged Qwen3 on {target}: {error}"));
+        let model = loader.load_bundle(&bundle, &ckpt).unwrap();
+        assert_eq!(model.manifest.version, 6);
+        assert!(model.manifest.prefill_window >= 256);
+
+        let tokenizer = load_tokenizer(&model_dir).unwrap();
+        let eos = model
+            .metadata()
+            .extra
+            .get("eos_token_id")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .or_else(|| tokenizer.eos_id());
+        let out = generate_greedy(
+            &model,
+            &tokenizer,
+            "tell me a story",
+            &GenerateConfig {
+                max_new_tokens: 48,
+                eos_token_id: eos,
+                apply_chat_template: false,
+                ..Default::default()
+            },
+            SessionConfig {
+                max_sequence_length: 1024,
+                ..SessionConfig::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("paged generate on {target}: {error}"));
+        eprintln!("qwen3 paged/{target} text={}", out.text);
+        assert!(
+            out.token_ids.len() > 8,
+            "expected several generated tokens, got {}",
+            out.token_ids.len()
+        );
+        let unique: std::collections::BTreeSet<_> = out.token_ids.iter().copied().collect();
+        assert!(
+            unique.len() >= 8,
+            "paged generate collapsed to {:?}; text={}",
+            out.token_ids,
+            out.text
+        );
+        // Refuse the known Vulkan garbage loop pattern.
+        assert!(
+            !out.text.contains("odable"),
+            "paged generate produced garbage text on {target}: {}",
+            out.text
+        );
+    }
 }

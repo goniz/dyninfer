@@ -345,8 +345,8 @@ pub fn emit_paged_causal_mask(
     page_size: u32,
     kv_heads: u32,
     gqa_group: u32,
-    // Vulkan SPIR-V cannot legalize `vector.step` from `linalg.index` on large
-    // mask tensors; use dense position constants there instead. HIP prefers
+    // Vulkan SPIR-V cannot legalize `vector.step` from `linalg.index` inside
+    // the fused paged module; use dense position constants there. HIP prefers
     // `linalg.index` because large dense constants break its codegen.
     dense_index_constants: bool,
 ) -> Result<()> {
@@ -358,14 +358,10 @@ pub fn emit_paged_causal_mask(
     f.arg("valid_count", "tensor<i64>");
     f.result_ty(&mask_ty);
     let body = if dense_index_constants {
-        let query_positions = (0..query_len)
-            .map(|value| value.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let key_positions = (0..page_size)
-            .map(|value| value.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
+        // Build position tensors with `scf.for` instead of `arith.constant dense`.
+        // Large dense i64 constants inside the fused paged module have produced
+        // wrong masks on Vulkan (garbage decode) even though the math matches
+        // `linalg.index`; SPIR-V also rejects `linalg.index` → `vector.step`.
         format!(
             r#"  %start64 = tensor.extract %start_pos[] : tensor<i64>
   %valid64 = tensor.extract %valid_count[] : tensor<i64>
@@ -373,8 +369,22 @@ pub fn emit_paged_causal_mask(
   %page64 = arith.index_cast %page_index : index to i64
   %page_size64 = arith.constant {page_size} : i64
   %page_start = arith.muli %page64, %page_size64 : i64
-  %query_positions = arith.constant dense<[{query_positions}]> : tensor<{query_len}xi64>
-  %key_positions = arith.constant dense<[{key_positions}]> : tensor<{page_size}xi64>
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %query_len_c = arith.constant {query_len} : index
+  %page_size_c = arith.constant {page_size} : index
+  %query_e = tensor.empty() : tensor<{query_len}xi64>
+  %query_positions = scf.for %qi = %c0 to %query_len_c step %c1 iter_args(%qacc = %query_e) -> (tensor<{query_len}xi64>) {{
+    %qi64 = arith.index_cast %qi : index to i64
+    %qnext = tensor.insert %qi64 into %qacc[%qi] : tensor<{query_len}xi64>
+    scf.yield %qnext : tensor<{query_len}xi64>
+  }}
+  %key_e = tensor.empty() : tensor<{page_size}xi64>
+  %key_positions = scf.for %ki = %c0 to %page_size_c step %c1 iter_args(%kacc = %key_e) -> (tensor<{page_size}xi64>) {{
+    %ki64 = arith.index_cast %ki : index to i64
+    %knext = tensor.insert %ki64 into %kacc[%ki] : tensor<{page_size}xi64>
+    scf.yield %knext : tensor<{page_size}xi64>
+  }}
   %zero = arith.constant 0.0 : f32
   %neg = arith.constant -3.40282347E+38 : f32
   %empty = tensor.empty() : {mask_ty}

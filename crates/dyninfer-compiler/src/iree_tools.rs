@@ -101,6 +101,17 @@ impl IreeTools {
 
     /// Compile with explicit IREE flags (e.g. HIP + `--iree-rocm-target`).
     pub fn compile_mlir_with_flags(&self, mlir: &str, flags: &[String]) -> Result<Vec<u8>> {
+        self.compile_mlir_with_flags_and_path(mlir, flags, None)
+    }
+
+    /// Like [`Self::compile_mlir_with_flags`], optionally prepending `extra_path`
+    /// so IREE preprocess tools (e.g. Vulkan LDS clamp) resolve.
+    pub fn compile_mlir_with_flags_and_path(
+        &self,
+        mlir: &str,
+        flags: &[String],
+        extra_path: Option<&Path>,
+    ) -> Result<Vec<u8>> {
         let dir = tempfile::tempdir().map_err(|e| {
             DynInferError::Compilation(CompilationError {
                 message: format!("tempdir failed: {e}"),
@@ -116,6 +127,20 @@ impl IreeTools {
         cmd.arg(&mlir_path).arg("-o").arg(&vmfb_path);
         for flag in flags {
             cmd.arg(flag);
+        }
+        if let Some(extra) = extra_path {
+            let mut paths = vec![extra.to_path_buf()];
+            paths.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            let joined = std::env::join_paths(paths).map_err(|e| {
+                DynInferError::Compilation(CompilationError {
+                    message: format!("failed to join PATH for iree-compile: {e}"),
+                    pass: Some("iree-compile".into()),
+                    diagnostics: vec![],
+                })
+            })?;
+            cmd.env("PATH", joined);
         }
 
         info!(?cmd, "invoking iree-compile");

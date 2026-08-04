@@ -23,6 +23,7 @@ use dyninfer_core::{
 };
 use dyninfer_error::{CompilationError, Diagnostic, DynInferError, Result, Severity};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use tracing::{info, info_span};
 
 pub const COMPILER_VERSION: &str = "0.3.0-iree-3.11.0-paged-kv-v6";
@@ -136,7 +137,7 @@ pub fn build_bound_model(
     let max_kv = shape_profile.max_sequence_length.max(requested_prefill);
     let paged = max_kv > 512;
     let prefill = if paged {
-        lowering::PAGED_PREFILL_CHUNK_SIZE
+        lowering::paged_prefill_chunk_size(&target.driver)
     } else {
         requested_prefill
     };
@@ -374,6 +375,71 @@ fn compile_flags_for(target: &TargetProfile) -> Result<Vec<String>> {
     Ok(flags)
 }
 
+fn needs_vulkan_lds_clamp(target: &TargetProfile) -> bool {
+    target.driver == "vulkan"
+        && target
+            .architecture
+            .as_deref()
+            .is_some_and(|arch| arch.starts_with("gfx"))
+}
+
+/// Writable dir + script for IREE `--iree-hal-preprocess-executables-with`.
+fn vulkan_lds_clamp_tool_dir() -> Result<PathBuf> {
+    use dyninfer_core::VULKAN_LDS_CLAMP_TOOL;
+    use std::io::Write;
+
+    let dir = std::env::temp_dir().join("dyninfer-iree-tools");
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        DynInferError::Compilation(CompilationError {
+            message: format!("failed to create Vulkan LDS clamp tool dir: {e}"),
+            pass: Some("vulkan.lds-clamp".into()),
+            diagnostics: vec![],
+        })
+    })?;
+    let tool = dir.join(VULKAN_LDS_CLAMP_TOOL);
+    if !tool.is_file() {
+        let mut file = std::fs::File::create(&tool).map_err(|e| {
+            DynInferError::Compilation(CompilationError {
+                message: format!("failed to write Vulkan LDS clamp tool: {e}"),
+                pass: Some("vulkan.lds-clamp".into()),
+                diagnostics: vec![],
+            })
+        })?;
+        file.write_all(
+            b"#!/usr/bin/env python3\nimport sys\nsys.stdout.write(sys.stdin.read().replace(\n    'max_workgroup_memory_bytes = 65536',\n    'max_workgroup_memory_bytes = 32768',\n))\n",
+        )
+        .map_err(|e| {
+            DynInferError::Compilation(CompilationError {
+                message: format!("failed to write Vulkan LDS clamp tool: {e}"),
+                pass: Some("vulkan.lds-clamp".into()),
+                diagnostics: vec![],
+            })
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&tool)
+                .map_err(|e| {
+                    DynInferError::Compilation(CompilationError {
+                        message: format!("failed to stat Vulkan LDS clamp tool: {e}"),
+                        pass: Some("vulkan.lds-clamp".into()),
+                        diagnostics: vec![],
+                    })
+                })?
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&tool, perms).map_err(|e| {
+                DynInferError::Compilation(CompilationError {
+                    message: format!("failed to chmod Vulkan LDS clamp tool: {e}"),
+                    pass: Some("vulkan.lds-clamp".into()),
+                    diagnostics: vec![],
+                })
+            })?;
+        }
+    }
+    Ok(dir)
+}
+
 fn compile_mlir_prefer_inprocess(
     mlir: &str,
     target: &TargetProfile,
@@ -381,6 +447,10 @@ fn compile_mlir_prefer_inprocess(
     tools: Option<&IreeTools>,
 ) -> Result<Vec<u8>> {
     let flags = compile_flags_for(target)?;
+    // AMD Vulkan LDS clamp uses an external preprocessor tool on PATH; the
+    // in-process session cannot see a process-local PATH extension under
+    // `forbid(unsafe_code)`, so always go through iree-compile for that case.
+    let force_subprocess = force_subprocess || needs_vulkan_lds_clamp(target);
     if !force_subprocess {
         match iree_compiler_sys::compile_mlir_to_vmfb(mlir, &flags) {
             Ok(bytes) => {
@@ -404,7 +474,10 @@ fn compile_mlir_prefer_inprocess(
             diagnostics: vec![],
         })
     })?;
-    tools.compile_mlir_with_flags(mlir, &flags)
+    let clamp_dir = needs_vulkan_lds_clamp(target)
+        .then(|| vulkan_lds_clamp_tool_dir())
+        .transpose()?;
+    tools.compile_mlir_with_flags_and_path(mlir, &flags, clamp_dir.as_deref())
 }
 
 impl ModelCompiler for LocalCompiler {
@@ -512,7 +585,9 @@ impl ModelCompiler for LocalCompiler {
             selected_kernels: request.bound_model.selected_kernels.clone(),
             shape_profile: if paged_kv {
                 let mut profile = request.shape_profile.clone();
-                profile.sequence_buckets = vec![lowering::PAGED_PREFILL_CHUNK_SIZE];
+                profile.sequence_buckets = vec![lowering::paged_prefill_chunk_size(
+                    &request.bound_model.target.driver,
+                )];
                 profile
             } else {
                 request.shape_profile.clone()
@@ -557,7 +632,9 @@ impl ModelCompiler for LocalCompiler {
                 storage: if paged_kv {
                     KvCacheStorage::Paged {
                         page_size: lowering::PAGED_KV_PAGE_SIZE,
-                        chunk_size: lowering::PAGED_PREFILL_CHUNK_SIZE,
+                        chunk_size: lowering::paged_prefill_chunk_size(
+                            &request.bound_model.target.driver,
+                        ),
                     }
                 } else {
                     KvCacheStorage::StaticGlobals
