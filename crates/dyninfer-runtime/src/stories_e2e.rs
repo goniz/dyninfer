@@ -92,6 +92,8 @@ mod tests {
             &GenerateConfig {
                 max_new_tokens: 40,
                 eos_token_id: Some(2),
+                apply_chat_template: false,
+                ..Default::default()
             },
             SessionConfig::default(),
         )

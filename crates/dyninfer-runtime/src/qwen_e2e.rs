@@ -363,6 +363,8 @@ mod tests {
             &GenerateConfig {
                 max_new_tokens: 2,
                 eos_token_id: tokenizer.eos_id(),
+                apply_chat_template: false,
+                ..Default::default()
             },
             SessionConfig::default(),
         )
@@ -428,6 +430,8 @@ mod tests {
             &GenerateConfig {
                 max_new_tokens: 8,
                 eos_token_id: eos,
+                apply_chat_template: false,
+                ..Default::default()
             },
             SessionConfig::default(),
         )
@@ -471,7 +475,7 @@ mod tests {
             )
             .unwrap();
         let model = loader.load_bundle(&bundle, &ckpt).unwrap();
-        assert_eq!(model.manifest.version, 5);
+        assert_eq!(model.manifest.version, 6);
         let mut session = model
             .create_session(SessionConfig {
                 max_sequence_length: 4224,
@@ -486,5 +490,191 @@ mod tests {
         let metrics = session.kv_cache_metrics().unwrap();
         assert_eq!(metrics.page_count, 17);
         assert!(metrics.allocated_bytes < 1024 * 1024 * 1024);
+    }
+
+    /// Prefill logit parity: CPU paged vs a GPU target. Catches Vulkan
+    /// correctness bugs that still produce finite logits. Enable with
+    /// `DYNINFER_QWEN3_PAGED_PARITY=1`; optional
+    /// `DYNINFER_QWEN3_PAGED_PARITY_TARGET` (default vulkan).
+    #[test]
+    fn qwen3_paged_cpu_vs_gpu_prefill_parity() {
+        if std::env::var_os("DYNINFER_QWEN3_PAGED_PARITY").is_none() {
+            eprintln!("skipping: set DYNINFER_QWEN3_PAGED_PARITY=1 for CPU vs GPU logit parity");
+            return;
+        }
+        if !iree_available() {
+            eprintln!("skipping: IREE not available");
+            return;
+        }
+        let Some(model_dir) = qwen3_dir() else {
+            eprintln!("skipping: Qwen3-0.6B not available");
+            return;
+        };
+        let ckpt = find_safetensors_checkpoint(&model_dir).unwrap();
+        let gpu = std::env::var("DYNINFER_QWEN3_PAGED_PARITY_TARGET")
+            .unwrap_or_else(|_| "vulkan".into());
+        let loader = ModelLoader::default();
+        let id = ArchitectureId::new("qwen3.decoder");
+        let overrides = dyninfer_core::MetadataMap::from([
+            ("max_kv".into(), serde_json::json!(1024)),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut logits_by_target = Vec::new();
+        for target in ["cpu", gpu.as_str()] {
+            let bundle = dir.path().join(format!("{target}.bundle"));
+            loader
+                .compile_to_bundle_with_overrides(
+                    &id,
+                    &ckpt,
+                    target,
+                    &bundle,
+                    &CompileOptions {
+                        mode: "local-jit".into(),
+                        ..Default::default()
+                    },
+                    &overrides,
+                )
+                .unwrap_or_else(|error| panic!("compile paged on {target}: {error}"));
+            let model = loader.load_bundle(&bundle, &ckpt).unwrap();
+            let mut session = model
+                .create_session(SessionConfig {
+                    max_sequence_length: 1024,
+                    ..SessionConfig::default()
+                })
+                .unwrap();
+            let tokenizer = load_tokenizer(&model_dir).unwrap();
+            let tokens = tokenizer.encode("tell me a story", true).unwrap();
+            let logits = session.prefill(&tokens).unwrap();
+            assert!(
+                logits.values.iter().all(|v| v.is_finite()),
+                "{target} produced non-finite logits"
+            );
+            let mut top = crate::generate::argmax(&logits.values);
+            let max_v = logits.values.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            eprintln!(
+                "{target}: prefill argmax={top} max={max_v} tokens={}",
+                tokens.len()
+            );
+            let mut greedy = vec![top];
+            let mut cur = logits.values;
+            for step in 0..8 {
+                let next_logits = session.decode(top).unwrap();
+                assert!(
+                    next_logits.values.iter().all(|v| v.is_finite()),
+                    "{target} decode step {step} non-finite"
+                );
+                top = crate::generate::argmax(&next_logits.values);
+                greedy.push(top);
+                cur = next_logits.values;
+            }
+            eprintln!("{target}: greedy8={greedy:?}");
+            logits_by_target.push((target.to_string(), cur, greedy));
+        }
+        let (cpu_name, cpu, cpu_greedy) = &logits_by_target[0];
+        let (gpu_name, gpu_logits, gpu_greedy) = &logits_by_target[1];
+        let err = crate::reference::max_abs_err(cpu, gpu_logits).unwrap();
+        eprintln!("{cpu_name} vs {gpu_name}: final max_abs_err={err}");
+        eprintln!("{cpu_name} greedy={cpu_greedy:?}");
+        eprintln!("{gpu_name} greedy={gpu_greedy:?}");
+        assert_eq!(
+            cpu_greedy, gpu_greedy,
+            "paged greedy tokens diverged after prefill+8 decode"
+        );
+        assert!(
+            err < 2.0,
+            "paged logits diverged: max_abs_err={err}"
+        );
+    }
+
+    /// Paged KV short generate (catches Vulkan shared-memory / garbage-token
+    /// regressions that finite-logit checks miss). Enable with
+    /// `DYNINFER_QWEN3_PAGED_GENERATE_E2E=1`; select backend with
+    /// `DYNINFER_QWEN3_PAGED_GENERATE_TARGET` (cpu, hip, or vulkan).
+    #[test]
+    fn qwen3_paged_short_generate() {
+        if std::env::var_os("DYNINFER_QWEN3_PAGED_GENERATE_E2E").is_none() {
+            eprintln!(
+                "skipping: set DYNINFER_QWEN3_PAGED_GENERATE_E2E=1 for paged generate qualification"
+            );
+            return;
+        }
+        if !iree_available() {
+            eprintln!("skipping: IREE not available");
+            return;
+        }
+        let Some(model_dir) = qwen3_dir() else {
+            eprintln!("skipping: Qwen3-0.6B not available");
+            return;
+        };
+        let ckpt = find_safetensors_checkpoint(&model_dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("paged-gen.bundle");
+        let loader = ModelLoader::default();
+        let id = ArchitectureId::new("qwen3.decoder");
+        let target =
+            std::env::var("DYNINFER_QWEN3_PAGED_GENERATE_TARGET").unwrap_or_else(|_| "vulkan".into());
+        let overrides = dyninfer_core::MetadataMap::from([
+            ("max_kv".into(), serde_json::json!(1024)),
+        ]);
+        loader
+            .compile_to_bundle_with_overrides(
+                &id,
+                &ckpt,
+                &target,
+                &bundle,
+                &CompileOptions {
+                    mode: "local-jit".into(),
+                    ..Default::default()
+                },
+                &overrides,
+            )
+            .unwrap_or_else(|error| panic!("compile paged Qwen3 on {target}: {error}"));
+        let model = loader.load_bundle(&bundle, &ckpt).unwrap();
+        assert_eq!(model.manifest.version, 6);
+        assert!(model.manifest.prefill_window >= 256);
+
+        let tokenizer = load_tokenizer(&model_dir).unwrap();
+        let eos = model
+            .metadata()
+            .extra
+            .get("eos_token_id")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .or_else(|| tokenizer.eos_id());
+        let out = generate_greedy(
+            &model,
+            &tokenizer,
+            "tell me a story",
+            &GenerateConfig {
+                max_new_tokens: 48,
+                eos_token_id: eos,
+                apply_chat_template: false,
+                ..Default::default()
+            },
+            SessionConfig {
+                max_sequence_length: 1024,
+                ..SessionConfig::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("paged generate on {target}: {error}"));
+        eprintln!("qwen3 paged/{target} text={}", out.text);
+        assert!(
+            out.token_ids.len() > 8,
+            "expected several generated tokens, got {}",
+            out.token_ids.len()
+        );
+        let unique: std::collections::BTreeSet<_> = out.token_ids.iter().copied().collect();
+        assert!(
+            unique.len() >= 8,
+            "paged generate collapsed to {:?}; text={}",
+            out.token_ids,
+            out.text
+        );
+        // Refuse the known Vulkan garbage loop pattern.
+        assert!(
+            !out.text.contains("odable"),
+            "paged generate produced garbage text on {target}: {}",
+            out.text
+        );
     }
 }

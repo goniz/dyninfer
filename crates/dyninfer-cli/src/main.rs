@@ -113,12 +113,22 @@ enum Commands {
         prompt: String,
         #[arg(long, default_value_t = 48)]
         max_new_tokens: usize,
+        /// HF-style repetition penalty (1.0 = off). Helps long greedy runs.
+        #[arg(long, default_value_t = 1.1)]
+        repetition_penalty: f32,
+        /// Do not apply the model's HF chat template.
+        #[arg(long)]
+        raw_prompt: bool,
+        /// Disable Qwen3-style thinking in the chat template (`enable_thinking=false`).
+        #[arg(long)]
+        no_thinking: bool,
         #[arg(long)]
         output_bundle: Option<PathBuf>,
-        /// Legacy prefill window. Paged executables use chunks up to 2048 tokens.
+        /// Legacy prefill window. Paged executables use chunks up to 512 tokens.
         #[arg(long)]
         prefill_window: Option<u32>,
-        /// Session/model context limit. Values above 512 select paged KV ABI v5.
+        /// Session/model context limit. Defaults to prompt tokens + --max-new-tokens.
+        /// Values above 512 select paged KV ABI v6.
         #[arg(long)]
         max_kv: Option<u32>,
     },
@@ -379,6 +389,8 @@ fn main() -> anyhow::Result<()> {
                 &GenerateConfig {
                     max_new_tokens,
                     eos_token_id: eos,
+                    apply_chat_template: false,
+                    ..Default::default()
                 },
                 SessionConfig::default(),
             )?;
@@ -393,6 +405,9 @@ fn main() -> anyhow::Result<()> {
             target,
             prompt,
             max_new_tokens,
+            repetition_penalty,
+            raw_prompt,
+            no_thinking,
             output_bundle,
             prefill_window,
             max_kv,
@@ -412,6 +427,40 @@ fn main() -> anyhow::Result<()> {
                 None => find_checkpoint(&model_dir)?,
             };
             eprintln!("checkpoint {}", ckpt.display());
+            let tokenizer = load_tokenizer(&model_dir)?;
+            let apply_chat_template = !raw_prompt;
+            let enable_thinking = !no_thinking;
+            let model_prompt = if apply_chat_template {
+                tokenizer
+                    .apply_chat_template(&prompt, enable_thinking)?
+                    .unwrap_or_else(|| prompt.clone())
+            } else {
+                prompt.clone()
+            };
+            if apply_chat_template && tokenizer.has_chat_template() {
+                eprintln!(
+                    "chat_template=tokenizer_config.json enable_thinking={enable_thinking}"
+                );
+            }
+            // Size KV for the full request; Qwen/large defaults are only 256.
+            let add_special = !tokenizer.is_byte_level() && !apply_chat_template;
+            let prompt_tokens = tokenizer.encode(&model_prompt, add_special)?.len();
+            let needed_kv = (prompt_tokens + max_new_tokens)
+                .try_into()
+                .unwrap_or(u32::MAX)
+                .max(1);
+            let effective_max_kv = match max_kv {
+                Some(k) if k < needed_kv => anyhow::bail!(
+                    "--max-kv {k} cannot fit prompt ({prompt_tokens} tokens) + --max-new-tokens {max_new_tokens} (need >= {needed_kv})"
+                ),
+                Some(k) => k,
+                None => needed_kv,
+            };
+            if max_kv.is_none() {
+                eprintln!(
+                    "max_kv={effective_max_kv} (prompt={prompt_tokens} + max_new_tokens={max_new_tokens})"
+                );
+            }
             let default_bundle = std::env::temp_dir().join(format!(
                 "dyninfer-generate-{}/model.bundle",
                 std::process::id()
@@ -424,9 +473,7 @@ fn main() -> anyhow::Result<()> {
             if let Some(w) = prefill_window {
                 overrides.insert("prefill_window".into(), serde_json::json!(w));
             }
-            if let Some(k) = max_kv {
-                overrides.insert("max_kv".into(), serde_json::json!(k));
-            }
+            overrides.insert("max_kv".into(), serde_json::json!(effective_max_kv));
             let paths = loader.compile_to_bundle_with_overrides(
                 &id,
                 &ckpt,
@@ -439,7 +486,6 @@ fn main() -> anyhow::Result<()> {
                 &overrides,
             )?;
             let model = loader.load_bundle(&paths.root, &ckpt)?;
-            let tokenizer = load_tokenizer(&model_dir)?;
             let eos = model
                 .metadata()
                 .extra
@@ -454,10 +500,13 @@ fn main() -> anyhow::Result<()> {
                 &GenerateConfig {
                     max_new_tokens,
                     eos_token_id: eos,
+                    repetition_penalty,
+                    apply_chat_template,
+                    enable_thinking,
+                    ..Default::default()
                 },
                 SessionConfig {
-                    max_sequence_length: max_kv
-                        .unwrap_or(model.manifest.kv_cache.max_sequence_length),
+                    max_sequence_length: effective_max_kv,
                     ..SessionConfig::default()
                 },
             )?;

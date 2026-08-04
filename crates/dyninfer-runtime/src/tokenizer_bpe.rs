@@ -7,11 +7,13 @@
 //! Keeps the runtime free of the `tokenizers` crate (C++/esaxx).
 
 use dyninfer_error::{DynInferError, Result};
+use hf_chat_template::{ChatTemplate, Message, RenderInput, TokenizerConfig as HfTokenizerConfig};
 use serde::Deserialize;
+use serde_json::{Map, Value as Json};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 const SPACE_MARK: char = '\u{2581}'; // ▁ (SentencePiece)
 const GPT2_SPACE: char = '\u{0120}'; // Ġ (ByteLevel)
@@ -68,6 +70,10 @@ pub struct BpeTokenizer {
     bos_id: Option<u32>,
     eos_id: Option<u32>,
     special_ids: Vec<u32>,
+    /// Special/added pieces, longest-first for atomic encode splits.
+    special_pieces: Vec<(String, u32)>,
+    /// Official HF chat template from `tokenizer_config.json` / `chat_template.jinja`.
+    chat_template: Option<Arc<ChatTemplate>>,
     /// ByteLevel: unicode char -> byte
     byte_decoder: HashMap<char, u8>,
 }
@@ -98,18 +104,53 @@ fn gpt2_bytes_to_unicode() -> &'static (HashMap<u8, char>, HashMap<char, u8>) {
     })
 }
 
+/// Load HF chat template from a model directory.
+///
+/// Precedence matches `transformers`: standalone `chat_template.jinja` wins over the
+/// inline `chat_template` field in `tokenizer_config.json`.
+fn load_chat_template(model_dir: &Path) -> Option<Arc<ChatTemplate>> {
+    let config_path = model_dir.join("tokenizer_config.json");
+    let jinja_path = model_dir.join("chat_template.jinja");
+    let config = if config_path.is_file() {
+        let bytes = fs::read(&config_path).ok()?;
+        serde_json::from_slice::<HfTokenizerConfig>(&bytes).ok()
+    } else {
+        None
+    };
+    let tmpl = if jinja_path.is_file() {
+        let source = fs::read_to_string(&jinja_path).ok()?;
+        match &config {
+            Some(cfg) => ChatTemplate::from_template_and_config(&source, cfg).ok(),
+            None => ChatTemplate::from_str(&source).ok(),
+        }
+    } else if let Some(cfg) = config.as_ref() {
+        ChatTemplate::from_tokenizer_config(cfg).ok()
+    } else {
+        None
+    };
+    tmpl.map(Arc::new)
+}
+
 impl BpeTokenizer {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let file = if path.is_dir() {
-            path.join("tokenizer.json")
+        let (tokenizer_json, model_dir) = if path.is_dir() {
+            (path.join("tokenizer.json"), Some(path.to_path_buf()))
         } else {
-            path.to_path_buf()
+            let dir = path.parent().map(Path::to_path_buf);
+            (path.to_path_buf(), dir)
         };
-        let bytes = fs::read(&file).map_err(|e| {
-            DynInferError::io_path(file.display().to_string(), format!("read tokenizer: {e}"))
+        let bytes = fs::read(&tokenizer_json).map_err(|e| {
+            DynInferError::io_path(
+                tokenizer_json.display().to_string(),
+                format!("read tokenizer: {e}"),
+            )
         })?;
-        Self::from_bytes(&bytes)
+        let mut tok = Self::from_bytes(&bytes)?;
+        if let Some(dir) = model_dir {
+            tok.chat_template = load_chat_template(&dir);
+        }
+        Ok(tok)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
@@ -118,7 +159,15 @@ impl BpeTokenizer {
         if tf.model.vocab.is_empty() {
             return Err(DynInferError::io("tokenizer vocab is empty"));
         }
-        let max_id = tf.model.vocab.values().copied().max().unwrap_or(0);
+        let max_id = tf
+            .model
+            .vocab
+            .values()
+            .copied()
+            .chain(tf.added_tokens.iter().map(|t| t.id))
+            .max()
+            .unwrap_or(0);
+        let mut token_to_id = tf.model.vocab.clone();
         let mut id_to_token = vec![String::new(); (max_id as usize) + 1];
         for (tok, id) in &tf.model.vocab {
             let i = *id as usize;
@@ -127,15 +176,20 @@ impl BpeTokenizer {
             }
             id_to_token[i] = tok.clone();
         }
+        let mut special_pieces = Vec::new();
         for a in &tf.added_tokens {
             let i = a.id as usize;
             if i >= id_to_token.len() {
                 id_to_token.resize(i + 1, String::new());
             }
-            if id_to_token[i].is_empty() {
-                id_to_token[i] = a.content.clone();
+            id_to_token[i] = a.content.clone();
+            token_to_id.insert(a.content.clone(), a.id);
+            if a.special || a.content.starts_with("<|") {
+                special_pieces.push((a.content.clone(), a.id));
             }
         }
+        // Longest match first so `<|im_start|>` wins over shorter prefixes.
+        special_pieces.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
         let mut merges = HashMap::new();
         for (rank, entry) in tf.model.merges.iter().enumerate() {
@@ -175,8 +229,6 @@ impl BpeTokenizer {
                     || t.content == "<|eot_id|>"
             })
             .map(|t| t.id)
-            // Prefer chat end token when both exist: last matching above wins via find;
-            // Qwen lists endoftext before im_end — prefer im_end / endoftext explicitly.
             .or_else(|| {
                 tf.added_tokens
                     .iter()
@@ -200,13 +252,15 @@ impl BpeTokenizer {
 
         Ok(Self {
             kind,
-            token_to_id: tf.model.vocab,
+            token_to_id,
             id_to_token,
             merges,
             byte_fallback: tf.model.byte_fallback,
             bos_id,
             eos_id,
             special_ids,
+            special_pieces,
+            chat_template: None,
             byte_decoder,
         })
     }
@@ -221,6 +275,64 @@ impl BpeTokenizer {
 
     pub fn eos_id(&self) -> Option<u32> {
         self.eos_id
+    }
+
+    /// Token id for an exact vocab / added-token string, if present.
+    pub fn token_id(&self, piece: &str) -> Option<u32> {
+        self.token_to_id.get(piece).copied()
+    }
+
+    /// True when an official HF chat template was loaded from the model dir.
+    pub fn has_chat_template(&self) -> bool {
+        self.chat_template.is_some()
+    }
+
+    /// True when the tokenizer has ChatML markers (`<|im_start|>` / `<|im_end|>`).
+    pub fn has_chatml_markers(&self) -> bool {
+        self.token_id("<|im_start|>").is_some() && self.token_id("<|im_end|>").is_some()
+    }
+
+    /// Apply the model's HF chat template to a bare user prompt.
+    ///
+    /// Prefers `tokenizer_config.json` / `chat_template.jinja` via `hf-chat-template`.
+    /// Falls back to a minimal ChatML wrap when markers exist but no template was loaded.
+    /// Returns `None` if the prompt is already templated or no chat formatting is available.
+    pub fn apply_chat_template(
+        &self,
+        user: &str,
+        enable_thinking: bool,
+    ) -> Result<Option<String>> {
+        if user.contains("<|im_start|>") {
+            return Ok(None);
+        }
+        if let Some(tmpl) = &self.chat_template {
+            let mut extra = Map::new();
+            extra.insert("enable_thinking".into(), Json::Bool(enable_thinking));
+            let input = RenderInput {
+                messages: vec![Message::user(user)],
+                add_generation_prompt: true,
+                extra,
+                ..Default::default()
+            };
+            let rendered = tmpl.render(&input).map_err(|e| {
+                DynInferError::io(format!("chat_template render failed: {e}"))
+            })?;
+            return Ok(Some(rendered));
+        }
+        if !self.has_chatml_markers() {
+            return Ok(None);
+        }
+        let mut out = format!("<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n");
+        if !enable_thinking {
+            out.push_str("<think>\n\n</think>\n\n");
+        }
+        Ok(Some(out))
+    }
+
+    /// Wrap a bare user string in ChatML turn markers when supported.
+    #[deprecated(note = "use apply_chat_template")]
+    pub fn chatml_user_prompt(&self, user: &str) -> Option<String> {
+        self.apply_chat_template(user, true).ok().flatten()
     }
 
     fn normalize_sp(&self, text: &str) -> String {
@@ -288,6 +400,40 @@ impl BpeTokenizer {
     }
 
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
+        let mut ids = Vec::new();
+        if add_special_tokens {
+            if let Some(bos) = self.bos_id {
+                ids.push(bos);
+            }
+        }
+        // Split out atomic special tokens, then BPE each ordinary span.
+        let mut rest = text;
+        while !rest.is_empty() {
+            let mut special_at: Option<(usize, &str, u32)> = None;
+            for (piece, id) in &self.special_pieces {
+                if let Some(pos) = rest.find(piece.as_str()) {
+                    if special_at.is_none_or(|(best, _, _)| pos < best) {
+                        special_at = Some((pos, piece.as_str(), *id));
+                    }
+                }
+            }
+            let Some((pos, piece, id)) = special_at else {
+                ids.extend(self.encode_ordinary(rest)?);
+                break;
+            };
+            if pos > 0 {
+                ids.extend(self.encode_ordinary(&rest[..pos])?);
+            }
+            ids.push(id);
+            rest = &rest[pos + piece.len()..];
+        }
+        Ok(ids)
+    }
+
+    fn encode_ordinary(&self, text: &str) -> Result<Vec<u32>> {
+        if text.is_empty() {
+            return Ok(Vec::new());
+        }
         let pieces = match self.kind {
             TokenizerKind::SentencePiece => {
                 let normalized = self.normalize_sp(text);
@@ -295,12 +441,7 @@ impl BpeTokenizer {
             }
             TokenizerKind::ByteLevel => self.bpe_merge(self.initial_pieces_byte_level(text)),
         };
-        let mut ids = Vec::with_capacity(pieces.len() + 1);
-        if add_special_tokens {
-            if let Some(bos) = self.bos_id {
-                ids.push(bos);
-            }
-        }
+        let mut ids = Vec::with_capacity(pieces.len());
         for p in pieces {
             let id = self
                 .piece_id(&p)
@@ -525,5 +666,30 @@ mod tests {
         let text = tok.decode(&ids, true).unwrap();
         assert_eq!(text, "Once upon a time");
         assert_eq!(tok.encode("Hello", false).unwrap(), vec![9707]);
+
+        // Official template from tokenizer_config.json (or ChatML fallback).
+        assert!(tok.has_chatml_markers());
+        let chat = tok
+            .apply_chat_template("tell me a story", true)
+            .unwrap()
+            .expect("chat template");
+        assert_eq!(
+            chat,
+            "<|im_start|>user\ntell me a story<|im_end|>\n<|im_start|>assistant\n"
+        );
+        let chat_ids = tok.encode(&chat, false).unwrap();
+        assert_eq!(
+            chat_ids,
+            vec![151644, 872, 198, 72357, 752, 264, 3364, 151645, 198, 151644, 77091, 198],
+            "chat_ids={chat_ids:?}"
+        );
+        let no_think = tok
+            .apply_chat_template("tell me a story", false)
+            .unwrap()
+            .expect("chat template");
+        assert!(
+            no_think.ends_with("<think>\n\n</think>\n\n"),
+            "enable_thinking=false should prefill empty think block, got {no_think:?}"
+        );
     }
 }

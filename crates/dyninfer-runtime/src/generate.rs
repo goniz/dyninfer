@@ -4,6 +4,7 @@ use crate::tokenizer_bpe::BpeTokenizer;
 use crate::{CausalLanguageModel, Logits};
 use dyninfer_core::{SessionConfig, TokenId};
 use dyninfer_error::{DynInferError, Result};
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
@@ -24,10 +25,37 @@ pub fn argmax(logits: &[f32]) -> TokenId {
     best_i as TokenId
 }
 
+/// HuggingFace-style repetition penalty on tokens already present in `seen`.
+pub fn apply_repetition_penalty(logits: &mut [f32], seen: &HashMap<TokenId, u32>, penalty: f32) {
+    if (penalty - 1.0).abs() < f32::EPSILON || seen.is_empty() {
+        return;
+    }
+    for (&token, _) in seen {
+        let i = token as usize;
+        if i >= logits.len() {
+            continue;
+        }
+        let score = logits[i];
+        logits[i] = if score < 0.0 {
+            score * penalty
+        } else {
+            score / penalty
+        };
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GenerateConfig {
     pub max_new_tokens: usize,
     pub eos_token_id: Option<TokenId>,
+    /// Extra stop ids (e.g. `<|endoftext|>` alongside `<|im_end|>`).
+    pub stop_token_ids: Vec<TokenId>,
+    /// HF-style repetition penalty (`1.0` = off). Prefer `> 1` for long greedy runs.
+    pub repetition_penalty: f32,
+    /// Apply the model's HF chat template to bare prompts.
+    pub apply_chat_template: bool,
+    /// Qwen3-style thinking switch passed into the chat template.
+    pub enable_thinking: bool,
 }
 
 impl Default for GenerateConfig {
@@ -36,6 +64,10 @@ impl Default for GenerateConfig {
             max_new_tokens: 48,
             // Prefer tokenizer / model metadata; never hardcode Llama's 2.
             eos_token_id: None,
+            stop_token_ids: Vec::new(),
+            repetition_penalty: 1.1,
+            apply_chat_template: true,
+            enable_thinking: true,
         }
     }
 }
@@ -84,10 +116,19 @@ pub fn generate_greedy(
     config: &GenerateConfig,
     session_cfg: SessionConfig,
 ) -> Result<GenerateOutput> {
+    let model_prompt = if config.apply_chat_template {
+        tokenizer
+            .apply_chat_template(prompt, config.enable_thinking)?
+            .unwrap_or_else(|| prompt.to_string())
+    } else {
+        prompt.to_string()
+    };
+
     // ByteLevel (Qwen) tokenizers typically have no BOS; SentencePiece (Llama) does.
-    let add_special = !tokenizer.is_byte_level();
+    // Chat templates already emit specials — never double-add BOS.
+    let add_special = !tokenizer.is_byte_level() && !config.apply_chat_template;
     let mut ids: Vec<TokenId> = tokenizer
-        .encode(prompt, add_special)?
+        .encode(&model_prompt, add_special)?
         .into_iter()
         .map(|t| t as TokenId)
         .collect();
@@ -95,8 +136,25 @@ pub fn generate_greedy(
         return Err(DynInferError::io("prompt produced no tokens"));
     }
 
-    let eos = config.eos_token_id.or_else(|| tokenizer.eos_id());
+    let mut stop = config.stop_token_ids.clone();
+    if let Some(eos) = config.eos_token_id.or_else(|| tokenizer.eos_id()) {
+        if !stop.contains(&eos) {
+            stop.push(eos);
+        }
+    }
+    // Qwen generation_config also stops on <|endoftext|>.
+    if let Some(eof) = tokenizer.token_id("<|endoftext|>") {
+        let eof = eof as TokenId;
+        if !stop.contains(&eof) {
+            stop.push(eof);
+        }
+    }
+
     let prompt_tokens = ids.len();
+    let mut seen: HashMap<TokenId, u32> = HashMap::new();
+    for &id in &ids {
+        *seen.entry(id).or_insert(0) += 1;
+    }
 
     let mut session = model.create_session(session_cfg)?;
     let t0 = Instant::now();
@@ -106,19 +164,29 @@ pub fn generate_greedy(
 
     let t1 = Instant::now();
     for _ in 0..config.max_new_tokens {
+        apply_repetition_penalty(
+            &mut logits.values,
+            &seen,
+            config.repetition_penalty,
+        );
         let next = argmax(&logits.values);
-        if eos == Some(next) {
+        if stop.contains(&next) {
             break;
         }
         generated.push(next);
         ids.push(next);
+        *seen.entry(next).or_insert(0) += 1;
         logits = session.decode(next)?;
     }
     let decode_secs = t1.elapsed().as_secs_f64();
     let cache = session.kv_cache_metrics()?;
 
-    let all_ids: Vec<u32> = ids.iter().map(|&t| t as u32).collect();
-    let text = tokenizer.decode(&all_ids, true)?;
+    // Decode only the assistant continuation so ChatML markup stays out of `text`.
+    let continuation = tokenizer.decode(
+        &generated.iter().map(|&t| t as u32).collect::<Vec<_>>(),
+        true,
+    )?;
+    let text = format!("{prompt}{continuation}");
 
     Ok(GenerateOutput {
         prompt: prompt.to_string(),
