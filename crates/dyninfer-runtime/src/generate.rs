@@ -46,6 +46,8 @@ pub struct GenerateStats {
     pub generated_tokens: usize,
     pub prefill_secs: f64,
     pub decode_secs: f64,
+    pub kv_page_count: usize,
+    pub kv_allocated_bytes: usize,
 }
 
 impl GenerateStats {
@@ -113,6 +115,7 @@ pub fn generate_greedy(
         logits = session.decode(next)?;
     }
     let decode_secs = t1.elapsed().as_secs_f64();
+    let cache = session.kv_cache_metrics()?;
 
     let all_ids: Vec<u32> = ids.iter().map(|&t| t as u32).collect();
     let text = tokenizer.decode(&all_ids, true)?;
@@ -126,6 +129,8 @@ pub fn generate_greedy(
             generated_tokens: generated.len(),
             prefill_secs,
             decode_secs,
+            kv_page_count: cache.page_count,
+            kv_allocated_bytes: cache.allocated_bytes,
         },
     })
 }

@@ -3,6 +3,417 @@
 use dyninfer_error::Result;
 use dyninfer_mlir::{FuncBuilder, ModuleBuilder, Value};
 
+/// One page of numerically stable online attention. The returned accumulator,
+/// row maximum, and row sum can be fed into the next page without materializing
+/// a query-by-context score tensor.
+pub fn emit_iree_online_attention_page(
+    module: &mut ModuleBuilder,
+    name: &str,
+    query_len: u32,
+    page_size: u32,
+    kv_heads: u32,
+    gqa_group: u32,
+    head_dim: u32,
+) -> Result<()> {
+    let flash_queries = gqa_group * query_len;
+    let q_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}x{head_dim}xf32>");
+    let q_flash_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}x{head_dim}xf16>");
+    let q_flat_ty = format!("tensor<{kv_heads}x{flash_queries}x{head_dim}xf16>");
+    let output_flat_ty = format!("tensor<{kv_heads}x{flash_queries}x{head_dim}xf32>");
+    let kv_ty = format!("tensor<{kv_heads}x{page_size}x{head_dim}xf32>");
+    let kv_flash_ty = format!("tensor<{kv_heads}x{page_size}x{head_dim}xf16>");
+    let mask_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}x{page_size}xf32>");
+    let mask_flash_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}x{page_size}xf16>");
+    let mask_flat_ty = format!("tensor<{kv_heads}x{flash_queries}x{page_size}xf16>");
+    let row_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}xf32>");
+    let row_flat_ty = format!("tensor<{kv_heads}x{flash_queries}xf32>");
+    let flash_config = r#"compilation_info = #iree_codegen.compilation_info<
+        lowering_config = #iree_gpu.lowering_config<{
+          promote_operands = [0, 1, 2],
+          reduction = [0, 0, 0, 64, 0],
+          workgroup = [1, 64, 0, 0, 64]}>,
+        translation_info = #iree_codegen.translation_info<
+          pipeline = LLVMGPUVectorDistribute
+          workgroup_size = [128, 1, 1]
+          subgroup_size = 32,
+          {iree_codegen.denormal_fp_math_f32 = #iree_codegen.denormal_fp_math<"preserve-sign">}>>,
+      decomposition_config = {
+        pv_attrs = {lowering_config = #iree_gpu.lowering_config<{
+          mma_kind = #iree_gpu.mma_layout<WMMAR3_F32_16x16x16_F16>,
+          promote_operands = [1],
+          subgroup_basis = [[1, 4, 1, 1, 1], [0, 1, 3, 4]]}>},
+        qk_attrs = {lowering_config = #iree_gpu.lowering_config<{
+          mma_kind = #iree_gpu.mma_layout<WMMAR3_F32_16x16x16_F16>,
+          promote_operands = [0, 1],
+          subgroup_basis = [[1, 4, 1, 1, 1], [0, 1, 2, 3]]}>}}"#;
+
+    let mut f = module.func_private(name);
+    f.arg("q", &q_ty);
+    f.arg("k", &kv_ty);
+    f.arg("v", &kv_ty);
+    f.arg("scale", "f16");
+    f.arg("mask", &mask_ty);
+    f.arg("output", &q_ty);
+    f.arg("row_max", &row_ty);
+    f.arg("row_sum", &row_ty);
+    f.result_ty(&q_ty);
+    f.result_ty(&row_ty);
+    f.result_ty(&row_ty);
+    f.op_asm(format!(
+        r#"  %q16 = arith.truncf %q : {q_ty} to {q_flash_ty}
+  %k16 = arith.truncf %k : {kv_ty} to {kv_flash_ty}
+  %v16 = arith.truncf %v : {kv_ty} to {kv_flash_ty}
+  %mask16 = arith.truncf %mask : {mask_ty} to {mask_flash_ty}
+  %q_flat = tensor.collapse_shape %q16 [[0], [1, 2], [3]] : {q_flash_ty} into {q_flat_ty}
+  %mask_flat = tensor.collapse_shape %mask16 [[0], [1, 2], [3]] : {mask_flash_ty} into {mask_flat_ty}
+  %output_flat = tensor.collapse_shape %output [[0], [1, 2], [3]] : {q_ty} into {output_flat_ty}
+  %max_flat = tensor.collapse_shape %row_max [[0], [1, 2]] : {row_ty} into {row_flat_ty}
+  %sum_flat = tensor.collapse_shape %row_sum [[0], [1, 2]] : {row_ty} into {row_flat_ty}
+  %next:3 = iree_linalg_ext.online_attention {{
+      {flash_config},
+      indexing_maps = [
+        affine_map<(h, q, d, p, n) -> (h, q, d)>,
+        affine_map<(h, q, d, p, n) -> (h, p, d)>,
+        affine_map<(h, q, d, p, n) -> (h, p, n)>,
+        affine_map<(h, q, d, p, n) -> ()>,
+        affine_map<(h, q, d, p, n) -> (h, q, p)>,
+        affine_map<(h, q, d, p, n) -> (h, q, n)>,
+        affine_map<(h, q, d, p, n) -> (h, q)>,
+        affine_map<(h, q, d, p, n) -> (h, q)>
+      ]
+    }} ins(%q_flat, %k16, %v16, %scale, %mask_flat : {q_flat_ty}, {kv_flash_ty}, {kv_flash_ty}, f16, {mask_flat_ty})
+       outs(%output_flat, %max_flat, %sum_flat : {output_flat_ty}, {row_flat_ty}, {row_flat_ty}) {{
+    ^bb0(%score: f32):
+      iree_linalg_ext.yield %score : f32
+  }} -> {output_flat_ty}, {row_flat_ty}, {row_flat_ty}
+  %output_next = tensor.expand_shape %next#0 [[0], [1, 2], [3]] output_shape [{kv_heads}, {gqa_group}, {query_len}, {head_dim}] : {output_flat_ty} into {q_ty}
+  %max_next = tensor.expand_shape %next#1 [[0], [1, 2]] output_shape [{kv_heads}, {gqa_group}, {query_len}] : {row_flat_ty} into {row_ty}
+  %sum_next = tensor.expand_shape %next#2 [[0], [1, 2]] output_shape [{kv_heads}, {gqa_group}, {query_len}] : {row_flat_ty} into {row_ty}
+  return %output_next, %max_next, %sum_next : {q_ty}, {row_ty}, {row_ty}
+"#,
+    ));
+    f.finish(module)
+}
+
+/// Backend-portable online attention fallback. It materializes scores for one
+/// fixed page only, then merges page-local state with the running softmax.
+pub fn emit_online_attention_page(
+    module: &mut ModuleBuilder,
+    name: &str,
+    query_len: u32,
+    page_size: u32,
+    kv_heads: u32,
+    gqa_group: u32,
+    head_dim: u32,
+) -> Result<()> {
+    let q_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}x{head_dim}xf32>");
+    let kv_ty = format!("tensor<{kv_heads}x{page_size}x{head_dim}xf32>");
+    let score_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}x{page_size}xf32>");
+    let row_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}xf32>");
+    let mut f = module.func_private(name);
+    f.arg("q", &q_ty);
+    f.arg("k", &kv_ty);
+    f.arg("v", &kv_ty);
+    f.arg("scale", "f32");
+    f.arg("mask", &score_ty);
+    f.arg("output", &q_ty);
+    f.arg("row_max", &row_ty);
+    f.arg("row_sum", &row_ty);
+    f.result_ty(&q_ty);
+    f.result_ty(&row_ty);
+    f.result_ty(&row_ty);
+    f.op_asm(format!(
+        r#"  %zero = arith.constant 0.0 : f32
+  %neg = arith.constant -3.40282347E+38 : f32
+  %scores_e = tensor.empty() : {score_ty}
+  %scores_z = linalg.fill ins(%zero : f32) outs(%scores_e : {score_ty}) -> {score_ty}
+  %dots = linalg.generic {{
+      indexing_maps = [
+        affine_map<(kh, g, q, p, d) -> (kh, g, q, d)>,
+        affine_map<(kh, g, q, p, d) -> (kh, p, d)>,
+        affine_map<(kh, g, q, p, d) -> (kh, g, q, p)>
+      ],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel", "reduction"]}}
+    ins(%q, %k : {q_ty}, {kv_ty}) outs(%scores_z : {score_ty}) {{
+    ^bb0(%qv: f32, %kv: f32, %acc: f32):
+      %product = arith.mulf %qv, %kv : f32
+      %next = arith.addf %acc, %product : f32
+      linalg.yield %next : f32
+  }} -> {score_ty}
+  %masked_e = tensor.empty() : {score_ty}
+  %scores = linalg.generic {{
+      indexing_maps = [
+        affine_map<(kh, g, q, p) -> (kh, g, q, p)>,
+        affine_map<(kh, g, q, p) -> (kh, g, q, p)>,
+        affine_map<(kh, g, q, p) -> (kh, g, q, p)>
+      ],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel"]}}
+    ins(%dots, %mask : {score_ty}, {score_ty}) outs(%masked_e : {score_ty}) {{
+    ^bb0(%dot: f32, %bias: f32, %o: f32):
+      %scaled = arith.mulf %dot, %scale : f32
+      %value = arith.addf %scaled, %bias : f32
+      linalg.yield %value : f32
+  }} -> {score_ty}
+  %row_e = tensor.empty() : {row_ty}
+  %page_max_z = linalg.fill ins(%neg : f32) outs(%row_e : {row_ty}) -> {row_ty}
+  %page_max = linalg.reduce ins(%scores : {score_ty}) outs(%page_max_z : {row_ty}) dimensions = [3]
+    (%value: f32, %acc: f32) {{
+      %next = arith.maximumf %value, %acc : f32
+      linalg.yield %next : f32
+    }}
+  %new_max_e = tensor.empty() : {row_ty}
+  %new_max = arith.maximumf %row_max, %page_max : {row_ty}
+  %weights_e = tensor.empty() : {score_ty}
+  %weights = linalg.generic {{
+      indexing_maps = [
+        affine_map<(kh, g, q, p) -> (kh, g, q, p)>,
+        affine_map<(kh, g, q, p) -> (kh, g, q)>,
+        affine_map<(kh, g, q, p) -> (kh, g, q, p)>
+      ],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel"]}}
+    ins(%scores, %new_max : {score_ty}, {row_ty}) outs(%weights_e : {score_ty}) {{
+    ^bb0(%score: f32, %maximum: f32, %o: f32):
+      %shifted = arith.subf %score, %maximum : f32
+      %weight = math.exp %shifted : f32
+      linalg.yield %weight : f32
+  }} -> {score_ty}
+  %page_sum_z = linalg.fill ins(%zero : f32) outs(%row_e : {row_ty}) -> {row_ty}
+  %page_sum = linalg.reduce ins(%weights : {score_ty}) outs(%page_sum_z : {row_ty}) dimensions = [3]
+    (%value: f32, %acc: f32) {{
+      %next = arith.addf %value, %acc : f32
+      linalg.yield %next : f32
+    }}
+  %page_out_e = tensor.empty() : {q_ty}
+  %page_out_z = linalg.fill ins(%zero : f32) outs(%page_out_e : {q_ty}) -> {q_ty}
+  %page_out = linalg.generic {{
+      indexing_maps = [
+        affine_map<(kh, g, q, d, p) -> (kh, g, q, p)>,
+        affine_map<(kh, g, q, d, p) -> (kh, p, d)>,
+        affine_map<(kh, g, q, d, p) -> (kh, g, q, d)>
+      ],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel", "reduction"]}}
+    ins(%weights, %v : {score_ty}, {kv_ty}) outs(%page_out_z : {q_ty}) {{
+    ^bb0(%weight: f32, %value: f32, %acc: f32):
+      %product = arith.mulf %weight, %value : f32
+      %next = arith.addf %acc, %product : f32
+      linalg.yield %next : f32
+  }} -> {q_ty}
+  %old_scale_e = tensor.empty() : {row_ty}
+  %old_scale = linalg.generic {{
+      indexing_maps = [
+        affine_map<(kh, g, q) -> (kh, g, q)>,
+        affine_map<(kh, g, q) -> (kh, g, q)>,
+        affine_map<(kh, g, q) -> (kh, g, q)>
+      ],
+      iterator_types = ["parallel", "parallel", "parallel"]}}
+    ins(%row_max, %new_max : {row_ty}, {row_ty}) outs(%old_scale_e : {row_ty}) {{
+    ^bb0(%old: f32, %new: f32, %o: f32):
+      %delta = arith.subf %old, %new : f32
+      %factor = math.exp %delta : f32
+      linalg.yield %factor : f32
+  }} -> {row_ty}
+  %sum_e = tensor.empty() : {row_ty}
+  %combined_sum = linalg.generic {{
+      indexing_maps = [
+        affine_map<(kh, g, q) -> (kh, g, q)>,
+        affine_map<(kh, g, q) -> (kh, g, q)>,
+        affine_map<(kh, g, q) -> (kh, g, q)>,
+        affine_map<(kh, g, q) -> (kh, g, q)>
+      ],
+      iterator_types = ["parallel", "parallel", "parallel"]}}
+    ins(%row_sum, %old_scale, %page_sum : {row_ty}, {row_ty}, {row_ty}) outs(%sum_e : {row_ty}) {{
+    ^bb0(%old: f32, %factor: f32, %page: f32, %o: f32):
+      %scaled = arith.mulf %old, %factor : f32
+      %value = arith.addf %scaled, %page : f32
+      linalg.yield %value : f32
+  }} -> {row_ty}
+  %out_e = tensor.empty() : {q_ty}
+  %combined_out = linalg.generic {{
+      indexing_maps = [
+        affine_map<(kh, g, q, d) -> (kh, g, q, d)>,
+        affine_map<(kh, g, q, d) -> (kh, g, q)>,
+        affine_map<(kh, g, q, d) -> (kh, g, q, d)>,
+        affine_map<(kh, g, q, d) -> (kh, g, q, d)>
+      ],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel"]}}
+    ins(%output, %old_scale, %page_out : {q_ty}, {row_ty}, {q_ty}) outs(%out_e : {q_ty}) {{
+    ^bb0(%old: f32, %factor: f32, %page: f32, %o: f32):
+      %scaled = arith.mulf %old, %factor : f32
+      %value = arith.addf %scaled, %page : f32
+      linalg.yield %value : f32
+  }} -> {q_ty}
+  return %combined_out, %new_max, %combined_sum : {q_ty}, {row_ty}, {row_ty}"#
+    ));
+    f.finish(module)
+}
+
+pub fn emit_paged_causal_mask(
+    module: &mut ModuleBuilder,
+    name: &str,
+    query_len: u32,
+    page_size: u32,
+    kv_heads: u32,
+    gqa_group: u32,
+) -> Result<()> {
+    let mask_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}x{page_size}xf32>");
+    let query_positions = (0..query_len)
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let key_positions = (0..page_size)
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut f = module.func_private(name);
+    f.arg("start_pos", "tensor<i64>");
+    f.arg("page_index", "index");
+    f.result_ty(&mask_ty);
+    f.op_asm(format!(
+        r#"  %start64 = tensor.extract %start_pos[] : tensor<i64>
+  %page64 = arith.index_cast %page_index : index to i64
+  %page_size64 = arith.constant {page_size} : i64
+  %page_start = arith.muli %page64, %page_size64 : i64
+  %query_positions = arith.constant dense<[{query_positions}]> : tensor<{query_len}xi64>
+  %key_positions = arith.constant dense<[{key_positions}]> : tensor<{page_size}xi64>
+  %zero = arith.constant 0.0 : f32
+  %neg = arith.constant -3.40282347E+38 : f32
+  %empty = tensor.empty() : {mask_ty}
+  %mask = linalg.generic {{
+      indexing_maps = [
+        affine_map<(kh, g, q, k) -> (q)>,
+        affine_map<(kh, g, q, k) -> (k)>,
+        affine_map<(kh, g, q, k) -> (kh, g, q, k)>
+      ],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel"]}}
+    ins(%query_positions, %key_positions : tensor<{query_len}xi64>, tensor<{page_size}xi64>)
+    outs(%empty : {mask_ty}) {{
+    ^bb0(%q: i64, %k: i64, %o: f32):
+      %abs_q = arith.addi %start64, %q : i64
+      %abs_k = arith.addi %page_start, %k : i64
+      %visible = arith.cmpi ule, %abs_k, %abs_q : i64
+      %value = arith.select %visible, %zero, %neg : f32
+      linalg.yield %value : f32
+  }} -> {mask_ty}
+  return %mask : {mask_ty}"#
+    ));
+    f.finish(module)
+}
+
+#[cfg(test)]
+mod online_attention_tests {
+    use super::*;
+
+    fn q_value(head: usize, pos: usize, dim: usize) -> f64 {
+        (((head * 17 + pos * 3 + dim * 11) % 29) as f64 - 14.0) * 0.75
+    }
+
+    fn k_value(kv_head: usize, pos: usize, dim: usize) -> f64 {
+        (((kv_head * 13 + pos * 7 + dim * 5) % 31) as f64 - 15.0) * 0.5
+    }
+
+    fn v_value(kv_head: usize, pos: usize, dim: usize) -> f64 {
+        ((kv_head * 19 + pos * 11 + dim * 2) % 37) as f64 / 37.0
+    }
+
+    fn direct_attention(head: usize, query_pos: usize, length: usize, dim: usize) -> Vec<f64> {
+        let kv_head = head / 2;
+        let mut scores = Vec::with_capacity(query_pos + 1);
+        for key_pos in 0..length {
+            if key_pos > query_pos {
+                break;
+            }
+            let score = (0..dim)
+                .map(|d| q_value(head, query_pos, d) * k_value(kv_head, key_pos, d))
+                .sum::<f64>()
+                / (dim as f64).sqrt();
+            scores.push(score);
+        }
+        let maximum = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let weights: Vec<_> = scores.iter().map(|score| (score - maximum).exp()).collect();
+        let sum: f64 = weights.iter().sum();
+        (0..dim)
+            .map(|d| {
+                weights
+                    .iter()
+                    .enumerate()
+                    .map(|(key_pos, weight)| weight * v_value(kv_head, key_pos, d))
+                    .sum::<f64>()
+                    / sum
+            })
+            .collect()
+    }
+
+    fn paged_attention(head: usize, query_pos: usize, length: usize, dim: usize) -> Vec<f64> {
+        let kv_head = head / 2;
+        let mut running_max = f64::NEG_INFINITY;
+        let mut running_sum = 0.0;
+        let mut output = vec![0.0; dim];
+        for page_start in (0..length).step_by(256) {
+            let page_end = (page_start + 256).min(length).min(query_pos + 1);
+            if page_start >= page_end {
+                continue;
+            }
+            let scores: Vec<_> = (page_start..page_end)
+                .map(|key_pos| {
+                    (0..dim)
+                        .map(|d| q_value(head, query_pos, d) * k_value(kv_head, key_pos, d))
+                        .sum::<f64>()
+                        / (dim as f64).sqrt()
+                })
+                .collect();
+            let page_max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let next_max = running_max.max(page_max);
+            let old_scale = (running_max - next_max).exp();
+            for value in &mut output {
+                *value *= old_scale;
+            }
+            running_sum *= old_scale;
+            for (offset, score) in scores.into_iter().enumerate() {
+                let weight = (score - next_max).exp();
+                let key_pos = page_start + offset;
+                running_sum += weight;
+                for (d, value) in output.iter_mut().enumerate() {
+                    *value += weight * v_value(kv_head, key_pos, d);
+                }
+            }
+            running_max = next_max;
+        }
+        for value in &mut output {
+            *value /= running_sum;
+        }
+        output
+    }
+
+    #[test]
+    fn page_kernel_verifies_without_quadratic_context_tensor() {
+        let mut module = ModuleBuilder::new().unwrap();
+        emit_online_attention_page(&mut module, "online_page", 32, 256, 8, 2, 128).unwrap();
+        emit_iree_online_attention_page(&mut module, "iree_online_page", 32, 256, 8, 2, 128)
+            .unwrap();
+        emit_paged_causal_mask(&mut module, "paged_mask", 32, 256, 8, 2).unwrap();
+        emit_rope_chunk(&mut module, "rope_chunk", 32, 8, 128, 1_000_000.0).unwrap();
+        let text = module.finish().unwrap().mlir_text;
+        assert!(text.contains("iree_linalg_ext.online_attention"));
+        assert!(text.contains("math.powf"));
+        assert!(!text.contains("tensor<8x4096x4096"));
+    }
+
+    #[test]
+    fn online_merge_matches_f64_reference_at_page_boundaries() {
+        for length in [255, 256, 257, 4096] {
+            for query_pos in [0, 255.min(length - 1), 256.min(length - 1), length - 1] {
+                for head in 0..4 {
+                    let direct = direct_attention(head, query_pos, length, 4);
+                    let paged = paged_attention(head, query_pos, length, 4);
+                    for (expected, actual) in direct.iter().zip(&paged) {
+                        assert!((expected - actual).abs() < 1e-12);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// `func.func private @name(%x, %w) -> …` matmul-after-transpose linear.
 pub fn emit_linear(
     module: &mut ModuleBuilder,
@@ -253,6 +664,74 @@ pub fn emit_rope(
       %x2 = tensor.extract {x}[%p, %hh, %dim_hi] : {x_ty}
       %cv = tensor.extract %cos[%p, %pair_lo] : {half_ty}
       %sv = tensor.extract %sin[%p, %pair_lo] : {half_ty}
+      %x1c = arith.mulf %x1, %cv : f32
+      %x2s = arith.mulf %x2, %sv : f32
+      %x1s = arith.mulf %x1, %sv : f32
+      %x2c = arith.mulf %x2, %cv : f32
+      %lo = arith.subf %x1c, %x2s : f32
+      %hi = arith.addf %x1s, %x2c : f32
+      %r = arith.select %in_first, %lo, %hi : f32
+      linalg.yield %r : f32
+  }} -> {x_ty}
+  return %y : {x_ty}"#
+    ));
+    f.finish(module)
+}
+
+/// RoPE for a fixed-size chunk at a runtime absolute token offset. Unlike the
+/// legacy helpers this computes frequencies on device and emits no context-size
+/// lookup table.
+pub fn emit_rope_chunk(
+    module: &mut ModuleBuilder,
+    name: &str,
+    chunk: u32,
+    heads: u32,
+    head_dim: u32,
+    theta: f32,
+) -> Result<()> {
+    let half = head_dim / 2;
+    let x_ty = format!("tensor<{chunk}x{heads}x{head_dim}xf32>");
+    let mut f = module.func_private(name);
+    f.arg("x", &x_ty);
+    f.arg("start_pos", "tensor<i64>");
+    f.result_ty(&x_ty);
+    f.op_asm(format!(
+        r#"  %start64 = tensor.extract %start_pos[] : tensor<i64>
+  %start = arith.index_cast %start64 : i64 to index
+  %init = tensor.empty() : {x_ty}
+  %theta = arith.constant {theta:.8e} : f32
+  %two = arith.constant 2.0 : f32
+  %dimf = arith.constant {head_dim}.0 : f32
+  %one = arith.constant 1.0 : f32
+  %y = linalg.generic {{
+      indexing_maps = [
+        affine_map<(p, h, dim) -> (p, h, dim)>,
+        affine_map<(p, h, dim) -> (p, h, dim)>
+      ],
+      iterator_types = ["parallel", "parallel", "parallel"]}}
+    ins(%x : {x_ty}) outs(%init : {x_ty}) {{
+    ^bb0(%a: f32, %o: f32):
+      %p = linalg.index 0 : index
+      %hh = linalg.index 1 : index
+      %dim = linalg.index 2 : index
+      %half_i = arith.constant {half} : index
+      %in_first = arith.cmpi ult, %dim, %half_i : index
+      %pair = arith.remui %dim, %half_i : index
+      %pair_hi = arith.addi %pair, %half_i : index
+      %abs_pos = arith.addi %start, %p : index
+      %pos64 = arith.index_cast %abs_pos : index to i64
+      %pair64 = arith.index_cast %pair : index to i64
+      %posf = arith.sitofp %pos64 : i64 to f32
+      %pairf = arith.sitofp %pair64 : i64 to f32
+      %twopair = arith.mulf %two, %pairf : f32
+      %exponent = arith.divf %twopair, %dimf : f32
+      %den = math.powf %theta, %exponent : f32
+      %freq = arith.divf %one, %den : f32
+      %angle = arith.mulf %posf, %freq : f32
+      %cv = math.cos %angle : f32
+      %sv = math.sin %angle : f32
+      %x1 = tensor.extract %x[%p, %hh, %pair] : {x_ty}
+      %x2 = tensor.extract %x[%p, %hh, %pair_hi] : {x_ty}
       %x1c = arith.mulf %x1, %cv : f32
       %x2s = arith.mulf %x2, %sv : f32
       %x1s = arith.mulf %x1, %sv : f32

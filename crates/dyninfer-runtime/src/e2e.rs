@@ -550,4 +550,53 @@ mod tests {
             assert!(err < 1e-2, "{label} KV decode diverged: max_abs_err={err}");
         }
     }
+
+    #[test]
+    fn paged_kv_prefill_decode_and_reset() {
+        if std::env::var_os("DYNINFER_PAGED_KV_E2E").is_none() {
+            eprintln!("skipping: set DYNINFER_PAGED_KV_E2E=1 for paged KV E2E");
+            return;
+        }
+        if !iree_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("m.safetensors");
+        fs::write(&ckpt, tiny_llama_dense_f32()).unwrap();
+        let loader = ModelLoader::default();
+        let id = ArchitectureId::new("llama.decoder");
+        let bundle = dir.path().join("paged");
+        let overrides = dyninfer_core::MetadataMap::from([
+            ("max_kv".into(), serde_json::json!(1024)),
+            ("prefill_window".into(), serde_json::json!(256)),
+        ]);
+        let target = std::env::var("DYNINFER_PAGED_KV_TARGET").unwrap_or_else(|_| "cpu".into());
+        loader
+            .compile_to_bundle_with_overrides(
+                &id,
+                &ckpt,
+                &target,
+                &bundle,
+                &CompileOptions {
+                    mode: "local-jit".into(),
+                    ..Default::default()
+                },
+                &overrides,
+            )
+            .unwrap();
+        let model = loader.load_bundle(&bundle, &ckpt).unwrap();
+        assert_eq!(model.manifest.version, 3);
+        assert_eq!(model.manifest.prefill_window, 256);
+
+        let mut session = model.create_session(SessionConfig::default()).unwrap();
+        let tokens: Vec<u32> = (0..257).map(|index| 1 + index % 30).collect();
+        let _ = session.prefill(&tokens).unwrap();
+        let logits = session.decode(7).unwrap();
+        assert!(logits.values.iter().all(|value| value.is_finite()));
+        let metrics = session.kv_cache_metrics().unwrap();
+        assert_eq!(metrics.page_count, 2);
+        assert!(metrics.allocated_bytes > 0);
+        session.reset().unwrap();
+        assert_eq!(session.kv_cache_metrics().unwrap().page_count, 0);
+    }
 }

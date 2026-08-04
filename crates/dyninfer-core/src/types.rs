@@ -598,6 +598,17 @@ pub enum KvCacheLayout {
     Custom(String),
 }
 
+/// Physical ownership model for KV state exposed by an executable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum KvCacheStorage {
+    /// Legacy ABI: cache tensors are hidden mutable VM globals.
+    #[default]
+    StaticGlobals,
+    /// ABI v3: the runtime owns independently allocated device pages.
+    Paged { page_size: u32, chunk_size: u32 },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvCacheDescriptor {
     pub layer_count: u32,
@@ -608,6 +619,24 @@ pub struct KvCacheDescriptor {
     pub element_type: ScalarType,
     pub layout: KvCacheLayout,
     pub alignment: u64,
+    #[serde(default)]
+    pub storage: KvCacheStorage,
+}
+
+impl KvCacheDescriptor {
+    pub fn page_size(&self) -> Option<u32> {
+        match self.storage {
+            KvCacheStorage::StaticGlobals => None,
+            KvCacheStorage::Paged { page_size, .. } => Some(page_size),
+        }
+    }
+
+    pub fn chunk_size(&self) -> Option<u32> {
+        match self.storage {
+            KvCacheStorage::StaticGlobals => None,
+            KvCacheStorage::Paged { chunk_size, .. } => Some(chunk_size),
+        }
+    }
 }
 
 /// Model metadata exposed by the runtime.

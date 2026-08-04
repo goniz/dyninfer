@@ -26,8 +26,8 @@ pub use scalar::{Endianness, ScalarType, StorageElementType, TensorOrder};
 pub use shape::{ByteRange, Range64, Shape, ShapeProfile};
 pub use types::{
     BindingPlan, BindingTransform, BlockLayoutField, ExecutableManifest, KvCacheDescriptor,
-    KvCacheLayout, LogicalTensorConstraint, LogicalTensorType, ManifestParameterComponent,
-    MetadataMap, ModelMetadata, ParameterBinding, ParameterComponentBinding, ParameterRole,
-    ParameterSlot, PhysicalEncoding, SessionConfig, SourceFile, StorageComponent, TargetProfile,
-    TokenId, ZeroPointMode,
+    KvCacheLayout, KvCacheStorage, LogicalTensorConstraint, LogicalTensorType,
+    ManifestParameterComponent, MetadataMap, ModelMetadata, ParameterBinding,
+    ParameterComponentBinding, ParameterRole, ParameterSlot, PhysicalEncoding, SessionConfig,
+    SourceFile, StorageComponent, TargetProfile, TokenId, ZeroPointMode,
 };

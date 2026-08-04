@@ -81,6 +81,35 @@ pub mod bindings {
             out_logits: *mut *mut f32,
             out_count: *mut usize,
         ) -> c_int;
+        pub fn dyninfer_iree_session_configure_paged_kv(
+            session: *mut dyninfer_iree_session_t,
+            layer_count: usize,
+            page_size: usize,
+            kv_head_count: usize,
+            head_dim: usize,
+            chunk_size: usize,
+        ) -> c_int;
+        pub fn dyninfer_iree_session_ensure_kv_pages(
+            session: *mut dyninfer_iree_session_t,
+            page_count: usize,
+        ) -> c_int;
+        pub fn dyninfer_iree_session_invoke_paged_chunk(
+            session: *mut dyninfer_iree_session_t,
+            tokens: *const i64,
+            token_count: usize,
+            last: i64,
+            start_pos: i64,
+            out_logits: *mut *mut f32,
+            out_count: *mut usize,
+        ) -> c_int;
+        pub fn dyninfer_iree_session_reset_paged_kv(session: *mut dyninfer_iree_session_t)
+        -> c_int;
+        pub fn dyninfer_iree_session_kv_page_count(
+            session: *const dyninfer_iree_session_t,
+        ) -> usize;
+        pub fn dyninfer_iree_session_kv_allocated_bytes(
+            session: *const dyninfer_iree_session_t,
+        ) -> usize;
     }
 }
 

@@ -48,6 +48,8 @@ pub const LARGE_MAX_KV: u32 = 256;
 /// Matches [`TINY_PREFILL_WINDOW`]: decode-at-last fills a dense softmax domain.
 /// Larger models pass a host `attn_bias` for padded KV slots.
 pub const TINY_MAX_KV: u32 = 4;
+pub const PAGED_KV_PAGE_SIZE: u32 = 256;
+pub const PAGED_PREFILL_CHUNK_SIZE: u32 = 2048;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DenseDecoderConfig {
@@ -62,6 +64,11 @@ pub struct DenseDecoderConfig {
     pub seq: u32,
     /// Mutable KV capacity (`>= seq`); decode positions use `[0, max_kv)`.
     pub max_kv: u32,
+    /// Runtime-owned paged KV and chunked prefill ABI v3.
+    pub paged_kv: bool,
+    /// HIP uses IREE's fused online-attention op; portable backends retain the
+    /// page-local linalg fallback until their code generators support it.
+    pub iree_flash_attention: bool,
     pub rms_norm_eps: f32,
     pub rope_theta: Option<f32>,
     /// Qwen3-style RMSNorm on Q/K heads before RoPE.
@@ -157,6 +164,14 @@ impl DenseDecoderConfig {
             .operations
             .iter()
             .any(|operation| matches!(operation.kind, OperationKind::PerHeadRmsNorm { .. }));
+        let paged_kv = bound.architecture.operations.iter().any(|operation| {
+            matches!(operation.kind, OperationKind::Attention { .. })
+                && bound.selected_kernels.iter().any(|selected| {
+                    selected.operation_id == operation.id
+                        && selected.mode == ExecutionMode::Prefill
+                        && selected.lowering_id.as_str() == "attention.online_paged.generated"
+                })
+        });
         let mut param_keys = BTreeMap::new();
         let mut param_dtypes = BTreeMap::new();
         let mut param_compute_dtypes = BTreeMap::new();
@@ -204,6 +219,8 @@ impl DenseDecoderConfig {
             num_layers,
             seq,
             max_kv: max_kv.max(seq),
+            paged_kv,
+            iree_flash_attention: bound.target.driver == "hip",
             rms_norm_eps: f(
                 &["rms_norm_eps", "llama.attention.layer_norm_rms_epsilon"],
                 1e-5,
@@ -289,9 +306,14 @@ impl DenseDecoderConfig {
             && self.head_dim <= 256
             && self.q_dim() <= 4096
             && self.seq >= 1
-            && self.seq <= 256
+            && self.seq
+                <= if self.paged_kv {
+                    PAGED_PREFILL_CHUNK_SIZE
+                } else {
+                    256
+                }
             && self.max_kv >= self.seq
-            && self.max_kv <= 512
+            && self.max_kv <= if self.paged_kv { 1_048_576 } else { 512 }
     }
 }
 
@@ -318,10 +340,514 @@ pub fn build_dense_decoder(
     let _ = arch_id; // retained for call-site tracing / future module attrs
     emit_globals(builder, c)?;
     emit_helpers(builder, c)?;
-    emit_prefill(builder, c)?;
-    emit_decode(builder, c)?;
+    if c.paged_kv {
+        emit_paged_decoder(builder, c)?;
+    } else {
+        emit_prefill(builder, c)?;
+        emit_decode(builder, c)?;
+    }
     kernels::emit_add_smoke(builder)?;
     Ok(())
+}
+
+fn emit_paged_decoder(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()> {
+    emit_paged_chunk_begin(module, c)?;
+    emit_paged_layer_page(module, c)?;
+    for layer in 0..c.num_layers {
+        emit_paged_layer_prepare(module, c, layer)?;
+        emit_paged_layer_finish(module, c, layer)?;
+    }
+    emit_paged_chunk_logits(module, c)
+}
+
+fn emit_paged_chunk_begin(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()> {
+    let parameters = default_parameter_lowerings();
+    let (s, h, v) = (c.seq, c.hidden, c.vocab);
+    let hidden_ty = format!("tensor<{s}x{h}xf32>");
+    let mut f = module.func("chunk_begin");
+    f.arg("tokens", format!("tensor<{s}xi64>"));
+    f.arg("last", "tensor<i64>");
+    f.arg("start_pos", "tensor<i64>");
+    emit_load_compute(
+        &mut f,
+        c,
+        "emb_t",
+        "token_embd_weight",
+        "token_embd.weight",
+        &format!("{v}x{h}"),
+    );
+    f.op_asm(format!("  %h_acc0 = tensor.empty() : {hidden_ty}\n"));
+    for pos in 0..s {
+        f.op_asm(format!(
+            "  %c{pos}i = arith.constant {pos} : index\n  %t{pos} = tensor.extract %tokens[%c{pos}i] : tensor<{s}xi64>\n  %i{pos} = arith.index_cast %t{pos} : i64 to index\n"
+        ));
+        if !parameters.emit_embedding_call(
+            &mut f,
+            c,
+            &format!("r{pos}"),
+            &format!("i{pos}"),
+            "emb_t",
+            ExecutionMode::Prefill,
+        )? {
+            f.op_asm(format!(
+                "  %r{pos} = tensor.extract_slice %emb_t[%i{pos}, 0] [1, {h}] [1, 1] : tensor<{v}x{h}xf32> to tensor<1x{h}xf32>\n"
+            ));
+        }
+        let prev = if pos == 0 {
+            "h_acc0".to_string()
+        } else {
+            format!("h_acc{pos}")
+        };
+        let next = format!("h_acc{}", pos + 1);
+        f.op_asm(format!(
+            "  %{next} = tensor.insert_slice %r{pos} into %{prev}[{pos}, 0] [1, {h}] [1, 1] : tensor<1x{h}xf32> into {hidden_ty}\n"
+        ));
+    }
+    f.op_asm(format!(
+        "  %last64 = tensor.extract %last[] : tensor<i64>\n  %one64 = arith.constant 1 : i64\n  %valid64 = arith.addi %last64, %one64 : i64\n  %valid_e = tensor.empty() : tensor<i64>\n  %valid = tensor.insert %valid64 into %valid_e[] : tensor<i64>\n  util.global.store %h_acc{s}, @paged_hidden : {hidden_ty}\n  util.global.store %start_pos, @paged_start_pos : tensor<i64>\n  util.global.store %valid, @paged_valid_count : tensor<i64>\n  return"
+    ));
+    f.finish(module)
+}
+
+fn emit_paged_layer_prepare(
+    module: &mut ModuleBuilder,
+    c: &DenseDecoderConfig,
+    layer: u32,
+) -> Result<()> {
+    let (s, h, q, kv, nkv, g, d) = (
+        c.seq,
+        c.hidden,
+        c.q_dim(),
+        c.kv_dim(),
+        c.num_kv_heads,
+        c.gqa_group(),
+        c.head_dim,
+    );
+    let p = format!("blk{layer}");
+    let n = format!("blk.{layer}");
+    let hidden_ty = format!("tensor<{s}x{h}xf32>");
+    let qg_ty = format!("tensor<{nkv}x{g}x{s}x{d}xf32>");
+    let kv3_ty = format!("tensor<{s}x{nkv}x{d}xf32>");
+    let row_ty = format!("tensor<{nkv}x{g}x{s}xf32>");
+    let mut f = module.func(&format!("layer_prepare_{layer}"));
+    emit_load_compute(
+        &mut f,
+        c,
+        "attn_nw",
+        &format!("{p}_attn_norm_weight"),
+        &format!("{n}.attn_norm.weight"),
+        &format!("{h}"),
+    );
+    for (ssa, sym, canonical, shape) in [
+        (
+            "wq",
+            format!("{p}_attn_q_weight"),
+            format!("{n}.attn_q.weight"),
+            format!("{q}x{h}"),
+        ),
+        (
+            "wk",
+            format!("{p}_attn_k_weight"),
+            format!("{n}.attn_k.weight"),
+            format!("{kv}x{h}"),
+        ),
+        (
+            "wv",
+            format!("{p}_attn_v_weight"),
+            format!("{n}.attn_v.weight"),
+            format!("{kv}x{h}"),
+        ),
+    ] {
+        emit_load_compute(&mut f, c, ssa, &sym, &canonical, &shape);
+    }
+    if c.has_qk_norm {
+        emit_load_compute(
+            &mut f,
+            c,
+            "qnw",
+            &format!("{p}_attn_q_norm_weight"),
+            &format!("{n}.attn_q_norm.weight"),
+            &format!("{d}"),
+        );
+        emit_load_compute(
+            &mut f,
+            c,
+            "knw",
+            &format!("{p}_attn_k_norm_weight"),
+            &format!("{n}.attn_k_norm.weight"),
+            &format!("{d}"),
+        );
+    }
+    f.op_asm(format!(
+        "  %hidden = util.global.load @paged_hidden : {hidden_ty}\n  %start_pos = util.global.load @paged_start_pos : tensor<i64>\n  %xn = func.call @rms_norm(%hidden, %attn_nw) : ({hidden_ty}, tensor<{h}xf32>) -> {hidden_ty}\n"
+    ));
+    emit_linear_call(
+        &mut f,
+        c,
+        "q",
+        "linear_hq",
+        "xn",
+        "wq",
+        &format!("{n}.attn_q.weight"),
+        s,
+        h,
+        q,
+    );
+    emit_linear_call(
+        &mut f,
+        c,
+        "k",
+        "linear_hkv",
+        "xn",
+        "wk",
+        &format!("{n}.attn_k.weight"),
+        s,
+        h,
+        kv,
+    );
+    emit_linear_call(
+        &mut f,
+        c,
+        "v",
+        "linear_hkv",
+        "xn",
+        "wv",
+        &format!("{n}.attn_v.weight"),
+        s,
+        h,
+        kv,
+    );
+    let norm_args = if c.has_qk_norm { ", %qnw, %knw" } else { "" };
+    let norm_types = if c.has_qk_norm {
+        format!(", tensor<{d}xf32>, tensor<{d}xf32>")
+    } else {
+        String::new()
+    };
+    f.op_asm(format!(
+        "  %qg, %kc, %vc = func.call @prepare_paged_attention(%q, %k, %v, %start_pos{norm_args}) : (tensor<{s}x{q}xf32>, tensor<{s}x{kv}xf32>, tensor<{s}x{kv}xf32>, tensor<i64>{norm_types}) -> ({qg_ty}, {kv3_ty}, {kv3_ty})\n"
+    ));
+    f.op_asm(format!(
+        r#"  %zero = arith.constant 0.0 : f32
+  %neg = arith.constant -3.40282347E+38 : f32
+  %out_e = tensor.empty() : {qg_ty}
+  %row_e = tensor.empty() : {row_ty}
+  %out = linalg.fill ins(%zero : f32) outs(%out_e : {qg_ty}) -> {qg_ty}
+  %max = linalg.fill ins(%neg : f32) outs(%row_e : {row_ty}) -> {row_ty}
+  %sum = linalg.fill ins(%zero : f32) outs(%row_e : {row_ty}) -> {row_ty}
+  util.global.store %qg, @paged_query : {qg_ty}
+  util.global.store %kc, @paged_chunk_k : {kv3_ty}
+  util.global.store %vc, @paged_chunk_v : {kv3_ty}
+  util.global.store %out, @paged_attn_output : {qg_ty}
+  util.global.store %max, @paged_attn_max : {row_ty}
+  util.global.store %sum, @paged_attn_sum : {row_ty}
+  return"#
+    ));
+    f.finish(module)
+}
+
+fn emit_paged_layer_page(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()> {
+    let (s, nkv, g, d, layers, page) = (
+        c.seq,
+        c.num_kv_heads,
+        c.gqa_group(),
+        c.head_dim,
+        c.num_layers,
+        PAGED_KV_PAGE_SIZE,
+    );
+    let qg_ty = format!("tensor<{nkv}x{g}x{s}x{d}xf32>");
+    let kv3_ty = format!("tensor<{s}x{nkv}x{d}xf32>");
+    let row_ty = format!("tensor<{nkv}x{g}x{s}xf32>");
+    let mask_ty = format!("tensor<{nkv}x{g}x{s}x{page}xf32>");
+    let page_ty = format!("tensor<{layers}x2x{page}x{nkv}x{d}xf32>");
+    let expanded_ty = format!("tensor<1x1x{page}x{nkv}x{d}xf32>");
+    let page_slice_ty = format!("tensor<1x1x{page}x{nkv}x{d}xf32>");
+    let page_seq_ty = format!("tensor<{page}x{nkv}x{d}xf32>");
+    let page_head_ty = format!("tensor<{nkv}x{page}x{d}xf32>");
+    let scale_ty = if c.iree_flash_attention { "f16" } else { "f32" };
+    let mut f = module.func("layer_page");
+    f.arg("page", &page_ty);
+    f.arg("page_index", "tensor<i64>");
+    f.arg("start_pos", "tensor<i64>");
+    f.arg("layer_index", "tensor<i64>");
+    f.result_ty(&page_ty);
+    f.op_asm(format!(
+        r#"  %pi64 = tensor.extract %page_index[] : tensor<i64>
+  %start64 = tensor.extract %start_pos[] : tensor<i64>
+  %layer64 = tensor.extract %layer_index[] : tensor<i64>
+  %pi = arith.index_cast %pi64 : i64 to index
+  %start = arith.index_cast %start64 : i64 to index
+  %layer = arith.index_cast %layer64 : i64 to index
+  %page_size = arith.constant {page} : index
+  %page_start = arith.muli %pi, %page_size : index
+  %page_end = arith.addi %page_start, %page_size : index
+  %valid_t = util.global.load @paged_valid_count : tensor<i64>
+  %valid64 = tensor.extract %valid_t[] : tensor<i64>
+  %valid = arith.index_cast %valid64 : i64 to index
+  %chunk_end = arith.addi %start, %valid : index
+  %starts_before_chunk_end = arith.cmpi ult, %page_start, %chunk_end : index
+  %ends_after_chunk_start = arith.cmpi ugt, %page_end, %start : index
+  %intersects = arith.andi %starts_before_chunk_end, %ends_after_chunk_start : i1
+  %page_updated = scf.if %intersects -> ({page_ty}) {{
+    %kc = util.global.load @paged_chunk_k : {kv3_ty}
+    %vc = util.global.load @paged_chunk_v : {kv3_ty}
+    %old_ks = tensor.extract_slice %page[%layer, 0, 0, 0, 0] [1, 1, {page}, {nkv}, {d}] [1, 1, 1, 1, 1] : {page_ty} to {page_slice_ty}
+    %old_vs = tensor.extract_slice %page[%layer, 1, 0, 0, 0] [1, 1, {page}, {nkv}, {d}] [1, 1, 1, 1, 1] : {page_ty} to {page_slice_ty}
+    %old_k = tensor.collapse_shape %old_ks [[0, 1, 2], [3], [4]] : {page_slice_ty} into {page_seq_ty}
+    %old_v = tensor.collapse_shape %old_vs [[0, 1, 2], [3], [4]] : {page_slice_ty} into {page_seq_ty}
+    %c0i = arith.constant 0 : index
+    %new_k = linalg.generic {{
+        indexing_maps = [affine_map<(p, h, d) -> (p, h, d)>],
+        iterator_types = ["parallel", "parallel", "parallel"]}}
+      outs(%old_k : {page_seq_ty}) {{
+      ^bb0(%old: f32):
+        %pidx = linalg.index 0 : index
+        %hidx = linalg.index 1 : index
+        %didx = linalg.index 2 : index
+        %absolute = arith.addi %page_start, %pidx : index
+        %after_start = arith.cmpi uge, %absolute, %start : index
+        %before_end = arith.cmpi ult, %absolute, %chunk_end : index
+        %replace = arith.andi %after_start, %before_end : i1
+        %source_raw = arith.subi %absolute, %start : index
+        %source = arith.select %replace, %source_raw, %c0i : index
+        %value = tensor.extract %kc[%source, %hidx, %didx] : {kv3_ty}
+        %result = arith.select %replace, %value, %old : f32
+        linalg.yield %result : f32
+    }} -> {page_seq_ty}
+    %new_v = linalg.generic {{
+        indexing_maps = [affine_map<(p, h, d) -> (p, h, d)>],
+        iterator_types = ["parallel", "parallel", "parallel"]}}
+      outs(%old_v : {page_seq_ty}) {{
+      ^bb0(%old: f32):
+        %pidx = linalg.index 0 : index
+        %hidx = linalg.index 1 : index
+        %didx = linalg.index 2 : index
+        %absolute = arith.addi %page_start, %pidx : index
+        %after_start = arith.cmpi uge, %absolute, %start : index
+        %before_end = arith.cmpi ult, %absolute, %chunk_end : index
+        %replace = arith.andi %after_start, %before_end : i1
+        %source_raw = arith.subi %absolute, %start : index
+        %source = arith.select %replace, %source_raw, %c0i : index
+        %value = tensor.extract %vc[%source, %hidx, %didx] : {kv3_ty}
+        %result = arith.select %replace, %value, %old : f32
+        linalg.yield %result : f32
+    }} -> {page_seq_ty}
+    %ke = tensor.expand_shape %new_k [[0, 1, 2], [3], [4]] output_shape [1, 1, {page}, {nkv}, {d}] : {page_seq_ty} into {expanded_ty}
+    %ve = tensor.expand_shape %new_v [[0, 1, 2], [3], [4]] output_shape [1, 1, {page}, {nkv}, {d}] : {page_seq_ty} into {expanded_ty}
+    %pk = tensor.insert_slice %ke into %page[%layer, 0, 0, 0, 0] [1, 1, {page}, {nkv}, {d}] [1, 1, 1, 1, 1] : {expanded_ty} into {page_ty}
+    %pv = tensor.insert_slice %ve into %pk[%layer, 1, 0, 0, 0] [1, 1, {page}, {nkv}, {d}] [1, 1, 1, 1, 1] : {expanded_ty} into {page_ty}
+    scf.yield %pv : {page_ty}
+  }} else {{
+    scf.yield %page : {page_ty}
+  }}
+  %ks = tensor.extract_slice %page_updated[%layer, 0, 0, 0, 0] [1, 1, {page}, {nkv}, {d}] [1, 1, 1, 1, 1] : {page_ty} to {page_slice_ty}
+  %vs = tensor.extract_slice %page_updated[%layer, 1, 0, 0, 0] [1, 1, {page}, {nkv}, {d}] [1, 1, 1, 1, 1] : {page_ty} to {page_slice_ty}
+  %kseq = tensor.collapse_shape %ks [[0, 1, 2], [3], [4]] : {page_slice_ty} into {page_seq_ty}
+  %vseq = tensor.collapse_shape %vs [[0, 1, 2], [3], [4]] : {page_slice_ty} into {page_seq_ty}
+  %ke2 = tensor.empty() : {page_head_ty}
+  %ve2 = tensor.empty() : {page_head_ty}
+  %kh = linalg.transpose ins(%kseq : {page_seq_ty}) outs(%ke2 : {page_head_ty}) permutation = [1, 0, 2]
+  %vh = linalg.transpose ins(%vseq : {page_seq_ty}) outs(%ve2 : {page_head_ty}) permutation = [1, 0, 2]
+  %mask = func.call @paged_causal_mask(%start_pos, %pi) : (tensor<i64>, index) -> {mask_ty}
+  %query = util.global.load @paged_query : {qg_ty}
+  %out = util.global.load @paged_attn_output : {qg_ty}
+  %max = util.global.load @paged_attn_max : {row_ty}
+  %sum = util.global.load @paged_attn_sum : {row_ty}
+  %scale = arith.constant {scale:.8e} : {scale_ty}
+  %next:3 = func.call @online_attention_page(%query, %kh, %vh, %scale, %mask, %out, %max, %sum) : ({qg_ty}, {page_head_ty}, {page_head_ty}, {scale_ty}, {mask_ty}, {qg_ty}, {row_ty}, {row_ty}) -> ({qg_ty}, {row_ty}, {row_ty})
+  util.global.store %next#0, @paged_attn_output : {qg_ty}
+  util.global.store %next#1, @paged_attn_max : {row_ty}
+  util.global.store %next#2, @paged_attn_sum : {row_ty}
+  return %page_updated : {page_ty}"#,
+        scale = 1.0 / (d as f32).sqrt(),
+    ));
+    f.finish(module)
+}
+
+fn emit_paged_layer_finish(
+    module: &mut ModuleBuilder,
+    c: &DenseDecoderConfig,
+    layer: u32,
+) -> Result<()> {
+    let (s, h, q, nkv, g, d, i) = (
+        c.seq,
+        c.hidden,
+        c.q_dim(),
+        c.num_kv_heads,
+        c.gqa_group(),
+        c.head_dim,
+        c.intermediate,
+    );
+    let p = format!("blk{layer}");
+    let n = format!("blk.{layer}");
+    let hidden_ty = format!("tensor<{s}x{h}xf32>");
+    let qg_ty = format!("tensor<{nkv}x{g}x{s}x{d}xf32>");
+    let row_ty = format!("tensor<{nkv}x{g}x{s}xf32>");
+    let mut f = module.func(&format!("layer_finish_{layer}"));
+    for (ssa, sym, canonical, shape) in [
+        (
+            "wo",
+            format!("{p}_attn_output_weight"),
+            format!("{n}.attn_output.weight"),
+            format!("{h}x{q}"),
+        ),
+        (
+            "ffn_nw",
+            format!("{p}_ffn_norm_weight"),
+            format!("{n}.ffn_norm.weight"),
+            format!("{h}"),
+        ),
+        (
+            "wgate",
+            format!("{p}_ffn_gate_weight"),
+            format!("{n}.ffn_gate.weight"),
+            format!("{i}x{h}"),
+        ),
+        (
+            "wup",
+            format!("{p}_ffn_up_weight"),
+            format!("{n}.ffn_up.weight"),
+            format!("{i}x{h}"),
+        ),
+        (
+            "wdown",
+            format!("{p}_ffn_down_weight"),
+            format!("{n}.ffn_down.weight"),
+            format!("{h}x{i}"),
+        ),
+    ] {
+        emit_load_compute(&mut f, c, ssa, &sym, &canonical, &shape);
+    }
+    f.op_asm(format!(
+        r#"  %hidden = util.global.load @paged_hidden : {hidden_ty}
+  %out = util.global.load @paged_attn_output : {qg_ty}
+  %sum = util.global.load @paged_attn_sum : {row_ty}
+  %norm_e = tensor.empty() : {qg_ty}
+  %norm = linalg.generic {{
+      indexing_maps = [
+        affine_map<(kh, g, q, d) -> (kh, g, q, d)>,
+        affine_map<(kh, g, q, d) -> (kh, g, q)>,
+        affine_map<(kh, g, q, d) -> (kh, g, q, d)>
+      ],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel"]}}
+    ins(%out, %sum : {qg_ty}, {row_ty}) outs(%norm_e : {qg_ty}) {{
+    ^bb0(%value: f32, %den: f32, %o: f32):
+      %result = arith.divf %value, %den : f32
+      linalg.yield %result : f32
+  }} -> {qg_ty}
+  %ctx4e = tensor.empty() : tensor<{s}x{nkv}x{g}x{d}xf32>
+  %ctx4 = linalg.transpose ins(%norm : {qg_ty}) outs(%ctx4e : tensor<{s}x{nkv}x{g}x{d}xf32>) permutation = [2, 0, 1, 3]
+  %ctx = tensor.collapse_shape %ctx4 [[0], [1, 2, 3]] : tensor<{s}x{nkv}x{g}x{d}xf32> into tensor<{s}x{q}xf32>
+"#
+    ));
+    emit_linear_call(
+        &mut f,
+        c,
+        "o",
+        "linear_qh",
+        "ctx",
+        "wo",
+        &format!("{n}.attn_output.weight"),
+        s,
+        q,
+        h,
+    );
+    f.op_asm(format!(
+        "  %h2 = arith.addf %hidden, %o : {hidden_ty}\n  %fn = func.call @rms_norm(%h2, %ffn_nw) : ({hidden_ty}, tensor<{h}xf32>) -> {hidden_ty}\n"
+    ));
+    emit_linear_call(
+        &mut f,
+        c,
+        "gate",
+        "linear_hi",
+        "fn",
+        "wgate",
+        &format!("{n}.ffn_gate.weight"),
+        s,
+        h,
+        i,
+    );
+    emit_linear_call(
+        &mut f,
+        c,
+        "up",
+        "linear_hi",
+        "fn",
+        "wup",
+        &format!("{n}.ffn_up.weight"),
+        s,
+        h,
+        i,
+    );
+    f.op_asm(format!(
+        r#"  %silu = linalg.generic {{
+      indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>],
+      iterator_types = ["parallel", "parallel"]}}
+    ins(%gate : tensor<{s}x{i}xf32>) outs(%gate : tensor<{s}x{i}xf32>) {{
+    ^bb0(%a: f32, %b: f32):
+      %neg = arith.negf %a : f32
+      %exp = math.exp %neg : f32
+      %one = arith.constant 1.0 : f32
+      %den = arith.addf %one, %exp : f32
+      %value = arith.divf %a, %den : f32
+      linalg.yield %value : f32
+  }} -> tensor<{s}x{i}xf32>
+  %ff = arith.mulf %silu, %up : tensor<{s}x{i}xf32>
+"#
+    ));
+    emit_linear_call(
+        &mut f,
+        c,
+        "down",
+        "linear_ih",
+        "ff",
+        "wdown",
+        &format!("{n}.ffn_down.weight"),
+        s,
+        i,
+        h,
+    );
+    f.op_asm(format!(
+        "  %next_hidden = arith.addf %h2, %down : {hidden_ty}\n  util.global.store %next_hidden, @paged_hidden : {hidden_ty}\n  return"
+    ));
+    f.finish(module)
+}
+
+fn emit_paged_chunk_logits(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()> {
+    let (s, h, v) = (c.seq, c.hidden, c.vocab);
+    let hidden_ty = format!("tensor<{s}x{h}xf32>");
+    let mut f = module.func("chunk_logits");
+    f.arg("last", "tensor<i64>");
+    f.result_ty(format!("tensor<{v}xf32>"));
+    emit_load_compute(
+        &mut f,
+        c,
+        "out_nw",
+        "output_norm_weight",
+        "output_norm.weight",
+        &format!("{h}"),
+    );
+    emit_load_compute(
+        &mut f,
+        c,
+        "wout",
+        "output_weight",
+        "output.weight",
+        &format!("{v}x{h}"),
+    );
+    f.op_asm(format!(
+        r#"  %hidden = util.global.load @paged_hidden : {hidden_ty}
+  %last_i64 = tensor.extract %last[] : tensor<i64>
+  %li = arith.index_cast %last_i64 : i64 to index
+  %last_row = tensor.extract_slice %hidden[%li, 0] [1, {h}] [1, 1] : {hidden_ty} to tensor<1x{h}xf32>
+  %last_tile = tensor.empty() : {hidden_ty}
+  %last_s = tensor.insert_slice %last_row into %last_tile[0, 0] [1, {h}] [1, 1] : tensor<1x{h}xf32> into {hidden_ty}
+  %ln = func.call @rms_norm(%last_s, %out_nw) : ({hidden_ty}, tensor<{h}xf32>) -> {hidden_ty}
+  %ln1 = tensor.extract_slice %ln[0, 0] [1, {h}] [1, 1] : {hidden_ty} to tensor<1x{h}xf32>
+"#
+    ));
+    emit_output_proj(&mut f, c, "ln1", "wout", ExecutionMode::Prefill);
+    f.op_asm(format!("  return %logits : tensor<{v}xf32>"));
+    f.finish(module)
 }
 
 fn bound_param_dtype(param: &dyninfer_core::ParameterBinding) -> Option<ScalarType> {
@@ -545,6 +1071,29 @@ fn emit_globals(builder: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<(
         "output.weight",
         &format!("{v}x{h}"),
     )?;
+    if c.paged_kv {
+        let (s, h, nkv, g, d) = (c.seq, c.hidden, c.num_kv_heads, c.gqa_group(), c.head_dim);
+        builder.util_global_mutable_zero("paged_hidden", &format!("tensor<{s}x{h}xf32>"))?;
+        builder
+            .util_global_mutable_zero("paged_query", &format!("tensor<{nkv}x{g}x{s}x{d}xf32>"))?;
+        builder.util_global_mutable_zero("paged_chunk_k", &format!("tensor<{s}x{nkv}x{d}xf32>"))?;
+        builder.util_global_mutable_zero("paged_chunk_v", &format!("tensor<{s}x{nkv}x{d}xf32>"))?;
+        builder.util_global_mutable_zero(
+            "paged_attn_output",
+            &format!("tensor<{nkv}x{g}x{s}x{d}xf32>"),
+        )?;
+        builder
+            .util_global_mutable_zero("paged_attn_max", &format!("tensor<{nkv}x{g}x{s}xf32>"))?;
+        builder
+            .util_global_mutable_zero("paged_attn_sum", &format!("tensor<{nkv}x{g}x{s}xf32>"))?;
+        builder.append_toplevel_asm(
+            "util.global private mutable @paged_start_pos = dense<0> : tensor<i64>",
+        )?;
+        builder.append_toplevel_asm(
+            "util.global private mutable @paged_valid_count = dense<0> : tensor<i64>",
+        )?;
+        return Ok(());
+    }
     // Mutable KV cache (f32 compute). Prefill seeds [0, seq); decode grows to max_kv.
     let (mk, nkv, d) = (c.max_kv, c.num_kv_heads, c.head_dim);
     for layer in 0..c.num_layers {
@@ -593,16 +1142,118 @@ fn emit_helpers(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()
         kernels::emit_repeat_kv(module, "repeat_kv", s, nkv, nh, d, g)?;
     }
 
-    if let Some(theta) = c.rope_theta {
+    if !c.paged_kv
+        && let Some(theta) = c.rope_theta
+    {
         kernels::emit_rope(module, "apply_rope_q", s, nh, d, theta)?;
         if nkv != nh {
             kernels::emit_rope(module, "apply_rope_kv", s, nkv, d, theta)?;
         }
     }
 
-    emit_attn(module, c)?;
-    emit_decode_helpers(module, c)?;
+    if c.paged_kv {
+        if c.iree_flash_attention {
+            kernels::emit_iree_online_attention_page(
+                module,
+                "online_attention_page",
+                s,
+                PAGED_KV_PAGE_SIZE,
+                nkv,
+                g,
+                d,
+            )?;
+        } else {
+            kernels::emit_online_attention_page(
+                module,
+                "online_attention_page",
+                s,
+                PAGED_KV_PAGE_SIZE,
+                nkv,
+                g,
+                d,
+            )?;
+        }
+        kernels::emit_paged_causal_mask(
+            module,
+            "paged_causal_mask",
+            s,
+            PAGED_KV_PAGE_SIZE,
+            nkv,
+            g,
+        )?;
+        if let Some(theta) = c.rope_theta {
+            kernels::emit_rope_chunk(module, "apply_rope_q_chunk", s, nh, d, theta)?;
+            kernels::emit_rope_chunk(module, "apply_rope_kv_chunk", s, nkv, d, theta)?;
+        }
+        emit_prepare_paged_attention(module, c)?;
+    }
+
+    if !c.paged_kv {
+        emit_attn(module, c)?;
+        emit_decode_helpers(module, c)?;
+    }
     Ok(())
+}
+
+fn emit_prepare_paged_attention(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()> {
+    let (s, nh, nkv, d, q, kv, g) = (
+        c.seq,
+        c.num_heads,
+        c.num_kv_heads,
+        c.head_dim,
+        c.q_dim(),
+        c.kv_dim(),
+        c.gqa_group(),
+    );
+    let q_grouped_ty = format!("tensor<{nkv}x{g}x{s}x{d}xf32>");
+    let kv_ty = format!("tensor<{s}x{nkv}x{d}xf32>");
+    let mut f = module.func_private("prepare_paged_attention");
+    f.arg("q", format!("tensor<{s}x{q}xf32>"));
+    f.arg("k", format!("tensor<{s}x{kv}xf32>"));
+    f.arg("v", format!("tensor<{s}x{kv}xf32>"));
+    f.arg("start_pos", "tensor<i64>");
+    if c.has_qk_norm {
+        f.arg("q_norm", format!("tensor<{d}xf32>"));
+        f.arg("k_norm", format!("tensor<{d}xf32>"));
+    }
+    f.result_ty(&q_grouped_ty);
+    f.result_ty(&kv_ty);
+    f.result_ty(&kv_ty);
+    f.op_asm(format!(
+        r#"  %q3 = tensor.expand_shape %q [[0], [1, 2]] output_shape [{s}, {nh}, {d}] : tensor<{s}x{q}xf32> into tensor<{s}x{nh}x{d}xf32>
+  %k3 = tensor.expand_shape %k [[0], [1, 2]] output_shape [{s}, {nkv}, {d}] : tensor<{s}x{kv}xf32> into {kv_ty}
+  %v3 = tensor.expand_shape %v [[0], [1, 2]] output_shape [{s}, {nkv}, {d}] : tensor<{s}x{kv}xf32> into {kv_ty}
+"#
+    ));
+    let (q_name, k_name) = if c.has_qk_norm {
+        f.op_asm(format!(
+            "  %qn = func.call @rms_norm_q_heads(%q3, %q_norm) : (tensor<{s}x{nh}x{d}xf32>, tensor<{d}xf32>) -> tensor<{s}x{nh}x{d}xf32>\n"
+        ));
+        f.op_asm(format!(
+            "  %kn = func.call @rms_norm_kv_heads(%k3, %k_norm) : ({kv_ty}, tensor<{d}xf32>) -> {kv_ty}\n"
+        ));
+        ("qn", "kn")
+    } else {
+        ("q3", "k3")
+    };
+    let (q_name, k_name) = if c.rope_theta.is_some() {
+        f.op_asm(format!(
+            "  %qr = func.call @apply_rope_q_chunk(%{q_name}, %start_pos) : (tensor<{s}x{nh}x{d}xf32>, tensor<i64>) -> tensor<{s}x{nh}x{d}xf32>\n"
+        ));
+        f.op_asm(format!(
+            "  %kr = func.call @apply_rope_kv_chunk(%{k_name}, %start_pos) : ({kv_ty}, tensor<i64>) -> {kv_ty}\n"
+        ));
+        ("qr", "kr")
+    } else {
+        (q_name, k_name)
+    };
+    f.op_asm(format!(
+        r#"  %q4 = tensor.expand_shape %{q_name} [[0], [1, 2], [3]] output_shape [{s}, {nkv}, {g}, {d}] : tensor<{s}x{nh}x{d}xf32> into tensor<{s}x{nkv}x{g}x{d}xf32>
+  %qe = tensor.empty() : {q_grouped_ty}
+  %qg = linalg.transpose ins(%q4 : tensor<{s}x{nkv}x{g}x{d}xf32>) outs(%qe : {q_grouped_ty}) permutation = [1, 2, 0, 3]
+  return %qg, %{k_name}, %v3 : {q_grouped_ty}, {kv_ty}, {kv_ty}"#
+    ));
+    f.finish(module)
 }
 
 fn emit_attn(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()> {
@@ -1022,9 +1673,20 @@ fn emit_prefill(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()
     let d = c.head_dim;
     // Tokens are left-aligned (right-padded). `%last` is the index of the
     // newest real token so RoPE/causal attention ignore trailing pads.
-    let mut f = module.func("prefill");
+    let mut f = module.func(if c.paged_kv {
+        "prefill_chunk"
+    } else {
+        "prefill"
+    });
     f.arg("tokens", format!("tensor<{s}xi64>"));
     f.arg("last", "tensor<i64>");
+    if c.paged_kv {
+        f.arg("start_pos", "tensor<i64>");
+        f.op_asm(format!(
+            "  %pages = util.global.load @kv_pages : !util.list<tensor<{}x2x{}x{}x{}xf32>>\n",
+            c.num_layers, PAGED_KV_PAGE_SIZE, c.num_kv_heads, c.head_dim
+        ));
+    }
     f.result_ty(format!("tensor<{v}xf32>"));
     emit_load_compute(
         &mut f,
@@ -1207,43 +1869,66 @@ fn emit_prefill(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()
         );
         let nkv = c.num_kv_heads;
         let mk = c.max_kv;
-        if c.has_qk_norm {
+        if c.paged_kv {
+            let g = c.gqa_group();
+            let qg_ty = format!("tensor<{nkv}x{g}x{s}x{d}xf32>");
+            let kv3_ty = format!("tensor<{s}x{nkv}x{d}xf32>");
+            let list_ty = format!(
+                "!util.list<tensor<{}x2x{}x{}x{}xf32>>",
+                c.num_layers, PAGED_KV_PAGE_SIZE, nkv, d
+            );
+            let norm_args = if c.has_qk_norm {
+                format!(", %{p}_qnw, %{p}_knw")
+            } else {
+                String::new()
+            };
+            let norm_types = if c.has_qk_norm {
+                format!(", tensor<{d}xf32>, tensor<{d}xf32>")
+            } else {
+                String::new()
+            };
             f.op_asm(format!(
-                "  %{p}_ctx, %{p}_kc, %{p}_vc = func.call @attn(%{p}_q, %{p}_k, %{p}_v, %{p}_qnw, %{p}_knw) : (tensor<{s}x{q}xf32>, tensor<{s}x{kv}xf32>, tensor<{s}x{kv}xf32>, tensor<{d}xf32>, tensor<{d}xf32>) -> (tensor<{s}x{q}xf32>, tensor<{s}x{nkv}x{d}xf32>, tensor<{s}x{nkv}x{d}xf32>)\n"
+                "  %{p}_qg, %{p}_kc, %{p}_vc = func.call @prepare_paged_attention(%{p}_q, %{p}_k, %{p}_v, %start_pos{norm_args}) : (tensor<{s}x{q}xf32>, tensor<{s}x{kv}xf32>, tensor<{s}x{kv}xf32>, tensor<i64>{norm_types}) -> ({qg_ty}, {kv3_ty}, {kv3_ty})\n"
+            ));
+            f.op_asm(format!(
+                "  func.call @store_paged_kv_{layer}(%{p}_kc, %{p}_vc, %start_pos, %pages) : ({kv3_ty}, {kv3_ty}, tensor<i64>, {list_ty}) -> ()\n"
+            ));
+            f.op_asm(format!(
+                "  %{p}_ctxg = func.call @attend_pages_{layer}(%{p}_qg, %start_pos, %pages) : ({qg_ty}, tensor<i64>, {list_ty}) -> {qg_ty}\n"
+            ));
+            f.op_asm(format!(
+                "  %{p}_ctx4e = tensor.empty() : tensor<{s}x{nkv}x{g}x{d}xf32>\n"
+            ));
+            f.op_asm(format!(
+                "  %{p}_ctx4 = linalg.transpose ins(%{p}_ctxg : {qg_ty}) outs(%{p}_ctx4e : tensor<{s}x{nkv}x{g}x{d}xf32>) permutation = [2, 0, 1, 3]\n"
+            ));
+            f.op_asm(format!(
+                "  %{p}_ctx = tensor.collapse_shape %{p}_ctx4 [[0], [1, 2, 3]] : tensor<{s}x{nkv}x{g}x{d}xf32> into tensor<{s}x{q}xf32>\n"
             ));
         } else {
+            if c.has_qk_norm {
+                f.op_asm(format!(
+                    "  %{p}_ctx, %{p}_kc, %{p}_vc = func.call @attn(%{p}_q, %{p}_k, %{p}_v, %{p}_qnw, %{p}_knw) : (tensor<{s}x{q}xf32>, tensor<{s}x{kv}xf32>, tensor<{s}x{kv}xf32>, tensor<{d}xf32>, tensor<{d}xf32>) -> (tensor<{s}x{q}xf32>, tensor<{s}x{nkv}x{d}xf32>, tensor<{s}x{nkv}x{d}xf32>)\n"
+                ));
+            } else {
+                f.op_asm(format!(
+                    "  %{p}_ctx, %{p}_kc, %{p}_vc = func.call @attn(%{p}_q, %{p}_k, %{p}_v) : (tensor<{s}x{q}xf32>, tensor<{s}x{kv}xf32>, tensor<{s}x{kv}xf32>) -> (tensor<{s}x{q}xf32>, tensor<{s}x{nkv}x{d}xf32>, tensor<{s}x{nkv}x{d}xf32>)\n"
+                ));
+            }
+            // Seed mutable KV at positions [0, seq).
             f.op_asm(format!(
-                "  %{p}_ctx, %{p}_kc, %{p}_vc = func.call @attn(%{p}_q, %{p}_k, %{p}_v) : (tensor<{s}x{q}xf32>, tensor<{s}x{kv}xf32>, tensor<{s}x{kv}xf32>) -> (tensor<{s}x{q}xf32>, tensor<{s}x{nkv}x{d}xf32>, tensor<{s}x{nkv}x{d}xf32>)\n"
+                "  %{p}_k_z = tensor.empty() : tensor<{mk}x{nkv}x{d}xf32>\n  %{p}_v_z = tensor.empty() : tensor<{mk}x{nkv}x{d}xf32>\n  %{p}_k_f0 = arith.constant 0.0 : f32\n"
+            ));
+            f.op_asm(format!(
+                "  %{p}_k_old = linalg.fill ins(%{p}_k_f0 : f32) outs(%{p}_k_z : tensor<{mk}x{nkv}x{d}xf32>) -> tensor<{mk}x{nkv}x{d}xf32>\n  %{p}_v_old = linalg.fill ins(%{p}_k_f0 : f32) outs(%{p}_v_z : tensor<{mk}x{nkv}x{d}xf32>) -> tensor<{mk}x{nkv}x{d}xf32>\n"
+            ));
+            f.op_asm(format!(
+                "  %{p}_k_new = tensor.insert_slice %{p}_kc into %{p}_k_old[0, 0, 0] [{s}, {nkv}, {d}] [1, 1, 1] : tensor<{s}x{nkv}x{d}xf32> into tensor<{mk}x{nkv}x{d}xf32>\n  %{p}_v_new = tensor.insert_slice %{p}_vc into %{p}_v_old[0, 0, 0] [{s}, {nkv}, {d}] [1, 1, 1] : tensor<{s}x{nkv}x{d}xf32> into tensor<{mk}x{nkv}x{d}xf32>\n"
+            ));
+            f.op_asm(format!(
+                "  util.global.store %{p}_k_new, @kv_k{layer} : tensor<{mk}x{nkv}x{d}xf32>\n  util.global.store %{p}_v_new, @kv_v{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
             ));
         }
-        // Seed mutable KV at positions [0, seq). Always start from zeros so the
-        // [seq, max_kv) tail cannot retain garbage (mutable global zero-init is
-        // not reliable on the IREE CPU path once max_kv > prefill_window).
-        f.op_asm(format!(
-            "  %{p}_k_z = tensor.empty() : tensor<{mk}x{nkv}x{d}xf32>\n"
-        ));
-        f.op_asm(format!(
-            "  %{p}_v_z = tensor.empty() : tensor<{mk}x{nkv}x{d}xf32>\n"
-        ));
-        f.op_asm(format!("  %{p}_k_f0 = arith.constant 0.0 : f32\n"));
-        f.op_asm(format!(
-            "  %{p}_k_old = linalg.fill ins(%{p}_k_f0 : f32) outs(%{p}_k_z : tensor<{mk}x{nkv}x{d}xf32>) -> tensor<{mk}x{nkv}x{d}xf32>\n"
-        ));
-        f.op_asm(format!(
-            "  %{p}_v_old = linalg.fill ins(%{p}_k_f0 : f32) outs(%{p}_v_z : tensor<{mk}x{nkv}x{d}xf32>) -> tensor<{mk}x{nkv}x{d}xf32>\n"
-        ));
-        f.op_asm(format!(
-            "  %{p}_k_new = tensor.insert_slice %{p}_kc into %{p}_k_old[0, 0, 0] [{s}, {nkv}, {d}] [1, 1, 1] : tensor<{s}x{nkv}x{d}xf32> into tensor<{mk}x{nkv}x{d}xf32>\n"
-        ));
-        f.op_asm(format!(
-            "  %{p}_v_new = tensor.insert_slice %{p}_vc into %{p}_v_old[0, 0, 0] [{s}, {nkv}, {d}] [1, 1, 1] : tensor<{s}x{nkv}x{d}xf32> into tensor<{mk}x{nkv}x{d}xf32>\n"
-        ));
-        f.op_asm(format!(
-            "  util.global.store %{p}_k_new, @kv_k{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
-        ));
-        f.op_asm(format!(
-            "  util.global.store %{p}_v_new, @kv_v{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
-        ));
         emit_linear_call(
             &mut f,
             c,
@@ -1674,6 +2359,8 @@ mod tests {
             num_layers: 28,
             seq: LARGE_PREFILL_WINDOW,
             max_kv: LARGE_MAX_KV,
+            paged_kv: false,
+            iree_flash_attention: false,
             rms_norm_eps: 1e-6,
             rope_theta: Some(1_000_000.0),
             has_qk_norm: true,
@@ -1694,7 +2381,7 @@ mod tests {
 
     #[test]
     fn tiny_mha_still_supported() {
-        let c = DenseDecoderConfig {
+        let mut c = DenseDecoderConfig {
             vocab: 32,
             hidden: 64,
             intermediate: 128,
@@ -1704,6 +2391,8 @@ mod tests {
             num_layers: 1,
             seq: TINY_PREFILL_WINDOW,
             max_kv: TINY_MAX_KV,
+            paged_kv: false,
+            iree_flash_attention: false,
             rms_norm_eps: 1e-5,
             rope_theta: None,
             has_qk_norm: false,
@@ -1716,6 +2405,20 @@ mod tests {
         };
         assert!(c.supports_dense_emit());
         assert!(c.is_synthetic_fixture());
+        c.paged_kv = true;
+        c.max_kv = 1024;
+        let mlir = emit_dense_decoder_cfg("test.paged", &c).expect("paged MLIR verifies");
+        assert!(mlir.contains("@layer_page"));
+        assert!(!mlir.contains("!util.list<"));
+        assert!(mlir.contains("@paged_attn_max"));
+        assert!(!mlir.contains("tensor<4x4096x4096"));
+        crate::compile_mlir_prefer_inprocess(
+            &mlir,
+            &dyninfer_core::TargetProfile::llvm_cpu_host(),
+            false,
+            None,
+        )
+        .expect("paged MLIR compiles through IREE");
     }
 
     #[test]
@@ -1747,6 +2450,8 @@ mod tests {
             num_layers: 1,
             seq: TINY_PREFILL_WINDOW,
             max_kv: TINY_MAX_KV,
+            paged_kv: false,
+            iree_flash_attention: false,
             rms_norm_eps: 1e-5,
             rope_theta: None,
             has_qk_norm: false,
@@ -1796,6 +2501,8 @@ mod tests {
             num_layers: 1,
             seq: 4,
             max_kv: 8,
+            paged_kv: false,
+            iree_flash_attention: false,
             rms_norm_eps: 1e-5,
             rope_theta: Some(10000.0),
             has_qk_norm: true,

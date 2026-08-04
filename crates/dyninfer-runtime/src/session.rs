@@ -1,5 +1,5 @@
-use crate::ModelSession;
-use dyninfer_core::{KvCacheDescriptor, ModelMetadata, SessionConfig, TokenId};
+use crate::{KvCacheMetrics, ModelSession};
+use dyninfer_core::{KvCacheDescriptor, KvCacheStorage, ModelMetadata, SessionConfig, TokenId};
 use dyninfer_error::{DynInferError, IreeRuntimeError, Result};
 use iree_runtime::Context;
 use std::sync::Arc;
@@ -73,6 +73,16 @@ impl IreeSession {
         }
         (window, (n as i64) - 1)
     }
+
+    fn paged_geometry(&self) -> Option<(usize, usize)> {
+        match self.kv.storage {
+            KvCacheStorage::StaticGlobals => None,
+            KvCacheStorage::Paged {
+                page_size,
+                chunk_size,
+            } => Some((page_size as usize, chunk_size as usize)),
+        }
+    }
 }
 
 impl ModelSession for IreeSession {
@@ -93,7 +103,7 @@ impl ModelSession for IreeSession {
                 status_code: None,
             }));
         }
-        if tokens.len() > self.prefill_window {
+        if self.paged_geometry().is_none() && tokens.len() > self.prefill_window {
             return Err(DynInferError::IreeRuntime(IreeRuntimeError {
                 message: format!(
                     "prefill length {} exceeds compiled window {}",
@@ -116,8 +126,23 @@ impl ModelSession for IreeSession {
         }
         self.history.clear();
         self.history.extend_from_slice(tokens);
-        let (window, last) = self.window_from_tokens(tokens);
-        let values = self.context.invoke_prefill(&window, last)?;
+        let values = if let Some((page_size, chunk_size)) = self.paged_geometry() {
+            self.context.reset_paged_kv()?;
+            let mut logits = Vec::new();
+            for (chunk_index, chunk) in tokens.chunks(chunk_size).enumerate() {
+                let start = chunk_index * chunk_size;
+                let required_pages = (start + chunk.len()).div_ceil(page_size);
+                self.context.ensure_kv_pages(required_pages)?;
+                let (window, last) = self.window_from_tokens(chunk);
+                logits = self
+                    .context
+                    .invoke_paged_chunk(&window, last, start as i64)?;
+            }
+            logits
+        } else {
+            let (window, last) = self.window_from_tokens(tokens);
+            self.context.invoke_prefill(&window, last)?
+        };
         if values.len() != self.metadata.vocabulary_size as usize {
             return Err(DynInferError::IreeRuntime(IreeRuntimeError {
                 message: format!(
@@ -144,7 +169,6 @@ impl ModelSession for IreeSession {
             }));
         }
         let max_seq = self.max_seq();
-        let max_kv = self.kv.max_sequence_length.max(1) as usize;
         // Position is the write index into KV; once it reaches the session or
         // compiled limit, refuse rather than re-decoding at a stale position.
         if self.position >= max_seq {
@@ -156,10 +180,18 @@ impl ModelSession for IreeSession {
                 status_code: None,
             }));
         }
-        iree_runtime::fill_causal_attn_bias(&mut self.attn_bias, self.position as i64, max_kv);
-        let values =
+        let values = if let Some((page_size, _)) = self.paged_geometry() {
             self.context
-                .invoke_decode(i64::from(token), self.position as i64, &self.attn_bias)?;
+                .ensure_kv_pages((self.position as usize + 1).div_ceil(page_size))?;
+            let (window, last) = self.window_from_tokens(&[token]);
+            self.context
+                .invoke_paged_chunk(&window, last, self.position as i64)?
+        } else {
+            let max_kv = self.kv.max_sequence_length.max(1) as usize;
+            iree_runtime::fill_causal_attn_bias(&mut self.attn_bias, self.position as i64, max_kv);
+            self.context
+                .invoke_decode(i64::from(token), self.position as i64, &self.attn_bias)?
+        };
         if values.len() != self.metadata.vocabulary_size as usize {
             return Err(DynInferError::IreeRuntime(IreeRuntimeError {
                 message: format!(
@@ -180,8 +212,23 @@ impl ModelSession for IreeSession {
     }
 
     fn reset(&mut self) -> Result<()> {
+        if self.paged_geometry().is_some() {
+            self.context.reset_paged_kv()?;
+        }
         self.position = 0;
         self.history.clear();
         Ok(())
+    }
+
+    fn kv_cache_metrics(&self) -> Result<KvCacheMetrics> {
+        let (page_count, allocated_bytes) = if self.paged_geometry().is_some() {
+            self.context.paged_kv_metrics()?
+        } else {
+            (0, 0)
+        };
+        Ok(KvCacheMetrics {
+            page_count,
+            allocated_bytes,
+        })
     }
 }

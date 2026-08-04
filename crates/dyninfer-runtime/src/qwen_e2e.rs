@@ -437,4 +437,54 @@ mod tests {
         assert!(out.token_ids.len() > 1);
         let _ = Path::new(".");
     }
+
+    #[test]
+    fn qwen3_4k_paged_prompt_on_hip() {
+        if std::env::var_os("DYNINFER_QWEN3_PAGED_E2E").is_none() {
+            eprintln!("skipping: set DYNINFER_QWEN3_PAGED_E2E=1 for 4K HIP qualification");
+            return;
+        }
+        let Some(model_dir) = qwen3_dir() else {
+            eprintln!("skipping: Qwen3-0.6B not available");
+            return;
+        };
+        let ckpt = find_safetensors_checkpoint(&model_dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("paged.bundle");
+        let loader = ModelLoader::default();
+        let id = ArchitectureId::new("qwen3.decoder");
+        let overrides = dyninfer_core::MetadataMap::from([
+            ("prefill_window".into(), serde_json::json!(4096)),
+            ("max_kv".into(), serde_json::json!(4224)),
+        ]);
+        loader
+            .compile_to_bundle_with_overrides(
+                &id,
+                &ckpt,
+                "hip",
+                &bundle,
+                &CompileOptions {
+                    mode: "local-jit".into(),
+                    ..Default::default()
+                },
+                &overrides,
+            )
+            .unwrap();
+        let model = loader.load_bundle(&bundle, &ckpt).unwrap();
+        assert_eq!(model.manifest.version, 3);
+        let mut session = model
+            .create_session(SessionConfig {
+                max_sequence_length: 4224,
+                ..SessionConfig::default()
+            })
+            .unwrap();
+        let tokens: Vec<u32> = (0..4096).map(|index| 100 + index % 97).collect();
+        let prefill = session.prefill(&tokens).unwrap();
+        assert!(prefill.values.iter().all(|value| value.is_finite()));
+        let decode = session.decode(42).unwrap();
+        assert!(decode.values.iter().all(|value| value.is_finite()));
+        let metrics = session.kv_cache_metrics().unwrap();
+        assert_eq!(metrics.page_count, 17);
+        assert!(metrics.allocated_bytes < 1024 * 1024 * 1024);
+    }
 }

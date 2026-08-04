@@ -42,9 +42,18 @@ pub trait CausalLanguageModel: Send + Sync {
     fn create_session(&self, config: SessionConfig) -> Result<Box<dyn ModelSession>>;
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KvCacheMetrics {
+    pub page_count: usize,
+    pub allocated_bytes: usize,
+}
+
 pub trait ModelSession: Send {
     fn prefill(&mut self, tokens: &[TokenId]) -> Result<Logits>;
     fn decode(&mut self, token: TokenId) -> Result<Logits>;
     fn position(&self) -> u64;
     fn reset(&mut self) -> Result<()>;
+    fn kv_cache_metrics(&self) -> Result<KvCacheMetrics> {
+        Ok(KvCacheMetrics::default())
+    }
 }

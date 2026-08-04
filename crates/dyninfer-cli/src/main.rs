@@ -115,10 +115,10 @@ enum Commands {
         max_new_tokens: usize,
         #[arg(long)]
         output_bundle: Option<PathBuf>,
-        /// Prefill token window baked into the compiled executable (recompile to change).
+        /// Legacy prefill window. Paged executables use chunks up to 2048 tokens.
         #[arg(long)]
         prefill_window: Option<u32>,
-        /// Mutable KV capacity baked into the executable (`>= prefill_window`).
+        /// Session/model context limit. Values above 512 select paged KV ABI v3.
         #[arg(long)]
         max_kv: Option<u32>,
     },
@@ -455,7 +455,11 @@ fn main() -> anyhow::Result<()> {
                     max_new_tokens,
                     eos_token_id: eos,
                 },
-                SessionConfig::default(),
+                SessionConfig {
+                    max_sequence_length: max_kv
+                        .unwrap_or(model.manifest.kv_cache.max_sequence_length),
+                    ..SessionConfig::default()
+                },
             )?;
             print_generate_result(&out);
         }
@@ -555,12 +559,14 @@ fn print_generate_result(out: &GenerateOutput) {
     println!("{}", out.text);
     let s = &out.stats;
     eprintln!(
-        "prefill: {} tok in {:.3}s ({:.1} tok/s)  decode: {} tok in {:.3}s ({:.1} tok/s)",
+        "prefill: {} tok in {:.3}s ({:.1} tok/s)  decode: {} tok in {:.3}s ({:.1} tok/s)  KV: {} pages ({:.1} MiB)",
         s.prompt_tokens,
         s.prefill_secs,
         s.prefill_tps(),
         s.generated_tokens,
         s.decode_secs,
         s.decode_tps(),
+        s.kv_page_count,
+        s.kv_allocated_bytes as f64 / (1024.0 * 1024.0),
     );
 }

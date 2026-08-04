@@ -275,7 +275,8 @@ impl ArtifactCache {
     }
 
     fn lock_is_stale(&self, path: &Path) -> bool {
-        // Treat locks older than 5 minutes as abandoned (crash / kill -9).
+        // Only reclaim an old lock after its recorded holder has exited. A
+        // valid compile may legitimately take longer than this threshold.
         const STALE_SECS: u64 = 300;
         let Ok(meta) = fs::metadata(path) else {
             return true;
@@ -286,8 +287,26 @@ impl ArtifactCache {
         let Ok(age) = modified.elapsed() else {
             return true;
         };
-        age.as_secs() >= STALE_SECS
+        if age.as_secs() < STALE_SECS {
+            return false;
+        }
+
+        let holder_is_alive = fs::read_to_string(path)
+            .ok()
+            .and_then(|contents| contents.trim().parse::<u32>().ok())
+            .is_some_and(process_is_running);
+        !holder_is_alive
     }
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_running(pid: u32) -> bool {
+    pid != 0 && Path::new("/proc").join(pid.to_string()).exists()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_is_running(_pid: u32) -> bool {
+    false
 }
 
 struct PublishLockGuard {
@@ -402,6 +421,7 @@ mod tests {
                 element_type: ScalarType::F16,
                 layout: KvCacheLayout::LayersHeadsSeqDim,
                 alignment: 64,
+                storage: dyninfer_core::KvCacheStorage::StaticGlobals,
             },
             parameter_scope: "weights".into(),
             parameter_components: vec![],
@@ -432,5 +452,11 @@ mod tests {
         a.precision_policy_digest = "conservative-v1".into();
         b.precision_policy_digest = "conservative-v2".into();
         assert_ne!(a.digest().unwrap().as_str(), b.digest().unwrap().as_str());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detects_live_lock_holder() {
+        assert!(process_is_running(std::process::id()));
     }
 }

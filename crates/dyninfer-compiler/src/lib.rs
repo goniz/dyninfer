@@ -16,15 +16,16 @@ pub use mlir_emit::{emit_add_smoke_module, emit_bridge_module};
 
 use dyninfer_architecture::ArchitecturePackage;
 use dyninfer_core::{
-    BindingPlan, BoundModel, ExecutableManifest, ExecutionMode, KvCacheDescriptor, KvCacheLayout,
-    ManifestParameterComponent, OperationKind, PrecisionPolicy, ScalarType, SchemaFingerprint,
-    SelectedKernel, ShapeProfile, SpecializedExecutionShape, TargetProfile,
+    BindingPlan, BoundModel, ExecutableManifest, ExecutionMode, KernelId, KvCacheDescriptor,
+    KvCacheLayout, KvCacheStorage, LoweringId, ManifestParameterComponent, OperationKind,
+    PrecisionPolicy, ScalarType, SchemaFingerprint, SelectedKernel, ShapeProfile,
+    SpecializedExecutionShape, TargetProfile,
 };
 use dyninfer_error::{CompilationError, Diagnostic, DynInferError, Result, Severity};
 use serde::{Deserialize, Serialize};
 use tracing::{info, info_span};
 
-pub const COMPILER_VERSION: &str = "0.2.0-iree-3.11.0-bound-model-ir";
+pub const COMPILER_VERSION: &str = "0.3.0-iree-3.11.0-paged-kv-v3";
 /// Pinned IREE pip / source revision identity for executable cache keys (spec §19.1).
 pub const IREE_REVISION: &str = "3.11.0+e4a3b0405d7d";
 /// Kernel registry policy version included in executable cache keys.
@@ -69,6 +70,8 @@ pub struct LoweringOutput {
     pub mlir_text: String,
     pub prefill_window: u32,
     pub max_kv: u32,
+    pub paged_kv: bool,
+    pub num_layers: u32,
 }
 
 /// Resolve the bounded static shapes used by the initial prefill/decode ABI.
@@ -117,18 +120,39 @@ pub fn build_bound_model(
     binding: &BindingPlan,
     target: &TargetProfile,
     precision_policy: &PrecisionPolicy,
-    selected_kernels: Vec<SelectedKernel>,
+    mut selected_kernels: Vec<SelectedKernel>,
     shape_profile: &ShapeProfile,
 ) -> Result<BoundModel> {
     dyninfer_architecture::verify_architecture_graph(&architecture.graph)?;
     let batch_size = shape_profile.batch_sizes.first().copied().unwrap_or(1);
-    let prefill = shape_profile
+    let requested_prefill = shape_profile
         .sequence_buckets
         .first()
         .copied()
         .unwrap_or(1)
         .max(1);
-    let max_kv = shape_profile.max_sequence_length.max(prefill);
+    let max_kv = shape_profile.max_sequence_length.max(requested_prefill);
+    let paged = max_kv > 512;
+    let prefill = if paged {
+        lowering::PAGED_PREFILL_CHUNK_SIZE
+    } else {
+        requested_prefill
+    };
+    if paged {
+        let attention_ops: std::collections::BTreeSet<_> = architecture
+            .graph
+            .operations
+            .iter()
+            .filter(|operation| matches!(operation.kind, OperationKind::Attention { .. }))
+            .map(|operation| operation.id.clone())
+            .collect();
+        for selected in &mut selected_kernels {
+            if attention_ops.contains(&selected.operation_id) {
+                selected.kernel_id = KernelId::new("attention.online_paged.generated.f32");
+                selected.lowering_id = LoweringId::new("attention.online_paged.generated");
+            }
+        }
+    }
     Ok(BoundModel {
         version: 1,
         architecture: architecture.graph.clone(),
@@ -186,6 +210,8 @@ pub fn lower_bound_model(bound: &BoundModel) -> Result<LoweringOutput> {
         mlir_text,
         prefill_window: config.seq,
         max_kv: config.max_kv,
+        paged_kv: config.paged_kv,
+        num_layers: config.num_layers,
     })
 }
 
@@ -262,7 +288,9 @@ fn lowering_matches_operation(operation: &OperationKind, lowering: &str) -> bool
         OperationKind::Rope { .. } => lowering == "rope.generated",
         OperationKind::KvCacheWrite { .. } => lowering == "kv_cache.write.generated",
         OperationKind::KvCacheRead { .. } => lowering == "kv_cache.read.generated",
-        OperationKind::Attention { .. } => lowering == "attention.gqa.generated",
+        OperationKind::Attention { .. } => {
+            lowering == "attention.gqa.generated" || lowering == "attention.online_paged.generated"
+        }
         OperationKind::Elementwise {
             function: dyninfer_core::ElementwiseFunction::Silu,
         } => lowering == "elementwise.silu.generated",
@@ -373,6 +401,8 @@ impl ModelCompiler for LocalCompiler {
                 mlir_text: emit_add_smoke_module().to_string(),
                 prefill_window: 4,
                 max_kv: 4,
+                paged_kv: false,
+                num_layers: 0,
             }
         } else {
             lower_bound_model(request.bound_model)?
@@ -424,19 +454,39 @@ impl ModelCompiler for LocalCompiler {
             .map(|value| value as u32)
             .unwrap_or(1);
         let prefill_window = lowering.prefill_window;
+        let paged_kv = lowering.paged_kv;
+        let num_layers = lowering.num_layers;
         validate_binding_for_compile(&request.bound_model.binding)?;
         let manifest = ExecutableManifest {
             format: "dyninfer.bundle".into(),
-            version: 2,
+            version: if paged_kv { 3 } else { 2 },
             architecture_id: request.bound_model.architecture.architecture_id.clone(),
             architecture_revision: request.architecture_revision.into(),
             checkpoint_schema: request.checkpoint_schema.clone(),
             target: request.bound_model.target.clone(),
             precision_policy: request.bound_model.precision_policy.clone(),
             selected_kernels: request.bound_model.selected_kernels.clone(),
-            shape_profile: request.shape_profile.clone(),
+            shape_profile: if paged_kv {
+                let mut profile = request.shape_profile.clone();
+                profile.sequence_buckets = vec![lowering::PAGED_PREFILL_CHUNK_SIZE];
+                profile
+            } else {
+                request.shape_profile.clone()
+            },
             entrypoints: if request.options.smoke_only {
                 vec!["add".into()]
+            } else if paged_kv {
+                let mut entries = vec![
+                    "chunk_begin".into(),
+                    "layer_page".into(),
+                    "chunk_logits".into(),
+                    "add".into(),
+                ];
+                for layer in 0..num_layers {
+                    entries.push(format!("layer_prepare_{layer}"));
+                    entries.push(format!("layer_finish_{layer}"));
+                }
+                entries
             } else {
                 vec!["prefill".into(), "decode".into(), "add".into()]
             },
@@ -466,6 +516,14 @@ impl ModelCompiler for LocalCompiler {
                 element_type: ScalarType::F32,
                 layout: KvCacheLayout::LayersHeadsSeqDim,
                 alignment: 64,
+                storage: if paged_kv {
+                    KvCacheStorage::Paged {
+                        page_size: lowering::PAGED_KV_PAGE_SIZE,
+                        chunk_size: lowering::PAGED_PREFILL_CHUNK_SIZE,
+                    }
+                } else {
+                    KvCacheStorage::StaticGlobals
+                },
             },
             parameter_scope: "weights".into(),
             parameter_components: request

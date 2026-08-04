@@ -5,6 +5,7 @@ mod kernels;
 pub(super) mod parameter;
 
 pub use dense_decoder::{
-    DenseDecoderConfig, LARGE_MAX_KV, LARGE_PREFILL_WINDOW, PREFILL_MAX_KV, PREFILL_WINDOW,
-    TINY_MAX_KV, TINY_PREFILL_WINDOW, emit_dense_decoder_cfg,
+    DenseDecoderConfig, LARGE_MAX_KV, LARGE_PREFILL_WINDOW, PAGED_KV_PAGE_SIZE,
+    PAGED_PREFILL_CHUNK_SIZE, PREFILL_MAX_KV, PREFILL_WINDOW, TINY_MAX_KV, TINY_PREFILL_WINDOW,
+    emit_dense_decoder_cfg,
 };

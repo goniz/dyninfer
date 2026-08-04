@@ -404,6 +404,78 @@ impl Context {
         fill_causal_attn_bias(&mut bias, pos, max_kv);
         self.invoke_decode(token, pos, &bias)
     }
+
+    pub fn configure_paged_kv(
+        &self,
+        layer_count: usize,
+        page_size: usize,
+        kv_head_count: usize,
+        head_dim: usize,
+        chunk_size: usize,
+    ) -> Result<()> {
+        self.with_session(|session| {
+            let rc = unsafe {
+                sys::dyninfer_iree_session_configure_paged_kv(
+                    session,
+                    layer_count,
+                    page_size,
+                    kv_head_count,
+                    head_dim,
+                    chunk_size,
+                )
+            };
+            (rc == 0).then_some(()).ok_or_else(|| native_error(rc))
+        })
+    }
+
+    pub fn ensure_kv_pages(&self, page_count: usize) -> Result<()> {
+        self.with_session(|session| {
+            let rc = unsafe { sys::dyninfer_iree_session_ensure_kv_pages(session, page_count) };
+            (rc == 0).then_some(()).ok_or_else(|| native_error(rc))
+        })
+    }
+
+    pub fn invoke_paged_chunk(
+        &self,
+        tokens: &[i64],
+        last: i64,
+        start_pos: i64,
+    ) -> Result<Vec<f32>> {
+        self.with_session(|session| {
+            let mut out = ptr::null_mut();
+            let mut count = 0usize;
+            let rc = unsafe {
+                sys::dyninfer_iree_session_invoke_paged_chunk(
+                    session,
+                    tokens.as_ptr(),
+                    tokens.len(),
+                    last,
+                    start_pos,
+                    &mut out,
+                    &mut count,
+                )
+            };
+            take_f32_buf(rc, out, count)
+        })
+    }
+
+    pub fn reset_paged_kv(&self) -> Result<()> {
+        self.with_session(|session| {
+            let rc = unsafe { sys::dyninfer_iree_session_reset_paged_kv(session) };
+            (rc == 0).then_some(()).ok_or_else(|| native_error(rc))
+        })
+    }
+
+    pub fn paged_kv_metrics(&self) -> Result<(usize, usize)> {
+        self.with_session(|session| {
+            Ok(unsafe {
+                (
+                    sys::dyninfer_iree_session_kv_page_count(session),
+                    sys::dyninfer_iree_session_kv_allocated_bytes(session),
+                )
+            })
+        })
+    }
 }
 
 /// Fill `bias` in-place: `0` for `j <= pos`, else `-1e7`. Reuses capacity.

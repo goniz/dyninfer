@@ -18,9 +18,16 @@ if [[ -z "${RUNFILES_DIR}" && -n "${RUNFILES_MANIFEST_FILE:-}" ]]; then
   for key in \
       iree_compiler_linux_x86_64/iree/compiler/_mlir_libs/iree-compile \
       iree_compiler_linux_aarch64/iree/compiler/_mlir_libs/iree-compile; do
-    line="$(grep -F " ${key}" "${RUNFILES_MANIFEST_FILE}" | head -1 || true)"
-    if [[ -n "${line}" ]]; then
-      exec "${line##* }" "$@"
+    target="$(
+      awk -v key="${key}" \
+        '$1 == key || $1 == "+http_archive+" key {
+          print substr($0, index($0, " ") + 1)
+          exit
+        }' \
+        "${RUNFILES_MANIFEST_FILE}"
+    )"
+    if [[ -n "${target}" ]]; then
+      exec "${target}" "$@"
     fi
   done
   echo "iree-compile not found in runfiles manifest" >&2

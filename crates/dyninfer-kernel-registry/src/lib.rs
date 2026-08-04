@@ -272,7 +272,7 @@ pub struct KernelRegistry {
 
 impl KernelRegistry {
     /// Bump whenever candidate interpretation or selection ordering changes.
-    pub const VERSION: &'static str = "4";
+    pub const VERSION: &'static str = "5";
 
     pub fn new() -> Self {
         Self::default()
@@ -475,6 +475,22 @@ pub fn register_builtin_semantic_candidates(registry: &mut KernelRegistry) -> Re
             notes: "Architecture-independent generated lowering".into(),
         })?;
     }
+    registry.register(KernelCandidateDescriptor {
+        id: KernelId::new("attention.online_paged.generated.f32"),
+        operation: KernelOperationKind::Attention,
+        encoding: None,
+        input_types: vec![ScalarType::F32],
+        output_types: vec![ScalarType::F32],
+        accumulator_types: vec![ScalarType::F32],
+        shape: ShapeConstraint::default(),
+        orientations: vec![ParameterOrientation::Native],
+        target: TargetConstraint::any(),
+        modes: vec![ExecutionMode::Prefill, ExecutionMode::Decode],
+        lowering: LoweringId::new("attention.online_paged.generated"),
+        deterministic_score: 90,
+        readiness: ProductionReadiness::Production,
+        notes: "Runtime-paged online-softmax attention".into(),
+    })?;
     Ok(())
 }
 

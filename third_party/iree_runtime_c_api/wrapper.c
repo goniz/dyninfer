@@ -23,6 +23,15 @@ struct dyninfer_iree_session_t {
   size_t decode_bias_len;
   float* logits_host;
   size_t logits_capacity;
+  iree_hal_buffer_view_t** kv_pages;
+  size_t kv_page_count;
+  size_t kv_page_capacity;
+  size_t kv_layer_count;
+  size_t kv_page_size;
+  size_t kv_head_count;
+  size_t kv_head_dim;
+  size_t kv_chunk_size;
+  size_t kv_allocated_bytes;
 };
 
 static char g_last_error[2048] = {0};
@@ -350,6 +359,10 @@ void dyninfer_iree_session_destroy(dyninfer_iree_session_t* session) {
   iree_hal_buffer_view_release(session->decode_token);
   iree_hal_buffer_view_release(session->decode_pos);
   iree_hal_buffer_view_release(session->decode_bias);
+  for (size_t i = 0; i < session->kv_page_count; ++i) {
+    iree_hal_buffer_view_release(session->kv_pages[i]);
+  }
+  free(session->kv_pages);
   free(session->logits_host);
   iree_runtime_session_release(session->session);
   iree_hal_device_release(session->device);
@@ -487,4 +500,229 @@ int dyninfer_iree_session_invoke_decode(dyninfer_iree_session_t* session,
     return 1;
   }
   return 0;
+}
+
+static iree_status_t invoke_void(dyninfer_iree_session_t* wrapper,
+                                 const char* full_name,
+                                 iree_hal_buffer_view_t** inputs,
+                                 iree_host_size_t input_count) {
+  iree_runtime_call_t call;
+  IREE_RETURN_IF_ERROR(iree_runtime_call_initialize_by_name(
+      wrapper->session, iree_make_cstring_view(full_name), &call));
+  iree_status_t status = iree_ok_status();
+  for (iree_host_size_t i = 0; iree_status_is_ok(status) && i < input_count;
+       ++i) {
+    status = iree_runtime_call_inputs_push_back_buffer_view(&call, inputs[i]);
+  }
+  if (iree_status_is_ok(status)) {
+    status = iree_runtime_call_invoke(&call, /*flags=*/0);
+  }
+  iree_runtime_call_deinitialize(&call);
+  return status;
+}
+
+static iree_status_t invoke_buffer_view(
+    dyninfer_iree_session_t* wrapper, const char* full_name,
+    iree_hal_buffer_view_t** inputs, iree_host_size_t input_count,
+    iree_hal_buffer_view_t** out_view) {
+  *out_view = NULL;
+  iree_runtime_call_t call;
+  IREE_RETURN_IF_ERROR(iree_runtime_call_initialize_by_name(
+      wrapper->session, iree_make_cstring_view(full_name), &call));
+  iree_status_t status = iree_ok_status();
+  for (iree_host_size_t i = 0; iree_status_is_ok(status) && i < input_count;
+       ++i) {
+    status = iree_runtime_call_inputs_push_back_buffer_view(&call, inputs[i]);
+  }
+  if (iree_status_is_ok(status)) {
+    status = iree_runtime_call_invoke(&call, /*flags=*/0);
+  }
+  if (iree_status_is_ok(status)) {
+    status = iree_runtime_call_outputs_pop_front_buffer_view(&call, out_view);
+  }
+  iree_runtime_call_deinitialize(&call);
+  return status;
+}
+
+int dyninfer_iree_session_configure_paged_kv(
+    dyninfer_iree_session_t* session, size_t layer_count, size_t page_size,
+    size_t kv_head_count, size_t head_dim, size_t chunk_size) {
+  if (!session || layer_count == 0 || page_size == 0 || kv_head_count == 0 ||
+      head_dim == 0 || chunk_size == 0 ||
+      (page_size % chunk_size != 0 && chunk_size % page_size != 0)) {
+    set_error_msg("invalid paged KV configuration");
+    return 1;
+  }
+  if (session->kv_page_count != 0) {
+    set_error_msg("cannot reconfigure paged KV after allocation");
+    return 1;
+  }
+  session->kv_layer_count = layer_count;
+  session->kv_page_size = page_size;
+  session->kv_head_count = kv_head_count;
+  session->kv_head_dim = head_dim;
+  session->kv_chunk_size = chunk_size;
+  return 0;
+}
+
+int dyninfer_iree_session_ensure_kv_pages(dyninfer_iree_session_t* session,
+                                          size_t page_count) {
+  if (!session || session->kv_page_size == 0) {
+    set_error_msg("paged KV is not configured");
+    return 1;
+  }
+  if (page_count <= session->kv_page_count) return 0;
+  if (session->kv_page_capacity < page_count) {
+    size_t capacity = session->kv_page_capacity ? session->kv_page_capacity : 4;
+    while (capacity < page_count) capacity *= 2;
+    iree_hal_buffer_view_t** grown = (iree_hal_buffer_view_t**)realloc(
+        session->kv_pages, capacity * sizeof(*grown));
+    if (!grown) {
+      set_error_msg("growing KV page table");
+      return 1;
+    }
+    memset(grown + session->kv_page_capacity, 0,
+           (capacity - session->kv_page_capacity) * sizeof(*grown));
+    session->kv_pages = grown;
+    session->kv_page_capacity = capacity;
+  }
+
+  size_t elements = session->kv_layer_count;
+  if (elements > SIZE_MAX / 2) {
+    set_error_msg("KV page size overflow");
+    return 1;
+  }
+  elements *= 2;
+  const size_t factors[3] = {session->kv_page_size, session->kv_head_count,
+                             session->kv_head_dim};
+  for (size_t i = 0; i < 3; ++i) {
+    if (factors[i] == 0 || elements > SIZE_MAX / factors[i]) {
+      set_error_msg("KV page size overflow");
+      return 1;
+    }
+    elements *= factors[i];
+  }
+  float* zeros = (float*)calloc(elements, sizeof(float));
+  if (!zeros) {
+    set_error_msg("allocating zero-filled KV page staging");
+    return 1;
+  }
+  iree_hal_dim_t shape[5] = {
+      (iree_hal_dim_t)session->kv_layer_count, 2,
+      (iree_hal_dim_t)session->kv_page_size,
+      (iree_hal_dim_t)session->kv_head_count,
+      (iree_hal_dim_t)session->kv_head_dim};
+  iree_status_t status = iree_ok_status();
+  while (iree_status_is_ok(status) &&
+         session->kv_page_count < page_count) {
+    iree_hal_buffer_view_t* page = NULL;
+    status = allocate_f32_tensor(session->session, 5, shape, zeros, elements,
+                                 &page);
+    if (iree_status_is_ok(status)) {
+      session->kv_pages[session->kv_page_count++] = page;
+      session->kv_allocated_bytes += elements * sizeof(float);
+    }
+  }
+  free(zeros);
+  if (!iree_status_is_ok(status)) {
+    set_error_status(status);
+    return 1;
+  }
+  return 0;
+}
+
+int dyninfer_iree_session_invoke_paged_chunk(
+    dyninfer_iree_session_t* session, const int64_t* tokens,
+    size_t token_count, int64_t last, int64_t start_pos, float** out_logits,
+    size_t* out_count) {
+  *out_logits = NULL;
+  *out_count = 0;
+  if (!session || !tokens || token_count != session->kv_chunk_size ||
+      last < 0 || (size_t)last >= token_count || start_pos < 0) {
+    set_error_msg("invalid paged chunk invocation");
+    return 1;
+  }
+  iree_hal_dim_t token_shape[1] = {(iree_hal_dim_t)token_count};
+  iree_hal_buffer_view_t *v_tokens = NULL, *v_last = NULL, *v_start = NULL,
+                         *v_page_index = NULL, *v_layer_index = NULL;
+  iree_status_t status = allocate_i64_tensor(session->session, 1, token_shape,
+                                              tokens, token_count, &v_tokens);
+  if (iree_status_is_ok(status))
+    status = allocate_i64_tensor(session->session, 0, NULL, &last, 1, &v_last);
+  if (iree_status_is_ok(status))
+    status =
+        allocate_i64_tensor(session->session, 0, NULL, &start_pos, 1, &v_start);
+  iree_hal_buffer_view_t* begin_inputs[3] = {v_tokens, v_last, v_start};
+  if (iree_status_is_ok(status))
+    status = invoke_void(session, "module.chunk_begin", begin_inputs, 3);
+
+  char function_name[96];
+  for (size_t layer = 0;
+       iree_status_is_ok(status) && layer < session->kv_layer_count; ++layer) {
+    snprintf(function_name, sizeof(function_name), "module.layer_prepare_%zu",
+             layer);
+    status = invoke_void(session, function_name, NULL, 0);
+    if (iree_status_is_ok(status)) {
+      status = ensure_i64_scalar_view(session->session, &v_layer_index,
+                                      (int64_t)layer);
+    }
+    for (size_t page_index = 0;
+         iree_status_is_ok(status) && page_index < session->kv_page_count;
+         ++page_index) {
+      int64_t page_index_i64 = (int64_t)page_index;
+      status = ensure_i64_scalar_view(session->session, &v_page_index,
+                                      page_index_i64);
+      if (!iree_status_is_ok(status)) break;
+      iree_hal_buffer_view_t* page_inputs[4] = {
+          session->kv_pages[page_index], v_page_index, v_start, v_layer_index};
+      iree_hal_buffer_view_t* updated = NULL;
+      status = invoke_buffer_view(session, "module.layer_page", page_inputs, 4,
+                                  &updated);
+      if (iree_status_is_ok(status)) {
+        iree_hal_buffer_view_release(session->kv_pages[page_index]);
+        session->kv_pages[page_index] = updated;
+      }
+    }
+    if (iree_status_is_ok(status)) {
+      snprintf(function_name, sizeof(function_name), "module.layer_finish_%zu",
+               layer);
+      status = invoke_void(session, function_name, NULL, 0);
+    }
+  }
+  iree_hal_buffer_view_t* logits_input[1] = {v_last};
+  if (iree_status_is_ok(status)) {
+    status = invoke_named(session, "module.chunk_logits", logits_input, 1,
+                          out_logits, out_count);
+  }
+  iree_hal_buffer_view_release(v_tokens);
+  iree_hal_buffer_view_release(v_last);
+  iree_hal_buffer_view_release(v_start);
+  iree_hal_buffer_view_release(v_page_index);
+  iree_hal_buffer_view_release(v_layer_index);
+  if (!iree_status_is_ok(status)) {
+    set_error_status(status);
+    return 1;
+  }
+  return 0;
+}
+
+int dyninfer_iree_session_reset_paged_kv(dyninfer_iree_session_t* session) {
+  if (!session) return 1;
+  for (size_t i = 0; i < session->kv_page_count; ++i) {
+    iree_hal_buffer_view_release(session->kv_pages[i]);
+    session->kv_pages[i] = NULL;
+  }
+  session->kv_page_count = 0;
+  session->kv_allocated_bytes = 0;
+  return 0;
+}
+
+size_t dyninfer_iree_session_kv_page_count(
+    const dyninfer_iree_session_t* session) {
+  return session ? session->kv_page_count : 0;
+}
+
+size_t dyninfer_iree_session_kv_allocated_bytes(
+    const dyninfer_iree_session_t* session) {
+  return session ? session->kv_allocated_bytes : 0;
 }

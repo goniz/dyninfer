@@ -70,6 +70,23 @@ int dyninfer_iree_session_invoke_decode(dyninfer_iree_session_t* session,
                                         const float* attn_bias, size_t bias_len,
                                         float** out_logits, size_t* out_count);
 
+// ABI v3 paged KV. Pages are independent device-local tensors with shape
+// [layers, 2, page_size, kv_heads, head_dim].
+int dyninfer_iree_session_configure_paged_kv(
+    dyninfer_iree_session_t* session, size_t layer_count, size_t page_size,
+    size_t kv_head_count, size_t head_dim, size_t chunk_size);
+int dyninfer_iree_session_ensure_kv_pages(dyninfer_iree_session_t* session,
+                                          size_t page_count);
+int dyninfer_iree_session_invoke_paged_chunk(
+    dyninfer_iree_session_t* session, const int64_t* tokens,
+    size_t token_count, int64_t last, int64_t start_pos, float** out_logits,
+    size_t* out_count);
+int dyninfer_iree_session_reset_paged_kv(dyninfer_iree_session_t* session);
+size_t dyninfer_iree_session_kv_page_count(
+    const dyninfer_iree_session_t* session);
+size_t dyninfer_iree_session_kv_allocated_bytes(
+    const dyninfer_iree_session_t* session);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

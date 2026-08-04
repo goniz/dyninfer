@@ -12,8 +12,8 @@ use dyninfer_compiler::{
     LocalCompiler, ModelCompiler, build_bound_model, default_shape_profile,
 };
 use dyninfer_core::{
-    ArchitectureId, BindingPlan, ExecutableManifest, ModelMetadata, PrecisionPolicy, SessionConfig,
-    ShapeProfile, content_digest,
+    ArchitectureId, BindingPlan, ExecutableManifest, KvCacheStorage, ModelMetadata,
+    PrecisionPolicy, SessionConfig, ShapeProfile, content_digest,
 };
 use dyninfer_error::{CacheError, DynInferError, Result};
 use dyninfer_quantization::{CoverageReport, dry_run_coverage};
@@ -24,6 +24,45 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::info_span;
+
+fn validate_executable_abi(manifest: &ExecutableManifest, bundle: &Path) -> Result<()> {
+    if manifest.entrypoints == ["add"] {
+        return Ok(());
+    }
+    let required: &[&str] = match (&manifest.kv_cache.storage, manifest.version) {
+        (KvCacheStorage::StaticGlobals, 1 | 2) => &["prefill", "decode"],
+        (
+            KvCacheStorage::Paged {
+                page_size,
+                chunk_size,
+            },
+            3,
+        ) if *page_size > 0 && *chunk_size > 0 => &["chunk_begin", "chunk_logits"],
+        _ => {
+            return Err(DynInferError::Cache(CacheError {
+                message: format!(
+                    "unsupported executable/KV ABI version {} ({:?})",
+                    manifest.version, manifest.kv_cache.storage
+                ),
+                digest: None,
+                path: Some(bundle.display().to_string()),
+            }));
+        }
+    };
+    if let Some(missing) = required.iter().find(|entrypoint| {
+        !manifest
+            .entrypoints
+            .iter()
+            .any(|entry| entry == **entrypoint)
+    }) {
+        return Err(DynInferError::Cache(CacheError {
+            message: format!("bundle is missing required `{missing}` entrypoint"),
+            digest: None,
+            path: Some(bundle.display().to_string()),
+        }));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BundlePaths {
@@ -87,6 +126,19 @@ impl CausalLanguageModel for LoadedModel {
         // Each session must own its own context: the VMFB keeps mutable KV in
         // util.global state inside a single native IREE session.
         let context = Arc::new(self.executable.open_context()?);
+        if let KvCacheStorage::Paged {
+            page_size,
+            chunk_size,
+        } = self.manifest.kv_cache.storage
+        {
+            context.configure_paged_kv(
+                self.manifest.kv_cache.layer_count as usize,
+                page_size as usize,
+                self.manifest.kv_cache.kv_head_count as usize,
+                self.manifest.kv_cache.head_dimension as usize,
+                chunk_size as usize,
+            )?;
+        }
         Ok(Box::new(IreeSession::new(
             self.metadata.clone(),
             config,
@@ -300,6 +352,7 @@ impl ModelLoader {
         let bindings_path = bundle.join("bindings.json");
         let vmfb_path = bundle.join("executables").join("model.vmfb");
         let manifest: ExecutableManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+        validate_executable_abi(&manifest, bundle)?;
         let binding: BindingPlan = serde_json::from_slice(&fs::read(&bindings_path)?)?;
         let checkpoint = checkpoint.as_ref();
         let mut catalog = self.inspect(checkpoint)?;
