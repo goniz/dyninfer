@@ -1,0 +1,13 @@
+[package]
+name = "dyninfer-mlir-sys"
+description = "bindgen for MLIR C API symbols exported by libIREECompiler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+iree-compiler-sys = { workspace = true }
+
+[build-dependencies]
+bindgen = { workspace = true }

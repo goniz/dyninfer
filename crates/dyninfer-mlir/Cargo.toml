@@ -1,0 +1,15 @@
+[package]
+name = "dyninfer-mlir"
+description = "Melior-style MLIR module builder over the IREE-exported MLIR C API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dyninfer-error = { workspace = true }
+dyninfer-mlir-sys = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,24 @@
+[package]
+name = "dyninfer-compiler"
+description = "Safe Rust compiler orchestrator wrapper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dyninfer-architecture = { workspace = true }
+dyninfer-checkpoint = { workspace = true }
+dyninfer-core = { workspace = true }
+dyninfer-error = { workspace = true }
+dyninfer-kernel-registry = { workspace = true }
+dyninfer-mlir = { workspace = true }
+dyninfer-quantization = { workspace = true }
+iree-compiler-sys = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

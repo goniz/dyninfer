@@ -1,0 +1,30 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["wrapper.h"])
+
+cc_library(
+    name = "headers",
+    hdrs = ["wrapper.h"],
+    includes = ["."],
+)
+
+# In-process IREE runtime session wrapper (links source-built @iree_core).
+cc_library(
+    name = "iree_runtime_c_api",
+    srcs = ["wrapper.c"],
+    hdrs = ["wrapper.h"],
+    includes = ["."],
+    deps = [
+        ":headers",
+        "//bazel/iree:hal_drivers",
+        "//bazel/iree:runtime_cc",
+        "@iree_core//runtime/src/iree/io:file_handle",
+        "@iree_core//runtime/src/iree/io:parameter_index",
+        "@iree_core//runtime/src/iree/io:parameter_index_provider",
+        "@iree_core//runtime/src/iree/io/formats:parser_registry",
+        "@iree_core//runtime/src/iree/modules/io/parameters",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],
+)

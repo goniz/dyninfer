@@ -1,0 +1,7 @@
+# Pinned IREE revision used by the Bazel module (see MODULE.bazel + bazel/iree/).
+# Source: bazel_dep(name="iree_core") + git_override (recursive submodules).
+# Prebuilt wheels: iree-base-compiler / iree-base-runtime (tool-backed path).
+IREE_PIP_VERSION=3.11.0
+IREE_GIT_COMMIT=e4a3b0405d7d23554da26403658d0e8c3c5ecf25
+IREE_LLVM_COMMIT=66395ad94c3283d938a2957e7c7b439711764680
+

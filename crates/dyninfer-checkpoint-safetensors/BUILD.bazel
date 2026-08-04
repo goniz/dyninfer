@@ -1,0 +1,19 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+rust_library(
+    name = "dyninfer-checkpoint-safetensors",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "dyninfer_checkpoint_safetensors",
+    edition = "2024",
+    aliases = aliases(),
+    deps = all_crate_deps(normal = True),
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "dyninfer-checkpoint-safetensors_tests",
+    crate = ":dyninfer-checkpoint-safetensors",
+    deps = all_crate_deps(normal_dev = True),
+)

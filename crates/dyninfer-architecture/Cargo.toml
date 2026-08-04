@@ -1,0 +1,15 @@
+[package]
+name = "dyninfer-architecture"
+description = "Architecture registry, config schema, package model, and built-in model graphs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dyninfer-checkpoint = { workspace = true }
+dyninfer-core = { workspace = true }
+dyninfer-error = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }

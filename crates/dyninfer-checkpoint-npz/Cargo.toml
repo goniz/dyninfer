@@ -1,0 +1,12 @@
+[package]
+name = "dyninfer-checkpoint-npz"
+description = "Deferred TensorFlow / NPZ checkpoint stub"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dyninfer-checkpoint = { workspace = true }
+dyninfer-core = { workspace = true }
+dyninfer-error = { workspace = true }

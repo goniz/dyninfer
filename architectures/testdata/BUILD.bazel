@@ -1,0 +1,4 @@
+package(default_visibility = ["//visibility:public"])
+
+# Model weights / tokenizers are not vendored — use Hugging Face Hub
+# (`hf download …`) and the local Hub cache.

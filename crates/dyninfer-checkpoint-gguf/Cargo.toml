@@ -1,0 +1,19 @@
+[package]
+name = "dyninfer-checkpoint-gguf"
+description = "GGUF container reader and Q4_0 convention decoder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+byteorder = { workspace = true }
+dyninfer-checkpoint = { workspace = true }
+dyninfer-core = { workspace = true }
+dyninfer-error = { workspace = true }
+half = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1039,9 +1039,14 @@ Only the following crates MAY contain unrestricted unsafe blocks:
 
 - `iree-runtime-sys`
 - `iree-runtime`
+- `iree-compiler-sys`
 - `dyninfer-compiler-sys`
+- `dyninfer-mlir-sys`
+- `dyninfer-mlir` (MLIR C API callbacks and melior-style builders; thin layer over `dyninfer-mlir-sys`)
 
 Other crates MUST use `#![forbid(unsafe_code)]` unless an exception is documented in an architecture decision record.
+
+**Bound Model IR note (v0):** Architecture packages currently retain a graph sketch in `mlir_text` (notes + slots). Executable VMFB MLIR is still emitted by architecture-specific dense-decoder paths. GGUF Q4_0 uses the portable qkernel path: layer weights bind as packed `tensor<Nxi8>` and lower to device-fused unpack+dot (`dyninfer-architecture::ops::qkernel`); `token_embd` / `output` are host-dequantized to f32 for gather and vocab projection.
 
 ---
 

@@ -1,0 +1,29 @@
+[package]
+name = "dyninfer-runtime"
+description = "Model loading, sessions, and prefill/decode orchestration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dyninfer-architecture = { workspace = true }
+dyninfer-binding = { workspace = true }
+dyninfer-cache = { workspace = true }
+dyninfer-checkpoint = { workspace = true }
+dyninfer-checkpoint-gguf = { workspace = true }
+dyninfer-checkpoint-safetensors = { workspace = true }
+dyninfer-compiler = { workspace = true }
+dyninfer-core = { workspace = true }
+dyninfer-error = { workspace = true }
+dyninfer-kernel-registry = { workspace = true }
+dyninfer-quantization = { workspace = true }
+dyninfer-target = { workspace = true }
+iree-runtime = { workspace = true }
+half = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

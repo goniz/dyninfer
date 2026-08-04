@@ -1,0 +1,21 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+rust_library(
+    name = "dyninfer-architecture",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "dyninfer_architecture",
+    edition = "2024",
+    aliases = aliases(),
+    data = ["//bazel/iree:compiler_libs"],
+    deps = all_crate_deps(normal = True),
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "dyninfer-architecture_tests",
+    crate = ":dyninfer-architecture",
+    data = ["//bazel/iree:compiler_libs"],
+    deps = all_crate_deps(normal_dev = True),
+)

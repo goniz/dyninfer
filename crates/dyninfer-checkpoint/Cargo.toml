@@ -1,0 +1,18 @@
+[package]
+name = "dyninfer-checkpoint"
+description = "Checkpoint container/convention traits and catalog model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dyninfer-core = { workspace = true }
+dyninfer-error = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

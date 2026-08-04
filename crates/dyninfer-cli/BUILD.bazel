@@ -1,0 +1,15 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+
+rust_binary(
+    name = "dyninfer",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "dyninfer",
+    edition = "2024",
+    aliases = aliases(),
+    data = [
+        "//bazel/iree:tools",
+    ],
+    deps = all_crate_deps(normal = True),
+    visibility = ["//visibility:public"],
+)

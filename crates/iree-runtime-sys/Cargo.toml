@@ -1,0 +1,9 @@
+[package]
+name = "iree-runtime-sys"
+description = "Unsafe bindings for the dyninfer IREE runtime C wrapper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]

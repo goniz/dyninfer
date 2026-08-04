@@ -1,0 +1,14 @@
+[package]
+name = "dyninfer-target"
+description = "Hardware discovery and IREE target mapping"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dyninfer-core = { workspace = true }
+dyninfer-error = { workspace = true }
+iree-runtime = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }

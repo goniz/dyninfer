@@ -1,0 +1,14 @@
+[package]
+name = "iree-compiler-sys"
+description = "bindgen + thin safe wrappers for libIREECompiler embedding API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+links = "IREECompiler"
+
+[dependencies]
+tracing = { workspace = true }
+
+[build-dependencies]
+bindgen = { workspace = true }
