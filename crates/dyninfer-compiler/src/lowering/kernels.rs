@@ -16,18 +16,48 @@ pub fn emit_iree_online_attention_page(
     head_dim: u32,
 ) -> Result<()> {
     let flash_queries = gqa_group * query_len;
+    let kernel_queries = if query_len == 1 { 16 } else { flash_queries };
     let q_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}x{head_dim}xf32>");
     let q_flash_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}x{head_dim}xf16>");
     let q_flat_ty = format!("tensor<{kv_heads}x{flash_queries}x{head_dim}xf16>");
     let output_flat_ty = format!("tensor<{kv_heads}x{flash_queries}x{head_dim}xf32>");
+    let q_kernel_ty = format!("tensor<{kv_heads}x{kernel_queries}x{head_dim}xf16>");
+    let output_kernel_ty = format!("tensor<{kv_heads}x{kernel_queries}x{head_dim}xf32>");
     let kv_ty = format!("tensor<{kv_heads}x{page_size}x{head_dim}xf32>");
     let kv_flash_ty = format!("tensor<{kv_heads}x{page_size}x{head_dim}xf16>");
     let mask_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}x{page_size}xf32>");
     let mask_flash_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}x{page_size}xf16>");
     let mask_flat_ty = format!("tensor<{kv_heads}x{flash_queries}x{page_size}xf16>");
+    let mask_kernel_ty = format!("tensor<{kv_heads}x{kernel_queries}x{page_size}xf16>");
     let row_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}xf32>");
     let row_flat_ty = format!("tensor<{kv_heads}x{flash_queries}xf32>");
-    let flash_config = r#"compilation_info = #iree_codegen.compilation_info<
+    let row_kernel_ty = format!("tensor<{kv_heads}x{kernel_queries}xf32>");
+    let flash_config = if query_len == 1 {
+        String::from(
+            r#"compilation_info = #iree_codegen.compilation_info<
+        lowering_config = #iree_gpu.lowering_config<{
+          promote_operands = [0, 1, 2],
+          reduction = [0, 0, 0, 64, 0],
+          workgroup = [1, 16, 0, 0, 64]}>,
+        translation_info = #iree_codegen.translation_info<
+          pipeline = LLVMGPUVectorDistribute
+          workgroup_size = [32, 1, 1]
+          subgroup_size = 32,
+          {iree_codegen.denormal_fp_math_f32 = #iree_codegen.denormal_fp_math<"preserve-sign">}>>,
+      decomposition_config = {
+        pv_attrs = {lowering_config = #iree_gpu.lowering_config<{
+          mma_kind = #iree_gpu.mma_layout<WMMAR3_F32_16x16x16_F16>,
+          promote_operands = [1],
+          subgroup_basis = [[1, 1, 1, 1, 1], [0, 1, 3, 4]]}>},
+        qk_attrs = {lowering_config = #iree_gpu.lowering_config<{
+          mma_kind = #iree_gpu.mma_layout<WMMAR3_F32_16x16x16_F16>,
+          promote_operands = [0, 1],
+          subgroup_basis = [[1, 1, 1, 1, 1], [0, 1, 2, 3]]}>}},
+"#,
+        )
+    } else {
+        String::from(
+            r#"compilation_info = #iree_codegen.compilation_info<
         lowering_config = #iree_gpu.lowering_config<{
           promote_operands = [0, 1, 2],
           reduction = [0, 0, 0, 64, 0],
@@ -45,7 +75,10 @@ pub fn emit_iree_online_attention_page(
         qk_attrs = {lowering_config = #iree_gpu.lowering_config<{
           mma_kind = #iree_gpu.mma_layout<WMMAR3_F32_16x16x16_F16>,
           promote_operands = [0, 1],
-          subgroup_basis = [[1, 4, 1, 1, 1], [0, 1, 2, 3]]}>}}"#;
+          subgroup_basis = [[1, 4, 1, 1, 1], [0, 1, 2, 3]]}>}},
+"#,
+        )
+    };
 
     let mut f = module.func_private(name);
     f.arg("q", &q_ty);
@@ -59,6 +92,57 @@ pub fn emit_iree_online_attention_page(
     f.result_ty(&q_ty);
     f.result_ty(&row_ty);
     f.result_ty(&row_ty);
+    let (padding, q_input, mask_input, output_input, max_input, sum_input, result_slices) =
+        if query_len == 1 {
+            (
+                format!(
+                    r#"  %zero16 = arith.constant 0.0 : f16
+  %zero32 = arith.constant 0.0 : f32
+  %q_pad_e = tensor.empty() : {q_kernel_ty}
+  %mask_pad_e = tensor.empty() : {mask_kernel_ty}
+  %output_pad_e = tensor.empty() : {output_kernel_ty}
+  %row_pad_e = tensor.empty() : {row_kernel_ty}
+  %q_pad = linalg.fill ins(%zero16 : f16) outs(%q_pad_e : {q_kernel_ty}) -> {q_kernel_ty}
+  %mask_pad = linalg.fill ins(%zero16 : f16) outs(%mask_pad_e : {mask_kernel_ty}) -> {mask_kernel_ty}
+  %output_pad = linalg.fill ins(%zero32 : f32) outs(%output_pad_e : {output_kernel_ty}) -> {output_kernel_ty}
+  %row_pad = linalg.fill ins(%zero32 : f32) outs(%row_pad_e : {row_kernel_ty}) -> {row_kernel_ty}
+  %q_kernel = tensor.insert_slice %q_flat into %q_pad[0, 0, 0] [{kv_heads}, {flash_queries}, {head_dim}] [1, 1, 1] : {q_flat_ty} into {q_kernel_ty}
+  %mask_kernel = tensor.insert_slice %mask_flat into %mask_pad[0, 0, 0] [{kv_heads}, {flash_queries}, {page_size}] [1, 1, 1] : {mask_flat_ty} into {mask_kernel_ty}
+  %output_kernel = tensor.insert_slice %output_flat into %output_pad[0, 0, 0] [{kv_heads}, {flash_queries}, {head_dim}] [1, 1, 1] : {output_flat_ty} into {output_kernel_ty}
+  %max_kernel = tensor.insert_slice %max_flat into %row_pad[0, 0] [{kv_heads}, {flash_queries}] [1, 1] : {row_flat_ty} into {row_kernel_ty}
+  %sum_kernel = tensor.insert_slice %sum_flat into %row_pad[0, 0] [{kv_heads}, {flash_queries}] [1, 1] : {row_flat_ty} into {row_kernel_ty}
+"#
+                ),
+                "q_kernel",
+                "mask_kernel",
+                "output_kernel",
+                "max_kernel",
+                "sum_kernel",
+                format!(
+                    r#"  %output_real = tensor.extract_slice %next#0[0, 0, 0] [{kv_heads}, {flash_queries}, {head_dim}] [1, 1, 1] : {output_kernel_ty} to {output_flat_ty}
+  %max_real = tensor.extract_slice %next#1[0, 0] [{kv_heads}, {flash_queries}] [1, 1] : {row_kernel_ty} to {row_flat_ty}
+  %sum_real = tensor.extract_slice %next#2[0, 0] [{kv_heads}, {flash_queries}] [1, 1] : {row_kernel_ty} to {row_flat_ty}
+"#
+                ),
+            )
+        } else {
+            (
+                String::new(),
+                "q_flat",
+                "mask_flat",
+                "output_flat",
+                "max_flat",
+                "sum_flat",
+                String::new(),
+            )
+        };
+    let output_result = if query_len == 1 {
+        "output_real"
+    } else {
+        "next#0"
+    };
+    let max_result = if query_len == 1 { "max_real" } else { "next#1" };
+    let sum_result = if query_len == 1 { "sum_real" } else { "next#2" };
     f.op_asm(format!(
         r#"  %q16 = arith.truncf %q : {q_ty} to {q_flash_ty}
   %k16 = arith.truncf %k : {kv_ty} to {kv_flash_ty}
@@ -69,8 +153,9 @@ pub fn emit_iree_online_attention_page(
   %output_flat = tensor.collapse_shape %output [[0], [1, 2], [3]] : {q_ty} into {output_flat_ty}
   %max_flat = tensor.collapse_shape %row_max [[0], [1, 2]] : {row_ty} into {row_flat_ty}
   %sum_flat = tensor.collapse_shape %row_sum [[0], [1, 2]] : {row_ty} into {row_flat_ty}
+{padding}
   %next:3 = iree_linalg_ext.online_attention {{
-      {flash_config},
+      {flash_config}
       indexing_maps = [
         affine_map<(h, q, d, p, n) -> (h, q, d)>,
         affine_map<(h, q, d, p, n) -> (h, p, d)>,
@@ -81,14 +166,14 @@ pub fn emit_iree_online_attention_page(
         affine_map<(h, q, d, p, n) -> (h, q)>,
         affine_map<(h, q, d, p, n) -> (h, q)>
       ]
-    }} ins(%q_flat, %k16, %v16, %scale, %mask_flat : {q_flat_ty}, {kv_flash_ty}, {kv_flash_ty}, f16, {mask_flat_ty})
-       outs(%output_flat, %max_flat, %sum_flat : {output_flat_ty}, {row_flat_ty}, {row_flat_ty}) {{
+    }} ins(%{q_input}, %k16, %v16, %scale, %{mask_input} : {q_kernel_ty}, {kv_flash_ty}, {kv_flash_ty}, f16, {mask_kernel_ty})
+       outs(%{output_input}, %{max_input}, %{sum_input} : {output_kernel_ty}, {row_kernel_ty}, {row_kernel_ty}) {{
     ^bb0(%score: f32):
       iree_linalg_ext.yield %score : f32
-  }} -> {output_flat_ty}, {row_flat_ty}, {row_flat_ty}
-  %output_next = tensor.expand_shape %next#0 [[0], [1, 2], [3]] output_shape [{kv_heads}, {gqa_group}, {query_len}, {head_dim}] : {output_flat_ty} into {q_ty}
-  %max_next = tensor.expand_shape %next#1 [[0], [1, 2]] output_shape [{kv_heads}, {gqa_group}, {query_len}] : {row_flat_ty} into {row_ty}
-  %sum_next = tensor.expand_shape %next#2 [[0], [1, 2]] output_shape [{kv_heads}, {gqa_group}, {query_len}] : {row_flat_ty} into {row_ty}
+  }} -> {output_kernel_ty}, {row_kernel_ty}, {row_kernel_ty}
+{result_slices}  %output_next = tensor.expand_shape %{output_result} [[0], [1, 2], [3]] output_shape [{kv_heads}, {gqa_group}, {query_len}, {head_dim}] : {output_flat_ty} into {q_ty}
+  %max_next = tensor.expand_shape %{max_result} [[0], [1, 2]] output_shape [{kv_heads}, {gqa_group}, {query_len}] : {row_flat_ty} into {row_ty}
+  %sum_next = tensor.expand_shape %{sum_result} [[0], [1, 2]] output_shape [{kv_heads}, {gqa_group}, {query_len}] : {row_flat_ty} into {row_ty}
   return %output_next, %max_next, %sum_next : {q_ty}, {row_ty}, {row_ty}
 "#,
     ));
@@ -396,6 +481,47 @@ mod online_attention_tests {
         assert!(text.contains("iree_linalg_ext.online_attention"));
         assert!(text.contains("math.powf"));
         assert!(!text.contains("tensor<8x4096x4096"));
+    }
+
+    #[test]
+    fn hip_decode_flash_compiles_when_requested() {
+        if std::env::var_os("DYNINFER_HIP_FLASH_DECODE").is_none() {
+            return;
+        }
+        let mut module = ModuleBuilder::new().unwrap();
+        emit_iree_online_attention_page(&mut module, "decode_flash_impl", 1, 256, 8, 2, 128)
+            .unwrap();
+        let q = "tensor<8x2x1x128xf32>";
+        let kv = "tensor<8x256x128xf32>";
+        let mask = "tensor<8x2x1x256xf32>";
+        let row = "tensor<8x2x1xf32>";
+        let mut f = module.func("decode_flash");
+        f.arg("q", q);
+        f.arg("k", kv);
+        f.arg("v", kv);
+        f.arg("scale", "f16");
+        f.arg("mask", mask);
+        f.arg("output", q);
+        f.arg("row_max", row);
+        f.arg("row_sum", row);
+        f.result_ty(q);
+        f.result_ty(row);
+        f.result_ty(row);
+        f.op_asm(format!(
+            "  %next:3 = func.call @decode_flash_impl(%q, %k, %v, %scale, %mask, %output, %row_max, %row_sum) : ({q}, {kv}, {kv}, f16, {mask}, {q}, {row}, {row}) -> ({q}, {row}, {row})\n  return %next#0, %next#1, %next#2 : {q}, {row}, {row}"
+        ));
+        f.finish(&mut module).unwrap();
+        let mlir = module.finish().unwrap().mlir_text;
+        let arch = std::env::var("DYNINFER_HIP_ARCH").unwrap_or_else(|_| "gfx1151".into());
+        let mut flags = vec![
+            "--iree-hal-target-device=hip".into(),
+            format!("--iree-rocm-target={arch}"),
+        ];
+        if let Some(path) = iree_compiler_sys::discover_rocm_bc_dir() {
+            flags.push(format!("--iree-rocm-bc-dir={}", path.display()));
+        }
+        iree_compiler_sys::compile_mlir_to_vmfb(&mlir, &flags)
+            .expect("one-token HIP Flash Attention must compile");
     }
 
     #[test]

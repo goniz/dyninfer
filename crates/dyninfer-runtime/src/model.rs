@@ -36,8 +36,13 @@ fn validate_executable_abi(manifest: &ExecutableManifest, bundle: &Path) -> Resu
                 page_size,
                 chunk_size,
             },
-            3,
-        ) if *page_size > 0 && *chunk_size > 0 => &["chunk_begin", "chunk_logits"],
+            5,
+        ) if *page_size > 0 && *chunk_size > 0 => &[
+            "chunk_begin",
+            "chunk_logits",
+            "decode_chunk_begin",
+            "decode_chunk_logits",
+        ],
         _ => {
             return Err(DynInferError::Cache(CacheError {
                 message: format!(
@@ -70,6 +75,7 @@ pub struct BundlePaths {
     pub manifest: PathBuf,
     pub bindings: PathBuf,
     pub vmfb: PathBuf,
+    pub decode_vmfb: Option<PathBuf>,
 }
 
 /// Immutable ingredients needed to open an independent IREE context (own KV).
@@ -79,6 +85,7 @@ enum RuntimeParameters {
 
 struct ExecutableHandle {
     vmfb_path: PathBuf,
+    decode_vmfb_path: Option<PathBuf>,
     parameters: RuntimeParameters,
     /// Driver name or full HAL device URI.
     device: Option<String>,
@@ -89,6 +96,9 @@ impl ExecutableHandle {
         let instance = Instance::new()?;
         let module = Module::from_path(&self.vmfb_path)?;
         let mut context = Context::create(instance, module)?;
+        if let Some(path) = &self.decode_vmfb_path {
+            context = context.with_decode_module(Module::from_path(path)?);
+        }
         context = match &self.parameters {
             RuntimeParameters::Direct(parameters) => {
                 context.with_file_parameters(Arc::clone(parameters))
@@ -300,6 +310,7 @@ impl ModelLoader {
             if let Some(hit) = cache.lookup(&key)? {
                 return self.materialize_bundle_from_cache(
                     &hit.vmfb_path,
+                    hit.decode_vmfb_path.as_deref(),
                     &hit.manifest_path,
                     &plan,
                     output,
@@ -329,6 +340,10 @@ impl ModelLoader {
             cache.publish(
                 &key,
                 &output_compile.executable.bytes,
+                output_compile
+                    .decode_executable
+                    .as_ref()
+                    .map(|artifact| artifact.bytes.as_slice()),
                 &output_compile.manifest,
             )?;
         }
@@ -336,6 +351,10 @@ impl ModelLoader {
         self.write_bundle(
             output,
             &output_compile.executable.bytes,
+            output_compile
+                .decode_executable
+                .as_ref()
+                .map(|artifact| artifact.bytes.as_slice()),
             &output_compile.manifest,
             &plan,
             &catalog,
@@ -352,6 +371,18 @@ impl ModelLoader {
         let bindings_path = bundle.join("bindings.json");
         let vmfb_path = bundle.join("executables").join("model.vmfb");
         let manifest: ExecutableManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+        let decode_vmfb_path =
+            (manifest.version == 5).then(|| bundle.join("executables").join("decode.vmfb"));
+        if decode_vmfb_path
+            .as_ref()
+            .is_some_and(|path| !path.is_file())
+        {
+            return Err(DynInferError::Cache(CacheError {
+                message: "paged ABI v5 bundle is missing decode.vmfb".into(),
+                digest: None,
+                path: Some(bundle.display().to_string()),
+            }));
+        }
         validate_executable_abi(&manifest, bundle)?;
         let binding: BindingPlan = serde_json::from_slice(&fs::read(&bindings_path)?)?;
         let checkpoint = checkpoint.as_ref();
@@ -444,6 +475,7 @@ impl ModelLoader {
         // probe context so create_session still gets an independent KV.
         let executable = ExecutableHandle {
             vmfb_path: vmfb_path.clone(),
+            decode_vmfb_path: decode_vmfb_path.clone(),
             parameters,
             device,
         };
@@ -500,6 +532,7 @@ impl ModelLoader {
                 manifest: manifest_path,
                 bindings: bindings_path,
                 vmfb: vmfb_path,
+                decode_vmfb: decode_vmfb_path,
             },
             executable,
         })
@@ -509,6 +542,7 @@ impl ModelLoader {
         &self,
         output: impl AsRef<Path>,
         vmfb: &[u8],
+        decode_vmfb: Option<&[u8]>,
         manifest: &ExecutableManifest,
         plan: &BindingPlan,
         catalog: &CheckpointCatalog,
@@ -517,6 +551,13 @@ impl ModelLoader {
         fs::create_dir_all(root.join("executables"))?;
         let vmfb_path = root.join("executables").join("model.vmfb");
         fs::write(&vmfb_path, vmfb)?;
+        let decode_vmfb_path = if let Some(bytes) = decode_vmfb {
+            let path = root.join("executables").join("decode.vmfb");
+            fs::write(&path, bytes)?;
+            Some(path)
+        } else {
+            None
+        };
         let manifest_path = root.join("manifest.json");
         fs::write(&manifest_path, serde_json::to_vec_pretty(manifest)?)?;
         let bindings_path = root.join("bindings.json");
@@ -530,12 +571,14 @@ impl ModelLoader {
             manifest: manifest_path,
             bindings: bindings_path,
             vmfb: vmfb_path,
+            decode_vmfb: decode_vmfb_path,
         })
     }
 
     fn materialize_bundle_from_cache(
         &self,
         vmfb_src: &Path,
+        decode_vmfb_src: Option<&Path>,
         manifest_src: &Path,
         plan: &BindingPlan,
         output: impl AsRef<Path>,
@@ -546,6 +589,20 @@ impl ModelLoader {
         fs::create_dir_all(root.join("executables"))?;
         let vmfb_path = root.join("executables").join("model.vmfb");
         fs::write(&vmfb_path, vmfb)?;
+        let decode_vmfb_path = if let Some(src) = decode_vmfb_src {
+            let path = root.join("executables").join("decode.vmfb");
+            fs::write(&path, fs::read(src)?)?;
+            Some(path)
+        } else {
+            None
+        };
+        if manifest.version == 5 && decode_vmfb_path.is_none() {
+            return Err(DynInferError::Cache(CacheError {
+                message: "paged ABI v5 cache entry is missing decode.vmfb".into(),
+                digest: None,
+                path: Some(root.display().to_string()),
+            }));
+        }
         let manifest_path = root.join("manifest.json");
         fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
         let bindings_path = root.join("bindings.json");
@@ -555,6 +612,7 @@ impl ModelLoader {
             manifest: manifest_path,
             bindings: bindings_path,
             vmfb: vmfb_path,
+            decode_vmfb: decode_vmfb_path,
         })
     }
 }

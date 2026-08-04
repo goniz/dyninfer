@@ -183,9 +183,9 @@ impl ModelSession for IreeSession {
         let values = if let Some((page_size, _)) = self.paged_geometry() {
             self.context
                 .ensure_kv_pages((self.position as usize + 1).div_ceil(page_size))?;
-            let (window, last) = self.window_from_tokens(&[token]);
+            let decode_token = [i64::from(token)];
             self.context
-                .invoke_paged_chunk(&window, last, self.position as i64)?
+                .invoke_paged_chunk(&decode_token, 0, self.position as i64)?
         } else {
             let max_kv = self.kv.max_sequence_length.max(1) as usize;
             iree_runtime::fill_causal_attn_bias(&mut self.attn_bias, self.position as i64, max_kv);

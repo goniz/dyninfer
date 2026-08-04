@@ -25,7 +25,7 @@ use dyninfer_error::{CompilationError, Diagnostic, DynInferError, Result, Severi
 use serde::{Deserialize, Serialize};
 use tracing::{info, info_span};
 
-pub const COMPILER_VERSION: &str = "0.3.0-iree-3.11.0-paged-kv-v3";
+pub const COMPILER_VERSION: &str = "0.3.0-iree-3.11.0-paged-kv-v5";
 /// Pinned IREE pip / source revision identity for executable cache keys (spec §19.1).
 pub const IREE_REVISION: &str = "3.11.0+e4a3b0405d7d";
 /// Kernel registry policy version included in executable cache keys.
@@ -60,6 +60,7 @@ pub struct CompileRequest<'a> {
 #[derive(Debug, Clone)]
 pub struct CompileOutput {
     pub executable: VmfbArtifact,
+    pub decode_executable: Option<VmfbArtifact>,
     pub manifest: ExecutableManifest,
     pub diagnostics: Vec<Diagnostic>,
     pub mlir_text: String,
@@ -68,6 +69,7 @@ pub struct CompileOutput {
 #[derive(Debug, Clone)]
 pub struct LoweringOutput {
     pub mlir_text: String,
+    pub decode_mlir_text: Option<String>,
     pub prefill_window: u32,
     pub max_kv: u32,
     pub paged_kv: bool,
@@ -204,10 +206,28 @@ pub fn lower_bound_model(bound: &BoundModel) -> Result<LoweringOutput> {
             diagnostics: vec![],
         }));
     }
-    let mlir_text =
-        lowering::emit_dense_decoder_cfg(bound.architecture.architecture_id.as_str(), &config)?;
+    let (mlir_text, decode_mlir_text) = if config.paged_kv {
+        (
+            lowering::emit_dense_decoder_cfg_program(
+                bound.architecture.architecture_id.as_str(),
+                &config,
+                lowering::PagedProgram::Prefill,
+            )?,
+            Some(lowering::emit_dense_decoder_cfg_program(
+                bound.architecture.architecture_id.as_str(),
+                &config,
+                lowering::PagedProgram::Decode,
+            )?),
+        )
+    } else {
+        (
+            lowering::emit_dense_decoder_cfg(bound.architecture.architecture_id.as_str(), &config)?,
+            None,
+        )
+    };
     Ok(LoweringOutput {
         mlir_text,
+        decode_mlir_text,
         prefill_window: config.seq,
         max_kv: config.max_kv,
         paged_kv: config.paged_kv,
@@ -399,6 +419,7 @@ impl ModelCompiler for LocalCompiler {
         let lowering = if request.options.smoke_only {
             LoweringOutput {
                 mlir_text: emit_add_smoke_module().to_string(),
+                decode_mlir_text: None,
                 prefill_window: 4,
                 max_kv: 4,
                 paged_kv: false,
@@ -408,18 +429,39 @@ impl ModelCompiler for LocalCompiler {
             lower_bound_model(request.bound_model)?
         };
         let mlir = lowering.mlir_text;
+        let decode_mlir = lowering.decode_mlir_text;
 
         let _iree = info_span!("compile.iree").entered();
-        let vmfb = self
-            .compile_mlir(&mlir, &request.bound_model.target)
-            .map_err(|err| match err {
-                DynInferError::Compilation(mut c) => {
-                    c.diagnostics
-                        .push(Diagnostic::error("E_IREE_COMPILE", c.message.clone()));
-                    DynInferError::Compilation(c)
-                }
-                other => other,
-            })?;
+        let annotate_error = |err| match err {
+            DynInferError::Compilation(mut c) => {
+                c.diagnostics
+                    .push(Diagnostic::error("E_IREE_COMPILE", c.message.clone()));
+                DynInferError::Compilation(c)
+            }
+            other => other,
+        };
+        let (vmfb, decode_vmfb) = if let Some(decode_mlir) = decode_mlir.as_deref() {
+            std::thread::scope(|scope| {
+                let decode =
+                    scope.spawn(|| self.compile_mlir(decode_mlir, &request.bound_model.target));
+                let prefill = self.compile_mlir(&mlir, &request.bound_model.target);
+                let decode = decode.join().map_err(|_| {
+                    DynInferError::Compilation(CompilationError {
+                        message: "parallel decode compilation panicked".into(),
+                        pass: Some("iree-compile.decode".into()),
+                        diagnostics: vec![],
+                    })
+                })?;
+                Ok::<_, DynInferError>((prefill?, Some(decode?)))
+            })
+            .map_err(annotate_error)?
+        } else {
+            (
+                self.compile_mlir(&mlir, &request.bound_model.target)
+                    .map_err(annotate_error)?,
+                None,
+            )
+        };
 
         let backend = if request.options.force_subprocess {
             "iree-compile".to_string()
@@ -430,7 +472,10 @@ impl ModelCompiler for LocalCompiler {
         let mut diagnostics = vec![Diagnostic {
             code: "R_IREE_COMPILE".into(),
             severity: Severity::Remark,
-            message: format!("compiled {} bytes via {backend}", vmfb.len()),
+            message: format!(
+                "compiled {} bytes via {backend}",
+                vmfb.len() + decode_vmfb.as_ref().map_or(0, Vec::len)
+            ),
             architecture_op: None,
             parameter_slot: None,
             checkpoint_key: None,
@@ -459,7 +504,7 @@ impl ModelCompiler for LocalCompiler {
         validate_binding_for_compile(&request.bound_model.binding)?;
         let manifest = ExecutableManifest {
             format: "dyninfer.bundle".into(),
-            version: if paged_kv { 3 } else { 2 },
+            version: if paged_kv { 5 } else { 2 },
             architecture_id: request.bound_model.architecture.architecture_id.clone(),
             architecture_revision: request.architecture_revision.into(),
             checkpoint_schema: request.checkpoint_schema.clone(),
@@ -480,11 +525,16 @@ impl ModelCompiler for LocalCompiler {
                     "chunk_begin".into(),
                     "layer_page".into(),
                     "chunk_logits".into(),
+                    "decode_chunk_begin".into(),
+                    "decode_layer_page".into(),
+                    "decode_chunk_logits".into(),
                     "add".into(),
                 ];
                 for layer in 0..num_layers {
                     entries.push(format!("layer_prepare_{layer}"));
                     entries.push(format!("layer_finish_{layer}"));
+                    entries.push(format!("decode_layer_prepare_{layer}"));
+                    entries.push(format!("decode_layer_finish_{layer}"));
                 }
                 entries
             } else {
@@ -552,6 +602,7 @@ impl ModelCompiler for LocalCompiler {
 
         Ok(CompileOutput {
             executable: VmfbArtifact { bytes: vmfb },
+            decode_executable: decode_vmfb.map(|bytes| VmfbArtifact { bytes }),
             manifest,
             diagnostics,
             mlir_text: mlir,

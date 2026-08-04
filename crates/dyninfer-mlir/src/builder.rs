@@ -15,6 +15,7 @@ use dyninfer_error::Result;
 /// into a live [`Module`] for verify/print (avoids co-owning Module+Context).
 pub struct ModuleBuilder {
     ctx: Context,
+    module_name: Option<String>,
     /// Top-level op assembly fragments (each already parse-checked on append).
     toplevel: Vec<String>,
     verified_text: Option<String>,
@@ -30,9 +31,16 @@ impl ModuleBuilder {
     pub fn new() -> Result<Self> {
         Ok(Self {
             ctx: Context::new()?,
+            module_name: None,
             toplevel: Vec::new(),
             verified_text: None,
         })
+    }
+
+    pub fn new_named(name: impl Into<String>) -> Result<Self> {
+        let mut builder = Self::new()?;
+        builder.module_name = Some(name.into());
+        Ok(builder)
     }
 
     pub fn context(&self) -> &Context {
@@ -98,7 +106,10 @@ impl ModuleBuilder {
     }
 
     fn materialize(&self) -> Result<Module> {
-        let mut src = String::from("module {\n");
+        let mut src = match &self.module_name {
+            Some(name) => format!("module @{name} {{\n"),
+            None => String::from("module {\n"),
+        };
         for op in &self.toplevel {
             src.push_str(op);
             if !op.ends_with('\n') {

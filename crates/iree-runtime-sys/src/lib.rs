@@ -54,6 +54,16 @@ pub mod bindings {
             param_count: usize,
             out_session: *mut *mut dyninfer_iree_session_t,
         ) -> c_int;
+        pub fn dyninfer_iree_session_create_modules_with_file_params(
+            device_uri: *const c_char,
+            prefill_vmfb_path: *const c_char,
+            decode_vmfb_path: *const c_char,
+            files: *const dyninfer_iree_parameter_file_t,
+            file_count: usize,
+            params: *const dyninfer_iree_file_param_t,
+            param_count: usize,
+            out_session: *mut *mut dyninfer_iree_session_t,
+        ) -> c_int;
         pub fn dyninfer_iree_session_destroy(session: *mut dyninfer_iree_session_t);
         pub fn dyninfer_iree_last_error() -> *const c_char;
         pub fn dyninfer_iree_free(p: *mut c_void);

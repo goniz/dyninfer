@@ -110,6 +110,7 @@ impl Drop for NativeSession {
 pub struct Context {
     _instance: Instance,
     module: Module,
+    decode_module: Option<Module>,
     /// Explicit original-file/range descriptors, shared by independent
     /// sessions without staging checkpoint payloads in host memory.
     file_parameters: Option<Arc<FileParameterStorage>>,
@@ -218,10 +219,16 @@ impl Context {
         Ok(Self {
             _instance: instance,
             module,
+            decode_module: None,
             file_parameters: None,
             device: None,
             session: Mutex::new(None),
         })
+    }
+
+    pub fn with_decode_module(mut self, module: Module) -> Self {
+        self.decode_module = Some(module);
+        self
     }
 
     pub fn with_file_parameters(mut self, storage: Arc<FileParameterStorage>) -> Self {
@@ -271,6 +278,17 @@ impl Context {
         if guard.is_none() {
             let vmfb = self.module_path()?;
             let vmfb_c = path_cstring(vmfb)?;
+            let decode_vmfb_c = self
+                .decode_module
+                .as_ref()
+                .map(|module| {
+                    module.path.as_deref().ok_or_else(|| {
+                        runtime_error("decode module has no filesystem path for native load")
+                    })
+                })
+                .transpose()?
+                .map(path_cstring)
+                .transpose()?;
             let device_c = self
                 .device
                 .as_deref()
@@ -305,15 +323,28 @@ impl Context {
                     })
                     .collect();
                 unsafe {
-                    sys::dyninfer_iree_session_create_with_file_params(
-                        device_c.as_ref().map(|c| c.as_ptr()).unwrap_or(ptr::null()),
-                        vmfb_c.as_ptr(),
-                        c_files.as_ptr(),
-                        c_files.len(),
-                        c_params.as_ptr(),
-                        c_params.len(),
-                        &mut ptr,
-                    )
+                    if let Some(decode_vmfb) = decode_vmfb_c.as_ref() {
+                        sys::dyninfer_iree_session_create_modules_with_file_params(
+                            device_c.as_ref().map(|c| c.as_ptr()).unwrap_or(ptr::null()),
+                            vmfb_c.as_ptr(),
+                            decode_vmfb.as_ptr(),
+                            c_files.as_ptr(),
+                            c_files.len(),
+                            c_params.as_ptr(),
+                            c_params.len(),
+                            &mut ptr,
+                        )
+                    } else {
+                        sys::dyninfer_iree_session_create_with_file_params(
+                            device_c.as_ref().map(|c| c.as_ptr()).unwrap_or(ptr::null()),
+                            vmfb_c.as_ptr(),
+                            c_files.as_ptr(),
+                            c_files.len(),
+                            c_params.as_ptr(),
+                            c_params.len(),
+                            &mut ptr,
+                        )
+                    }
                 }
             } else {
                 unsafe {

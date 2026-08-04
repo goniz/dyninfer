@@ -44,6 +44,14 @@ int dyninfer_iree_session_create_with_file_params(
     const dyninfer_iree_file_param_t* params, size_t param_count,
     dyninfer_iree_session_t** out_session);
 
+// ABI v5: appends independently compiled prefill and decode modules to one
+// session so both share the same device and runtime-owned KV pages.
+int dyninfer_iree_session_create_modules_with_file_params(
+    const char* device_uri, const char* prefill_vmfb_path,
+    const char* decode_vmfb_path, const dyninfer_iree_parameter_file_t* files,
+    size_t file_count, const dyninfer_iree_file_param_t* params,
+    size_t param_count, dyninfer_iree_session_t** out_session);
+
 void dyninfer_iree_session_destroy(dyninfer_iree_session_t* session);
 
 // Human-readable error from the most recent failed call (process-wide).
@@ -70,7 +78,7 @@ int dyninfer_iree_session_invoke_decode(dyninfer_iree_session_t* session,
                                         const float* attn_bias, size_t bias_len,
                                         float** out_logits, size_t* out_count);
 
-// ABI v3 paged KV. Pages are independent device-local tensors with shape
+// Paged KV. Pages are independent device-local tensors with shape
 // [layers, 2, page_size, kv_heads, head_dim].
 int dyninfer_iree_session_configure_paged_kv(
     dyninfer_iree_session_t* session, size_t layer_count, size_t page_size,

@@ -32,6 +32,7 @@ struct dyninfer_iree_session_t {
   size_t kv_head_dim;
   size_t kv_chunk_size;
   size_t kv_allocated_bytes;
+  bool split_modules;
 };
 
 static char g_last_error[2048] = {0};
@@ -157,6 +158,7 @@ static iree_status_t append_file_parameters_module(
 }
 
 static int session_create_common(const char* device_uri, const char* vmfb_path,
+                                 const char* decode_vmfb_path,
                                  const dyninfer_iree_parameter_file_t* files,
                                  size_t file_count,
                                  const dyninfer_iree_file_param_t* file_params,
@@ -218,6 +220,12 @@ static int session_create_common(const char* device_uri, const char* vmfb_path,
     status = iree_runtime_session_append_bytecode_module_from_file(s->session,
                                                                    vmfb_path);
   }
+  if (iree_status_is_ok(status) && decode_vmfb_path &&
+      decode_vmfb_path[0] != '\0') {
+    status = iree_runtime_session_append_bytecode_module_from_file(
+        s->session, decode_vmfb_path);
+    s->split_modules = iree_status_is_ok(status);
+  }
 
   if (!iree_status_is_ok(status)) {
     set_error_status(status);
@@ -230,7 +238,7 @@ static int session_create_common(const char* device_uri, const char* vmfb_path,
 
 int dyninfer_iree_session_create(const char* device_uri, const char* vmfb_path,
                                  dyninfer_iree_session_t** out_session) {
-  return session_create_common(device_uri, vmfb_path,
+  return session_create_common(device_uri, vmfb_path, /*decode_vmfb_path=*/NULL,
                                /*files=*/NULL, /*file_count=*/0,
                                /*file_params=*/NULL, /*file_param_count=*/0,
                                out_session);
@@ -241,8 +249,19 @@ int dyninfer_iree_session_create_with_file_params(
     const dyninfer_iree_parameter_file_t* files, size_t file_count,
     const dyninfer_iree_file_param_t* params, size_t param_count,
     dyninfer_iree_session_t** out_session) {
-  return session_create_common(device_uri, vmfb_path, files, file_count, params,
-                               param_count, out_session);
+  return session_create_common(device_uri, vmfb_path, /*decode_vmfb_path=*/NULL,
+                               files, file_count, params, param_count,
+                               out_session);
+}
+
+int dyninfer_iree_session_create_modules_with_file_params(
+    const char* device_uri, const char* prefill_vmfb_path,
+    const char* decode_vmfb_path, const dyninfer_iree_parameter_file_t* files,
+    size_t file_count, const dyninfer_iree_file_param_t* params,
+    size_t param_count, dyninfer_iree_session_t** out_session) {
+  return session_create_common(device_uri, prefill_vmfb_path, decode_vmfb_path,
+                               files, file_count, params, param_count,
+                               out_session);
 }
 
 static iree_status_t allocate_i64_tensor(iree_runtime_session_t* session,
@@ -637,11 +656,16 @@ int dyninfer_iree_session_invoke_paged_chunk(
     size_t* out_count) {
   *out_logits = NULL;
   *out_count = 0;
-  if (!session || !tokens || token_count != session->kv_chunk_size ||
+  if (!session || !tokens ||
+      (token_count != session->kv_chunk_size && token_count != 1) ||
       last < 0 || (size_t)last >= token_count || start_pos < 0) {
     set_error_msg("invalid paged chunk invocation");
     return 1;
   }
+  const bool is_decode = token_count == 1;
+  const char* function_prefix = is_decode ? "decode_" : "";
+  const char* module_name =
+      session->split_modules ? (is_decode ? "decode" : "prefill") : "module";
   iree_hal_dim_t token_shape[1] = {(iree_hal_dim_t)token_count};
   iree_hal_buffer_view_t *v_tokens = NULL, *v_last = NULL, *v_start = NULL,
                          *v_page_index = NULL, *v_layer_index = NULL;
@@ -653,14 +677,17 @@ int dyninfer_iree_session_invoke_paged_chunk(
     status =
         allocate_i64_tensor(session->session, 0, NULL, &start_pos, 1, &v_start);
   iree_hal_buffer_view_t* begin_inputs[3] = {v_tokens, v_last, v_start};
-  if (iree_status_is_ok(status))
-    status = invoke_void(session, "module.chunk_begin", begin_inputs, 3);
-
   char function_name[96];
+  if (iree_status_is_ok(status)) {
+    snprintf(function_name, sizeof(function_name), "%s.%schunk_begin",
+             module_name, function_prefix);
+    status = invoke_void(session, function_name, begin_inputs, 3);
+  }
+
   for (size_t layer = 0;
        iree_status_is_ok(status) && layer < session->kv_layer_count; ++layer) {
-    snprintf(function_name, sizeof(function_name), "module.layer_prepare_%zu",
-             layer);
+    snprintf(function_name, sizeof(function_name),
+             "%s.%slayer_prepare_%zu", module_name, function_prefix, layer);
     status = invoke_void(session, function_name, NULL, 0);
     if (iree_status_is_ok(status)) {
       status = ensure_i64_scalar_view(session->session, &v_layer_index,
@@ -676,23 +703,27 @@ int dyninfer_iree_session_invoke_paged_chunk(
       iree_hal_buffer_view_t* page_inputs[4] = {
           session->kv_pages[page_index], v_page_index, v_start, v_layer_index};
       iree_hal_buffer_view_t* updated = NULL;
-      status = invoke_buffer_view(session, "module.layer_page", page_inputs, 4,
-                                  &updated);
+      snprintf(function_name, sizeof(function_name), "%s.%slayer_page",
+               module_name, function_prefix);
+      status =
+          invoke_buffer_view(session, function_name, page_inputs, 4, &updated);
       if (iree_status_is_ok(status)) {
         iree_hal_buffer_view_release(session->kv_pages[page_index]);
         session->kv_pages[page_index] = updated;
       }
     }
     if (iree_status_is_ok(status)) {
-      snprintf(function_name, sizeof(function_name), "module.layer_finish_%zu",
-               layer);
+      snprintf(function_name, sizeof(function_name),
+               "%s.%slayer_finish_%zu", module_name, function_prefix, layer);
       status = invoke_void(session, function_name, NULL, 0);
     }
   }
   iree_hal_buffer_view_t* logits_input[1] = {v_last};
   if (iree_status_is_ok(status)) {
-    status = invoke_named(session, "module.chunk_logits", logits_input, 1,
-                          out_logits, out_count);
+    snprintf(function_name, sizeof(function_name), "%s.%schunk_logits",
+             module_name, function_prefix);
+    status = invoke_named(session, function_name, logits_input, 1, out_logits,
+                          out_count);
   }
   iree_hal_buffer_view_release(v_tokens);
   iree_hal_buffer_view_release(v_last);

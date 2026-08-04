@@ -118,7 +118,7 @@ enum Commands {
         /// Legacy prefill window. Paged executables use chunks up to 2048 tokens.
         #[arg(long)]
         prefill_window: Option<u32>,
-        /// Session/model context limit. Values above 512 select paged KV ABI v3.
+        /// Session/model context limit. Values above 512 select paged KV ABI v5.
         #[arg(long)]
         max_kv: Option<u32>,
     },

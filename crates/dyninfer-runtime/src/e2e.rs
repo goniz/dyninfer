@@ -585,8 +585,8 @@ mod tests {
             )
             .unwrap();
         let model = loader.load_bundle(&bundle, &ckpt).unwrap();
-        assert_eq!(model.manifest.version, 3);
-        assert_eq!(model.manifest.prefill_window, 256);
+        assert_eq!(model.manifest.version, 5);
+        assert_eq!(model.manifest.prefill_window, 2048);
 
         let mut session = model.create_session(SessionConfig::default()).unwrap();
         let tokens: Vec<u32> = (0..257).map(|index| 1 + index % 30).collect();

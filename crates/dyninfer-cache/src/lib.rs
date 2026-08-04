@@ -45,6 +45,8 @@ pub struct CacheEntry {
     pub key: CacheKey,
     pub manifest_path: PathBuf,
     pub vmfb_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_vmfb_path: Option<PathBuf>,
     pub size_bytes: u64,
 }
 
@@ -81,6 +83,7 @@ impl ArtifactCache {
         &self,
         key: &CacheKey,
         vmfb: &[u8],
+        decode_vmfb: Option<&[u8]>,
         manifest: &ExecutableManifest,
     ) -> Result<CacheEntry> {
         let digest = key.digest()?;
@@ -117,6 +120,13 @@ impl ArtifactCache {
                     .map_err(|e| cache_io(&digest, &vmfb_path, e))?;
                 f.sync_all().ok();
             }
+            if let Some(bytes) = decode_vmfb {
+                let path = staging.join("decode.vmfb");
+                let mut f = fs::File::create(&path).map_err(|e| cache_io(&digest, &path, e))?;
+                f.write_all(bytes)
+                    .map_err(|e| cache_io(&digest, &path, e))?;
+                f.sync_all().ok();
+            }
             let manifest_path = staging.join("manifest.json");
             let json = serde_json::to_vec_pretty(manifest)?;
             fs::write(&manifest_path, json).map_err(|e| cache_io(&digest, &manifest_path, e))?;
@@ -141,7 +151,8 @@ impl ArtifactCache {
                 key: key.clone(),
                 manifest_path: dir.join("manifest.json"),
                 vmfb_path: dir.join("model.vmfb"),
-                size_bytes: vmfb.len() as u64,
+                decode_vmfb_path: decode_vmfb.map(|_| dir.join("decode.vmfb")),
+                size_bytes: (vmfb.len() + decode_vmfb.map_or(0, <[u8]>::len)) as u64,
             })
         })();
 
@@ -176,7 +187,14 @@ impl ArtifactCache {
                 key,
                 manifest_path,
                 vmfb_path: vmfb_path.clone(),
-                size_bytes: fs::metadata(&vmfb_path).map(|m| m.len()).unwrap_or(0),
+                decode_vmfb_path: path
+                    .join("decode.vmfb")
+                    .is_file()
+                    .then(|| path.join("decode.vmfb")),
+                size_bytes: fs::metadata(&vmfb_path).map(|m| m.len()).unwrap_or(0)
+                    + fs::metadata(path.join("decode.vmfb"))
+                        .map(|m| m.len())
+                        .unwrap_or(0),
             });
         }
         out.sort_by(|a, b| a.digest.as_str().cmp(b.digest.as_str()));
@@ -218,14 +236,19 @@ impl ArtifactCache {
         let dir = self.entry_dir(digest);
         let manifest_path = dir.join("manifest.json");
         let vmfb_path = dir.join("model.vmfb");
+        let decode_vmfb_path = dir.join("decode.vmfb");
         if manifest_path.is_file() && vmfb_path.is_file() {
-            let size_bytes = fs::metadata(&vmfb_path).map(|m| m.len()).unwrap_or(0);
+            let size_bytes = fs::metadata(&vmfb_path).map(|m| m.len()).unwrap_or(0)
+                + fs::metadata(&decode_vmfb_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
             debug!(digest = %digest.short(), "cache hit");
             Some(CacheEntry {
                 digest: digest.clone(),
                 key: key.clone(),
                 manifest_path,
                 vmfb_path,
+                decode_vmfb_path: decode_vmfb_path.is_file().then_some(decode_vmfb_path),
                 size_bytes,
             })
         } else {
@@ -430,7 +453,7 @@ mod tests {
             prefill_window: 4,
             diagnostics: vec![],
         };
-        cache.publish(&key, b"VMFBSTUB", &manifest).unwrap();
+        cache.publish(&key, b"VMFBSTUB", None, &manifest).unwrap();
         let hit = cache.lookup(&key).unwrap().expect("hit");
         assert_eq!(fs::read(hit.vmfb_path).unwrap(), b"VMFBSTUB");
         assert!(!dir.path().join("parameters").exists());
