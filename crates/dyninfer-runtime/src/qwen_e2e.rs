@@ -475,7 +475,7 @@ mod tests {
             )
             .unwrap();
         let model = loader.load_bundle(&bundle, &ckpt).unwrap();
-        assert_eq!(model.manifest.version, 5);
+        assert_eq!(model.manifest.version, 6);
         let mut session = model
             .create_session(SessionConfig {
                 max_sequence_length: 4224,

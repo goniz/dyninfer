@@ -9,8 +9,10 @@
 #include "iree/io/file_handle.h"
 #include "iree/io/parameter_index.h"
 #include "iree/io/parameter_index_provider.h"
+#include "iree/modules/hal/types.h"
 #include "iree/modules/io/parameters/module.h"
 #include "iree/runtime/api.h"
+#include "iree/vm/api.h"
 
 struct dyninfer_iree_session_t {
   iree_runtime_instance_t* instance;
@@ -521,48 +523,6 @@ int dyninfer_iree_session_invoke_decode(dyninfer_iree_session_t* session,
   return 0;
 }
 
-static iree_status_t invoke_void(dyninfer_iree_session_t* wrapper,
-                                 const char* full_name,
-                                 iree_hal_buffer_view_t** inputs,
-                                 iree_host_size_t input_count) {
-  iree_runtime_call_t call;
-  IREE_RETURN_IF_ERROR(iree_runtime_call_initialize_by_name(
-      wrapper->session, iree_make_cstring_view(full_name), &call));
-  iree_status_t status = iree_ok_status();
-  for (iree_host_size_t i = 0; iree_status_is_ok(status) && i < input_count;
-       ++i) {
-    status = iree_runtime_call_inputs_push_back_buffer_view(&call, inputs[i]);
-  }
-  if (iree_status_is_ok(status)) {
-    status = iree_runtime_call_invoke(&call, /*flags=*/0);
-  }
-  iree_runtime_call_deinitialize(&call);
-  return status;
-}
-
-static iree_status_t invoke_buffer_view(
-    dyninfer_iree_session_t* wrapper, const char* full_name,
-    iree_hal_buffer_view_t** inputs, iree_host_size_t input_count,
-    iree_hal_buffer_view_t** out_view) {
-  *out_view = NULL;
-  iree_runtime_call_t call;
-  IREE_RETURN_IF_ERROR(iree_runtime_call_initialize_by_name(
-      wrapper->session, iree_make_cstring_view(full_name), &call));
-  iree_status_t status = iree_ok_status();
-  for (iree_host_size_t i = 0; iree_status_is_ok(status) && i < input_count;
-       ++i) {
-    status = iree_runtime_call_inputs_push_back_buffer_view(&call, inputs[i]);
-  }
-  if (iree_status_is_ok(status)) {
-    status = iree_runtime_call_invoke(&call, /*flags=*/0);
-  }
-  if (iree_status_is_ok(status)) {
-    status = iree_runtime_call_outputs_pop_front_buffer_view(&call, out_view);
-  }
-  iree_runtime_call_deinitialize(&call);
-  return status;
-}
-
 int dyninfer_iree_session_configure_paged_kv(
     dyninfer_iree_session_t* session, size_t layer_count, size_t page_size,
     size_t kv_head_count, size_t head_dim, size_t chunk_size) {
@@ -650,6 +610,59 @@ int dyninfer_iree_session_ensure_kv_pages(dyninfer_iree_session_t* session,
   return 0;
 }
 
+static iree_status_t invoke_paged_chunk_once(
+    dyninfer_iree_session_t* wrapper, const char* full_name,
+    iree_hal_buffer_view_t* v_tokens, iree_hal_buffer_view_t* v_last,
+    iree_hal_buffer_view_t* v_start, float** out_logits, size_t* out_count) {
+  iree_runtime_call_t call;
+  IREE_RETURN_IF_ERROR(iree_runtime_call_initialize_by_name(
+      wrapper->session, iree_make_cstring_view(full_name), &call));
+
+  iree_status_t status = iree_ok_status();
+  if (iree_status_is_ok(status)) {
+    status = iree_runtime_call_inputs_push_back_buffer_view(&call, v_tokens);
+  }
+  if (iree_status_is_ok(status)) {
+    status = iree_runtime_call_inputs_push_back_buffer_view(&call, v_last);
+  }
+  if (iree_status_is_ok(status)) {
+    status = iree_runtime_call_inputs_push_back_buffer_view(&call, v_start);
+  }
+  for (size_t i = 0; iree_status_is_ok(status) && i < wrapper->kv_page_count;
+       ++i) {
+    status = iree_runtime_call_inputs_push_back_buffer_view(
+        &call, wrapper->kv_pages[i]);
+  }
+  if (iree_status_is_ok(status)) {
+    status = iree_runtime_call_invoke(&call, /*flags=*/0);
+  }
+
+  iree_hal_buffer_view_t* logits_view = NULL;
+  if (iree_status_is_ok(status)) {
+    status =
+        iree_runtime_call_outputs_pop_front_buffer_view(&call, &logits_view);
+  }
+  if (iree_status_is_ok(status)) {
+    status = copy_f32_view_to_host(wrapper->session, logits_view,
+                                   &wrapper->logits_host,
+                                   &wrapper->logits_capacity, out_logits,
+                                   out_count);
+  }
+  iree_hal_buffer_view_release(logits_view);
+
+  for (size_t i = 0; iree_status_is_ok(status) && i < wrapper->kv_page_count;
+       ++i) {
+    iree_hal_buffer_view_t* updated = NULL;
+    status =
+        iree_runtime_call_outputs_pop_front_buffer_view(&call, &updated);
+    if (!iree_status_is_ok(status)) break;
+    iree_hal_buffer_view_release(wrapper->kv_pages[i]);
+    wrapper->kv_pages[i] = updated;
+  }
+  iree_runtime_call_deinitialize(&call);
+  return status;
+}
+
 int dyninfer_iree_session_invoke_paged_chunk(
     dyninfer_iree_session_t* session, const int64_t* tokens,
     size_t token_count, int64_t last, int64_t start_pos, float** out_logits,
@@ -663,12 +676,14 @@ int dyninfer_iree_session_invoke_paged_chunk(
     return 1;
   }
   const bool is_decode = token_count == 1;
-  const char* function_prefix = is_decode ? "decode_" : "";
   const char* module_name =
       session->split_modules ? (is_decode ? "decode" : "prefill") : "module";
+  const char* entry = is_decode ? "decode_chunk" : "prefill_chunk";
+  char function_name[96];
+  snprintf(function_name, sizeof(function_name), "%s.%s", module_name, entry);
+
   iree_hal_dim_t token_shape[1] = {(iree_hal_dim_t)token_count};
-  iree_hal_buffer_view_t *v_tokens = NULL, *v_last = NULL, *v_start = NULL,
-                         *v_page_index = NULL, *v_layer_index = NULL;
+  iree_hal_buffer_view_t *v_tokens = NULL, *v_last = NULL, *v_start = NULL;
   iree_status_t status = allocate_i64_tensor(session->session, 1, token_shape,
                                               tokens, token_count, &v_tokens);
   if (iree_status_is_ok(status))
@@ -676,60 +691,13 @@ int dyninfer_iree_session_invoke_paged_chunk(
   if (iree_status_is_ok(status))
     status =
         allocate_i64_tensor(session->session, 0, NULL, &start_pos, 1, &v_start);
-  iree_hal_buffer_view_t* begin_inputs[3] = {v_tokens, v_last, v_start};
-  char function_name[96];
   if (iree_status_is_ok(status)) {
-    snprintf(function_name, sizeof(function_name), "%s.%schunk_begin",
-             module_name, function_prefix);
-    status = invoke_void(session, function_name, begin_inputs, 3);
-  }
-
-  for (size_t layer = 0;
-       iree_status_is_ok(status) && layer < session->kv_layer_count; ++layer) {
-    snprintf(function_name, sizeof(function_name),
-             "%s.%slayer_prepare_%zu", module_name, function_prefix, layer);
-    status = invoke_void(session, function_name, NULL, 0);
-    if (iree_status_is_ok(status)) {
-      status = ensure_i64_scalar_view(session->session, &v_layer_index,
-                                      (int64_t)layer);
-    }
-    for (size_t page_index = 0;
-         iree_status_is_ok(status) && page_index < session->kv_page_count;
-         ++page_index) {
-      int64_t page_index_i64 = (int64_t)page_index;
-      status = ensure_i64_scalar_view(session->session, &v_page_index,
-                                      page_index_i64);
-      if (!iree_status_is_ok(status)) break;
-      iree_hal_buffer_view_t* page_inputs[4] = {
-          session->kv_pages[page_index], v_page_index, v_start, v_layer_index};
-      iree_hal_buffer_view_t* updated = NULL;
-      snprintf(function_name, sizeof(function_name), "%s.%slayer_page",
-               module_name, function_prefix);
-      status =
-          invoke_buffer_view(session, function_name, page_inputs, 4, &updated);
-      if (iree_status_is_ok(status)) {
-        iree_hal_buffer_view_release(session->kv_pages[page_index]);
-        session->kv_pages[page_index] = updated;
-      }
-    }
-    if (iree_status_is_ok(status)) {
-      snprintf(function_name, sizeof(function_name),
-               "%s.%slayer_finish_%zu", module_name, function_prefix, layer);
-      status = invoke_void(session, function_name, NULL, 0);
-    }
-  }
-  iree_hal_buffer_view_t* logits_input[1] = {v_last};
-  if (iree_status_is_ok(status)) {
-    snprintf(function_name, sizeof(function_name), "%s.%schunk_logits",
-             module_name, function_prefix);
-    status = invoke_named(session, function_name, logits_input, 1, out_logits,
-                          out_count);
+    status = invoke_paged_chunk_once(session, function_name, v_tokens, v_last,
+                                     v_start, out_logits, out_count);
   }
   iree_hal_buffer_view_release(v_tokens);
   iree_hal_buffer_view_release(v_last);
   iree_hal_buffer_view_release(v_start);
-  iree_hal_buffer_view_release(v_page_index);
-  iree_hal_buffer_view_release(v_layer_index);
   if (!iree_status_is_ok(status)) {
     set_error_status(status);
     return 1;

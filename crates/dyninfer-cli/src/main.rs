@@ -128,7 +128,7 @@ enum Commands {
         #[arg(long)]
         prefill_window: Option<u32>,
         /// Session/model context limit. Defaults to prompt tokens + --max-new-tokens.
-        /// Values above 512 select paged KV ABI v5.
+        /// Values above 512 select paged KV ABI v6.
         #[arg(long)]
         max_kv: Option<u32>,
     },

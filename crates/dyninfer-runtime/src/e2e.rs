@@ -585,16 +585,31 @@ mod tests {
             )
             .unwrap();
         let model = loader.load_bundle(&bundle, &ckpt).unwrap();
-        assert_eq!(model.manifest.version, 5);
+        assert_eq!(model.manifest.version, 6);
         assert_eq!(model.manifest.prefill_window, 512);
 
         let mut session = model.create_session(SessionConfig::default()).unwrap();
         let tokens: Vec<u32> = (0..257).map(|index| 1 + index % 30).collect();
-        let _ = session.prefill(&tokens).unwrap();
+        let prefill = session.prefill(&tokens).unwrap();
+        let prefill_bad = prefill
+            .values
+            .iter()
+            .filter(|value| !value.is_finite())
+            .count();
+        assert_eq!(prefill_bad, 0, "prefill produced non-finite logits");
         let logits = session.decode(7).unwrap();
-        assert!(logits.values.iter().all(|value| value.is_finite()));
+        let decode_bad = logits
+            .values
+            .iter()
+            .filter(|value| !value.is_finite())
+            .count();
+        assert_eq!(
+            decode_bad, 0,
+            "decode produced {decode_bad} non-finite logits (of {})",
+            logits.values.len()
+        );
         let metrics = session.kv_cache_metrics().unwrap();
-        assert_eq!(metrics.page_count, 2);
+        assert_eq!(metrics.page_count, 4); // ceil(1024/256) for ABI v6 fixed arity
         assert!(metrics.allocated_bytes > 0);
         session.reset().unwrap();
         assert_eq!(session.kv_cache_metrics().unwrap().page_count, 0);

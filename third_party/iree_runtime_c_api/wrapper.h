@@ -44,7 +44,7 @@ int dyninfer_iree_session_create_with_file_params(
     const dyninfer_iree_file_param_t* params, size_t param_count,
     dyninfer_iree_session_t** out_session);
 
-// ABI v5: appends independently compiled prefill and decode modules to one
+// ABI v6: appends independently compiled prefill and decode modules to one
 // session so both share the same device and runtime-owned KV pages.
 int dyninfer_iree_session_create_modules_with_file_params(
     const char* device_uri, const char* prefill_vmfb_path,

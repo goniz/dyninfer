@@ -128,11 +128,13 @@ impl ModelSession for IreeSession {
         self.history.extend_from_slice(tokens);
         let values = if let Some((page_size, chunk_size)) = self.paged_geometry() {
             self.context.reset_paged_kv()?;
+            // ABI v6 fused entrypoints take a compile-time page arity of
+            // ceil(max_kv / page_size); allocate the full set up front.
+            let max_pages = (self.max_seq() as usize).div_ceil(page_size).max(1);
+            self.context.ensure_kv_pages(max_pages)?;
             let mut logits = Vec::new();
             for (chunk_index, chunk) in tokens.chunks(chunk_size).enumerate() {
                 let start = chunk_index * chunk_size;
-                let required_pages = (start + chunk.len()).div_ceil(page_size);
-                self.context.ensure_kv_pages(required_pages)?;
                 let (window, last) = self.window_from_tokens(chunk);
                 logits = self
                     .context
@@ -181,8 +183,8 @@ impl ModelSession for IreeSession {
             }));
         }
         let values = if let Some((page_size, _)) = self.paged_geometry() {
-            self.context
-                .ensure_kv_pages((self.position as usize + 1).div_ceil(page_size))?;
+            let max_pages = (self.max_seq() as usize).div_ceil(page_size).max(1);
+            self.context.ensure_kv_pages(max_pages)?;
             let decode_token = [i64::from(token)];
             self.context
                 .invoke_paged_chunk(&decode_token, 0, self.position as i64)?

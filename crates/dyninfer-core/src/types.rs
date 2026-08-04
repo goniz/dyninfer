@@ -605,8 +605,8 @@ pub enum KvCacheStorage {
     /// Legacy ABI: cache tensors are hidden mutable VM globals.
     #[default]
     StaticGlobals,
-    /// ABI v5: the runtime owns device pages shared by separately compiled
-    /// chunked-prefill and one-token decode modules.
+    /// ABI v6: the runtime owns device pages shared by separately compiled
+    /// prefill/decode modules; each chunk is one fused host invoke.
     Paged { page_size: u32, chunk_size: u32 },
 }
 

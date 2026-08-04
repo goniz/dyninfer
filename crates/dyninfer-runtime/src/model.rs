@@ -36,13 +36,8 @@ fn validate_executable_abi(manifest: &ExecutableManifest, bundle: &Path) -> Resu
                 page_size,
                 chunk_size,
             },
-            5,
-        ) if *page_size > 0 && *chunk_size > 0 => &[
-            "chunk_begin",
-            "chunk_logits",
-            "decode_chunk_begin",
-            "decode_chunk_logits",
-        ],
+            6,
+        ) if *page_size > 0 && *chunk_size > 0 => &["prefill_chunk", "decode_chunk"],
         _ => {
             return Err(DynInferError::Cache(CacheError {
                 message: format!(
@@ -372,13 +367,13 @@ impl ModelLoader {
         let vmfb_path = bundle.join("executables").join("model.vmfb");
         let manifest: ExecutableManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
         let decode_vmfb_path =
-            (manifest.version == 5).then(|| bundle.join("executables").join("decode.vmfb"));
+            (manifest.version == 6).then(|| bundle.join("executables").join("decode.vmfb"));
         if decode_vmfb_path
             .as_ref()
             .is_some_and(|path| !path.is_file())
         {
             return Err(DynInferError::Cache(CacheError {
-                message: "paged ABI v5 bundle is missing decode.vmfb".into(),
+                message: "paged ABI v6 bundle is missing decode.vmfb".into(),
                 digest: None,
                 path: Some(bundle.display().to_string()),
             }));
@@ -596,9 +591,9 @@ impl ModelLoader {
         } else {
             None
         };
-        if manifest.version == 5 && decode_vmfb_path.is_none() {
+        if manifest.version == 6 && decode_vmfb_path.is_none() {
             return Err(DynInferError::Cache(CacheError {
-                message: "paged ABI v5 cache entry is missing decode.vmfb".into(),
+                message: "paged ABI v6 cache entry is missing decode.vmfb".into(),
                 digest: None,
                 path: Some(root.display().to_string()),
             }));

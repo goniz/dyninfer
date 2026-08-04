@@ -25,7 +25,7 @@ use dyninfer_error::{CompilationError, Diagnostic, DynInferError, Result, Severi
 use serde::{Deserialize, Serialize};
 use tracing::{info, info_span};
 
-pub const COMPILER_VERSION: &str = "0.3.0-iree-3.11.0-paged-kv-v5.1";
+pub const COMPILER_VERSION: &str = "0.3.0-iree-3.11.0-paged-kv-v6";
 /// Pinned IREE pip / source revision identity for executable cache keys (spec §19.1).
 pub const IREE_REVISION: &str = "3.11.0+e4a3b0405d7d";
 /// Kernel registry policy version included in executable cache keys.
@@ -500,11 +500,10 @@ impl ModelCompiler for LocalCompiler {
             .unwrap_or(1);
         let prefill_window = lowering.prefill_window;
         let paged_kv = lowering.paged_kv;
-        let num_layers = lowering.num_layers;
         validate_binding_for_compile(&request.bound_model.binding)?;
         let manifest = ExecutableManifest {
             format: "dyninfer.bundle".into(),
-            version: if paged_kv { 5 } else { 2 },
+            version: if paged_kv { 6 } else { 2 },
             architecture_id: request.bound_model.architecture.architecture_id.clone(),
             architecture_revision: request.architecture_revision.into(),
             checkpoint_schema: request.checkpoint_schema.clone(),
@@ -521,22 +520,11 @@ impl ModelCompiler for LocalCompiler {
             entrypoints: if request.options.smoke_only {
                 vec!["add".into()]
             } else if paged_kv {
-                let mut entries = vec![
-                    "chunk_begin".into(),
-                    "layer_page".into(),
-                    "chunk_logits".into(),
-                    "decode_chunk_begin".into(),
-                    "decode_layer_page".into(),
-                    "decode_chunk_logits".into(),
+                vec![
+                    "prefill_chunk".into(),
+                    "decode_chunk".into(),
                     "add".into(),
-                ];
-                for layer in 0..num_layers {
-                    entries.push(format!("layer_prepare_{layer}"));
-                    entries.push(format!("layer_finish_{layer}"));
-                    entries.push(format!("decode_layer_prepare_{layer}"));
-                    entries.push(format!("decode_layer_finish_{layer}"));
-                }
-                entries
+                ]
             } else {
                 vec!["prefill".into(), "decode".into(), "add".into()]
             },
