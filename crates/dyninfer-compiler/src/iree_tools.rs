@@ -105,7 +105,7 @@ impl IreeTools {
     }
 
     /// Like [`Self::compile_mlir_with_flags`], optionally prepending `extra_path`
-    /// so IREE preprocess tools (e.g. Vulkan LDS clamp) resolve.
+    /// so IREE preprocess tools resolve.
     pub fn compile_mlir_with_flags_and_path(
         &self,
         mlir: &str,

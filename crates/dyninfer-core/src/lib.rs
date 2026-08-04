@@ -29,6 +29,5 @@ pub use types::{
     KvCacheLayout, KvCacheStorage, LogicalTensorConstraint, LogicalTensorType,
     ManifestParameterComponent, MetadataMap, ModelMetadata, ParameterBinding,
     ParameterComponentBinding, ParameterRole, ParameterSlot, PhysicalEncoding, SessionConfig,
-    SourceFile, StorageComponent, TargetProfile, TokenId, VULKAN_LDS_CLAMP_TOOL, ZeroPointMode,
-    vulkan_executable_flags,
+    SourceFile, StorageComponent, TargetProfile, TokenId, ZeroPointMode,
 };

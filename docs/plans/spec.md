@@ -6,7 +6,7 @@
 **Primary implementation language:** Rust 2024 edition  
 **Build system:** Bazel with `rules_rs`  
 **Compiler backend:** MLIR + IREE  
-**Initial deployment targets:** Linux x86-64 and AArch64; LLVM CPU and Vulkan GPU
+**Initial deployment targets:** Linux x86-64 and AArch64; LLVM CPU and HIP/ROCm GPU
 
 ---
 
@@ -278,7 +278,7 @@ model.bundle/
 |-- bindings.json
 |-- checkpoint-schema.json
 |-- executables/
-|   |-- vulkan-generic.vmfb
+|   |-- cuda-sm_80.vmfb
 |   |-- llvm-cpu-x86_64.vmfb
 |   `-- rocm-gfx1151.vmfb
 |-- tuning/
@@ -774,7 +774,7 @@ IREE defines:
 - Fusion and canonical optimization.
 - Workgroup/thread distribution.
 - Vector and backend lowering.
-- SPIR-V, LLVM CPU, CUDA, or ROCm executable generation.
+- LLVM CPU, CUDA, or ROCm executable generation.
 - VMFB packaging and HAL invocation.
 
 ### 13.2 Kernel levels
@@ -1606,7 +1606,7 @@ dyninfer bind \
 dyninfer compile \
   --architecture llama.arch \
   --checkpoint model.gguf \
-  --target vulkan://local \
+  --target hip://local \
   --mode local-jit \
   --output model.bundle
 ```
@@ -1733,7 +1733,7 @@ Reference implementation
   versus
 CPU IREE executable
   versus
-Vulkan IREE executable
+HIP IREE executable
 ```
 
 Compare:
@@ -1818,7 +1818,7 @@ Sensitive checkpoint contents MUST NOT be logged.
 - Rust-to-C++ compiler bridge.
 - Compile and invoke a trivial dense MLIR module.
 
-**Exit criterion:** Rust CLI compiles MLIR to VMFB and invokes it on CPU and Vulkan.
+**Exit criterion:** Rust CLI compiles MLIR to VMFB and invokes it on CPU and HIP.
 
 ### Milestone 1: Dense Llama proof of concept
 
@@ -1837,7 +1837,7 @@ Sensitive checkpoint contents MUST NOT be logged.
 - Q4_0 physical encoding.
 - Portable generated Q4_0 linear kernel.
 - Direct original-checkpoint parameter provider.
-- CPU and Vulkan differential tests.
+- CPU and HIP differential tests.
 
 **Exit criterion:** Run an unmodified Q4_0 GGUF checkpoint through the engine.
 
@@ -1854,7 +1854,7 @@ Sensitive checkpoint contents MUST NOT be logged.
 
 - Specialized decode attention.
 - GQA-aware cache access.
-- Vulkan subgroup-aware Q4_0 lowering.
+- HIP subgroup-aware Q4_0 lowering.
 - Buffer reuse and asynchronous execution.
 
 ### Milestone 5: Additional formats and targets
@@ -1875,7 +1875,7 @@ Version 1 is complete when:
 3. C++ is limited to MLIR/IREE compiler extension and C ABI code.
 4. An unmodified SafeTensors dense checkpoint runs locally.
 5. An unmodified GGUF Q4_0 checkpoint runs locally.
-6. Both CPU and Vulkan backends are supported.
+6. Both CPU and HIP backends are supported.
 7. Separate prefill and decode VM functions are generated.
 8. Executable caching reuses code across checkpoints with compatible schemas.
 9. Derived parameter caches never modify the original checkpoint.
@@ -1890,7 +1890,7 @@ Version 1 is complete when:
 The following decisions should be captured in architecture decision records during implementation:
 
 1. Whether checkpoint canonical names are embedded into VMFBs or resolved through an aliasing parameter provider.
-2. Whether the first quantized Vulkan lowering uses pure standard/vector MLIR or a target-specific IREE compiler extension.
+2. Whether the first quantized GPU lowering uses pure standard/vector MLIR or a target-specific IREE compiler extension.
 3. Whether KV cache is represented as explicit tensors, HAL buffers, or a custom runtime resource in later versions.
 4. Whether the compiler is linked in-process by default or always invoked as a worker.
 5. How architecture MLIR dialect version migration is handled.
@@ -1911,7 +1911,7 @@ To minimize risk, the implementation should begin with these choices:
 - Actual checkpoint keys embedded in the first VMFB binding implementation.
 - SafeTensors BF16 followed by GGUF Q4_0.
 - Explicit static KV-cache tensors.
-- CPU reference backend before Vulkan optimization.
+- CPU reference backend before GPU optimization.
 - Generic generated quantized kernels before handwritten kernels.
 - In-process compiler for development, worker process option before accepting untrusted packages.
 - Sampling in Rust for version 1.

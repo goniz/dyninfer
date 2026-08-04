@@ -114,7 +114,7 @@ pub struct Context {
     /// Explicit original-file/range descriptors, shared by independent
     /// sessions without staging checkpoint payloads in host memory.
     file_parameters: Option<Arc<FileParameterStorage>>,
-    /// IREE HAL driver name or full device URI (`hip`, `vulkan://…`, …).
+    /// IREE HAL driver name or full device URI (`hip`, `hip://GPU-…`, …).
     /// Empty → local-task.
     device: Option<String>,
     session: Mutex<Option<NativeSession>>,
@@ -236,7 +236,7 @@ impl Context {
         self
     }
 
-    /// Set HAL device/driver or full device URI (e.g. `hip`, `vulkan://GPU-…`).
+    /// Set HAL device/driver or full device URI (e.g. `hip`, `hip://GPU-…`).
     /// `rocm` aliases to `hip`. Bare driver names still select the default device.
     pub fn with_device(mut self, device: impl Into<String>) -> Self {
         let d = device.into();

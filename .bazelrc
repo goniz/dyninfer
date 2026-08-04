@@ -13,8 +13,8 @@ common --noincompatible_disallow_empty_glob
 build --features=-layering_check
 
 # Skip AMDGPU device-bitcode / CUDA host drivers for the in-process runtime
-# (HIP + CPU + Vulkan are enough for dyninfer). Override on the CLI if needed.
-build --@iree_core//runtime/src/iree/hal/drivers:enabled_drivers=hip,local-sync,local-task,null,vulkan
+# (HIP + CPU are enough for dyninfer). Override on the CLI if needed.
+build --@iree_core//runtime/src/iree/hal/drivers:enabled_drivers=hip,local-sync,local-task,null
 
 build --keep_going
 build --show_timestamps

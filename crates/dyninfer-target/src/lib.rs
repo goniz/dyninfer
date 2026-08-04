@@ -16,7 +16,7 @@ pub struct DiscoveredDevice {
     pub driver: String,
     pub device_id: u32,
     pub name: String,
-    /// IREE device URI (`hip://…`, `vulkan://…`, …).
+    /// IREE device URI (`hip://…`, `cuda://…`, …).
     pub uri: String,
     /// GPU arch from dump (`gfx1151`, `sm_80`), when known.
     pub arch: Option<String>,
@@ -51,7 +51,7 @@ impl TargetDiscovery {
         }
     }
 
-    /// Best target for this machine: CUDA/HIP ≻ Vulkan ≻ CPU.
+    /// Best target for this machine: CUDA/HIP ≻ CPU.
     pub fn select_best(&self) -> Result<TargetProfile> {
         let devices = self.discover()?;
         let device = devices.into_iter().next().unwrap_or_else(cpu_device);
@@ -64,10 +64,8 @@ impl TargetDiscovery {
     /// Parse a CLI / config target spec into a [`TargetProfile`].
     ///
     /// Supported:
-    /// - `auto` → probe IREE HAL devices; pick CUDA/HIP over Vulkan/CPU
+    /// - `auto` → probe IREE HAL devices; pick CUDA/HIP over CPU
     /// - `cpu` / `llvm-cpu` / `local*` → host CPU
-    /// - `vulkan` / `vulkan://…` → a matching locally discovered Vulkan device
-    /// - `vulkan:gfx1151` / `vulkan/rdna3` → Vulkan + arch for `--iree-vulkan-target`
     /// - `rocm` / `hip` → a matching locally discovered HIP device
     /// - `rocm:gfx1151` / `hip:gfx1100` / `rocm/gfx1151` → HIP + chip
     /// - `cuda` / `cuda:sm_80` → CUDA (+ arch)
@@ -84,8 +82,8 @@ impl TargetDiscovery {
             DynInferError::Config(ConfigError {
                 message: format!(
                     "unknown target specification: {spec} \
-                     (expected auto|cpu|vulkan|vulkan:<arch>|vulkan://<device>|\
-                     rocm|hip|cuda|rocm:<gfx>|cuda:<sm>)"
+                     (expected auto|cpu|rocm|hip|cuda|rocm:<gfx>|cuda:<sm>|\
+                     hip://<device>|cuda://<device>)"
                 ),
             })
         })?;
@@ -128,14 +126,13 @@ fn cpu_device() -> DiscoveredDevice {
     }
 }
 
-/// Preference: discrete GPU HAL (cuda, hip) ≻ vulkan ≻ CPU.
+/// Preference: discrete GPU HAL (cuda, hip) ≻ CPU.
 fn driver_rank(driver: &str) -> u8 {
     match driver {
         "cuda" => 0,
         "hip" | "rocm" => 1,
-        "vulkan" => 2,
-        "local-task" | "local-sync" | "local" => 3,
-        _ => 4,
+        "local-task" | "local-sync" | "local" => 2,
+        _ => 3,
     }
 }
 
@@ -172,13 +169,6 @@ struct GpuRequest {
 
 fn parse_gpu_request(spec: &str) -> Option<GpuRequest> {
     let lower = spec.to_ascii_lowercase();
-    if lower.starts_with("vulkan://") {
-        return Some(GpuRequest {
-            driver: "vulkan",
-            architecture: None,
-            uri: Some(spec.to_string()),
-        });
-    }
     if lower.starts_with("hip://") || lower.starts_with("rocm://") {
         return Some(GpuRequest {
             driver: "hip",
@@ -193,12 +183,7 @@ fn parse_gpu_request(spec: &str) -> Option<GpuRequest> {
             uri: Some(spec.to_string()),
         });
     }
-    for (prefix, driver) in [
-        ("vulkan", "vulkan"),
-        ("rocm", "hip"),
-        ("hip", "hip"),
-        ("cuda", "cuda"),
-    ] {
+    for (prefix, driver) in [("rocm", "hip"), ("hip", "hip"), ("cuda", "cuda")] {
         if lower == prefix {
             return Some(GpuRequest {
                 driver,
@@ -242,15 +227,13 @@ pub fn parse_dump_devices(dump: &str) -> Vec<DiscoveredDevice> {
     let mut pending: Option<PendingDevice> = None;
     let mut hip_index = 0u32;
     let mut cuda_index = 0u32;
-    let mut vulkan_index = 0u32;
 
     let flush = |pending: &mut Option<PendingDevice>,
                  devices: &mut Vec<DiscoveredDevice>,
                  hip_index: &mut u32,
-                 cuda_index: &mut u32,
-                 vulkan_index: &mut u32| {
+                 cuda_index: &mut u32| {
         if let Some(p) = pending.take() {
-            if let Some(dev) = pending_to_device(p, hip_index, cuda_index, vulkan_index) {
+            if let Some(dev) = pending_to_device(p, hip_index, cuda_index) {
                 devices.push(dev);
             }
         }
@@ -262,25 +245,13 @@ pub fn parse_dump_devices(dump: &str) -> Vec<DiscoveredDevice> {
             .strip_prefix("# Enumerated devices for driver '")
             .and_then(|s| s.strip_suffix('\''))
         {
-            flush(
-                &mut pending,
-                &mut devices,
-                &mut hip_index,
-                &mut cuda_index,
-                &mut vulkan_index,
-            );
+            flush(&mut pending, &mut devices, &mut hip_index, &mut cuda_index);
             current_driver = Some(driver.to_string());
             continue;
         }
 
         if let Some(rest) = trimmed.strip_prefix("# --device=") {
-            flush(
-                &mut pending,
-                &mut devices,
-                &mut hip_index,
-                &mut cuda_index,
-                &mut vulkan_index,
-            );
+            flush(&mut pending, &mut devices, &mut hip_index, &mut cuda_index);
             let uri = rest.trim().to_string();
             let driver = current_driver
                 .clone()
@@ -321,50 +292,7 @@ pub fn parse_dump_devices(dump: &str) -> Vec<DiscoveredDevice> {
             }
         }
     }
-    flush(
-        &mut pending,
-        &mut devices,
-        &mut hip_index,
-        &mut cuda_index,
-        &mut vulkan_index,
-    );
-
-    // Some Vulkan drivers omit `gpu-arch-name` while the HIP view of the
-    // same physical adapter reports it. An exact, unique device-name match is
-    // discovered evidence (not a guessed architecture), and gives IREE the
-    // target required to compile a Vulkan executable for that adapter.
-    let correlated_arches: Vec<_> = devices
-        .iter()
-        .filter(|device| device.driver == "hip" || device.driver == "cuda")
-        .filter_map(|device| {
-            device
-                .arch
-                .as_ref()
-                .map(|arch| (device.name.clone(), arch.clone()))
-        })
-        .collect();
-    for device in devices
-        .iter_mut()
-        .filter(|device| device.driver == "vulkan" && device.arch.is_none())
-    {
-        let mut matching = correlated_arches
-            .iter()
-            .filter(|(name, _)| name == &device.name)
-            .map(|(_, arch)| arch.as_str());
-        let Some(arch) = matching.next() else {
-            continue;
-        };
-        if matching.any(|other| other != arch) {
-            continue;
-        }
-        device.arch = Some(arch.to_string());
-        device.profile = TargetProfile::vulkan(arch)
-            .with_device_identity(device.device_id, device.uri.clone(), device.name.clone())
-            .with_execution_limits(
-                device.profile.subgroup_size,
-                device.profile.max_workgroup_invocations,
-            );
-    }
+    flush(&mut pending, &mut devices, &mut hip_index, &mut cuda_index);
 
     // Always offer CPU as a fallback option in the inventory.
     if !devices.iter().any(|d| d.driver.starts_with("local")) {
@@ -387,7 +315,6 @@ fn pending_to_device(
     p: PendingDevice,
     hip_index: &mut u32,
     cuda_index: &mut u32,
-    vulkan_index: &mut u32,
 ) -> Option<DiscoveredDevice> {
     let driver = p.driver.as_str();
     // Skip empty local placeholders already covered by cpu_device; keep one local-task.
@@ -436,30 +363,6 @@ fn pending_to_device(
                 device_id: id,
                 name,
                 uri: p.uri.clone(),
-                arch,
-                profile,
-            })
-        }
-        "vulkan" => {
-            let id = *vulkan_index;
-            *vulkan_index += 1;
-            let arch = p.arch.clone().filter(|s| !s.is_empty());
-            let name = nonempty_name(
-                &p.name,
-                &arch
-                    .as_ref()
-                    .map(|arch| format!("vulkan-{arch}"))
-                    .unwrap_or_else(|| "vulkan-device".into()),
-            );
-            let profile = TargetProfile::vulkan(arch.as_deref().unwrap_or(""))
-                .with_device_identity(id, p.uri.clone(), name.clone())
-                .with_discovered_features(p.features)
-                .with_execution_limits(p.subgroup_size, p.max_workgroup_invocations);
-            Some(DiscoveredDevice {
-                driver: "vulkan".into(),
-                device_id: id,
-                name,
-                uri: p.uri,
                 arch,
                 profile,
             })
@@ -528,22 +431,26 @@ mod tests {
 "#;
 
     #[test]
-    fn parses_dump_and_ranks_hip_over_vulkan_cpu() {
+    fn parses_dump_and_ranks_hip_over_cpu() {
         let mut devices = parse_dump_devices(SAMPLE_DUMP);
         sort_by_preference(&mut devices);
         assert_eq!(devices[0].driver, "hip");
         assert_eq!(devices[0].arch.as_deref(), Some("gfx1151"));
         assert_eq!(devices[0].profile.rocm_target(), Some("gfx1151"));
-        assert!(devices.iter().any(|d| d.driver == "vulkan"));
         assert!(devices.iter().any(|d| d.driver == "local-task"));
-        let vulkan = devices.iter().find(|d| d.driver == "vulkan").unwrap();
-        assert_eq!(vulkan.uri, "vulkan://00000000-f400-0000-0000-000000000000");
-        assert_eq!(
-            vulkan.profile.device_uri.as_deref(),
-            Some(vulkan.uri.as_str())
+        // Unsupported HAL drivers reported by IREE are never offered.
+        assert!(
+            devices
+                .iter()
+                .all(|d| d.driver == "hip" || d.driver == "local-task")
         );
-        assert!(vulkan.profile.is_compile_ready());
-        assert_eq!(vulkan.profile.vulkan_target(), Some("gfx1151"));
+    }
+
+    #[test]
+    fn unsupported_driver_specs_are_rejected() {
+        assert!(parse_gpu_request("vulkan").is_none());
+        assert!(parse_gpu_request("vulkan://GPU-0").is_none());
+        assert!(TargetDiscovery::resolve("vulkan").is_err());
     }
 
     #[test]

@@ -192,14 +192,6 @@ impl QuantizationDefinition for MlxAffineDefinition {
                     required_features: vec![],
                 },
             ),
-            (
-                "vulkan",
-                TargetConstraint {
-                    backends: vec!["vulkan".into()],
-                    exact_architectures: vec![],
-                    required_features: vec!["spirv".into()],
-                },
-            ),
         ];
         operations
         .into_iter()

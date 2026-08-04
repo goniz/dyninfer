@@ -617,7 +617,7 @@ mod tests {
         assert!(metrics.allocated_bytes > 0);
 
         // Multi-step greedy decode must stay finite and not collapse into a
-        // single repeating token (the Vulkan shared-memory bug surfaced as an
+        // single repeating token (GPU shared-memory bugs have surfaced as an
         // `odable`-style loop with finite but garbage logits).
         let mut greedy_tokens = Vec::with_capacity(16);
         let mut logits = logits;

@@ -345,10 +345,6 @@ pub fn emit_paged_causal_mask(
     page_size: u32,
     kv_heads: u32,
     gqa_group: u32,
-    // Vulkan SPIR-V cannot legalize `vector.step` from `linalg.index` inside
-    // the fused paged module; use dense position constants there. HIP prefers
-    // `linalg.index` because large dense constants break its codegen.
-    dense_index_constants: bool,
 ) -> Result<()> {
     let mask_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}x{page_size}xf32>");
     let mut f = module.func_private(name);
@@ -357,60 +353,8 @@ pub fn emit_paged_causal_mask(
     // Host/chunk valid length: only keys in `[start, start+valid)` are written.
     f.arg("valid_count", "tensor<i64>");
     f.result_ty(&mask_ty);
-    let body = if dense_index_constants {
-        // Build position tensors with `scf.for` instead of `arith.constant dense`.
-        // Large dense i64 constants inside the fused paged module have produced
-        // wrong masks on Vulkan (garbage decode) even though the math matches
-        // `linalg.index`; SPIR-V also rejects `linalg.index` → `vector.step`.
-        format!(
-            r#"  %start64 = tensor.extract %start_pos[] : tensor<i64>
-  %valid64 = tensor.extract %valid_count[] : tensor<i64>
-  %seq_end = arith.addi %start64, %valid64 : i64
-  %page64 = arith.index_cast %page_index : index to i64
-  %page_size64 = arith.constant {page_size} : i64
-  %page_start = arith.muli %page64, %page_size64 : i64
-  %c0 = arith.constant 0 : index
-  %c1 = arith.constant 1 : index
-  %query_len_c = arith.constant {query_len} : index
-  %page_size_c = arith.constant {page_size} : index
-  %query_e = tensor.empty() : tensor<{query_len}xi64>
-  %query_positions = scf.for %qi = %c0 to %query_len_c step %c1 iter_args(%qacc = %query_e) -> (tensor<{query_len}xi64>) {{
-    %qi64 = arith.index_cast %qi : index to i64
-    %qnext = tensor.insert %qi64 into %qacc[%qi] : tensor<{query_len}xi64>
-    scf.yield %qnext : tensor<{query_len}xi64>
-  }}
-  %key_e = tensor.empty() : tensor<{page_size}xi64>
-  %key_positions = scf.for %ki = %c0 to %page_size_c step %c1 iter_args(%kacc = %key_e) -> (tensor<{page_size}xi64>) {{
-    %ki64 = arith.index_cast %ki : index to i64
-    %knext = tensor.insert %ki64 into %kacc[%ki] : tensor<{page_size}xi64>
-    scf.yield %knext : tensor<{page_size}xi64>
-  }}
-  %zero = arith.constant 0.0 : f32
-  %neg = arith.constant -3.40282347E+38 : f32
-  %empty = tensor.empty() : {mask_ty}
-  %mask = linalg.generic {{
-      indexing_maps = [
-        affine_map<(kh, g, q, k) -> (q)>,
-        affine_map<(kh, g, q, k) -> (k)>,
-        affine_map<(kh, g, q, k) -> (kh, g, q, k)>
-      ],
-      iterator_types = ["parallel", "parallel", "parallel", "parallel"]}}
-    ins(%query_positions, %key_positions : tensor<{query_len}xi64>, tensor<{page_size}xi64>)
-    outs(%empty : {mask_ty}) {{
-    ^bb0(%q: i64, %k: i64, %o: f32):
-      %abs_q = arith.addi %start64, %q : i64
-      %abs_k = arith.addi %page_start, %k : i64
-      %causal = arith.cmpi ule, %abs_k, %abs_q : i64
-      %written = arith.cmpi ult, %abs_k, %seq_end : i64
-      %visible = arith.andi %causal, %written : i1
-      %value = arith.select %visible, %zero, %neg : f32
-      linalg.yield %value : f32
-  }} -> {mask_ty}
-  return %mask : {mask_ty}"#
-        )
-    } else {
-        format!(
-            r#"  %start64 = tensor.extract %start_pos[] : tensor<i64>
+    let body = format!(
+        r#"  %start64 = tensor.extract %start_pos[] : tensor<i64>
   %valid64 = tensor.extract %valid_count[] : tensor<i64>
   %seq_end = arith.addi %start64, %valid64 : i64
   %page64 = arith.index_cast %page_index : index to i64
@@ -437,8 +381,7 @@ pub fn emit_paged_causal_mask(
       linalg.yield %value : f32
   }} -> {mask_ty}
   return %mask : {mask_ty}"#
-        )
-    };
+    );
     f.op_asm(body);
     f.finish(module)
 }
@@ -534,7 +477,7 @@ mod online_attention_tests {
         emit_online_attention_page(&mut module, "online_page", 32, 256, 8, 2, 128).unwrap();
         emit_iree_online_attention_page(&mut module, "iree_online_page", 32, 256, 8, 2, 128)
             .unwrap();
-        emit_paged_causal_mask(&mut module, "paged_mask", 32, 256, 8, 2, false).unwrap();
+        emit_paged_causal_mask(&mut module, "paged_mask", 32, 256, 8, 2).unwrap();
         emit_rope_chunk(&mut module, "rope_chunk", 32, 8, 128, 1_000_000.0).unwrap();
         let text = module.finish().unwrap().mlir_text;
         assert!(text.contains("iree_linalg_ext.online_attention"));
