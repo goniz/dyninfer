@@ -1,0 +1,9 @@
+.git
+.gitignore
+bazel-*
+target/
+third_party/iree-venv/
+Dockerfile
+.dockerignore
+__pycache__/
+*.pyc
