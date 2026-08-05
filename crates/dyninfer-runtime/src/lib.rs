@@ -7,6 +7,8 @@ mod e2e;
 mod generate;
 mod hf_hub;
 mod model;
+mod perf;
+mod perf_sample;
 mod qwen_e2e;
 mod reference;
 mod session;
@@ -27,6 +29,8 @@ pub use hf_hub::{
     hf_hub_cache_dir, hf_repo_folder_name, resolve_hf_snapshot,
 };
 pub use model::{LoadedModel, ModelLoader};
+pub use perf::{PerfConfig, PerfReport, PhaseMetrics, format_perf_report, run_perf};
+pub use perf_sample::parse_token_count;
 pub use reference::{
     max_abs_err, tiny_llama_gguf_q4_0_prefill_logits, tiny_llama_mlx_u4_prefill_logits,
     tiny_llama_prefill_logits,
@@ -48,6 +52,17 @@ pub struct KvCacheMetrics {
     pub allocated_bytes: usize,
 }
 
+/// IREE HAL allocator statistics (zeros when unavailable).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AllocatorMetrics {
+    pub host_bytes_peak: u64,
+    pub host_bytes_allocated: u64,
+    pub host_bytes_freed: u64,
+    pub device_bytes_peak: u64,
+    pub device_bytes_allocated: u64,
+    pub device_bytes_freed: u64,
+}
+
 pub trait ModelSession: Send {
     fn prefill(&mut self, tokens: &[TokenId]) -> Result<Logits>;
     fn decode(&mut self, token: TokenId) -> Result<Logits>;
@@ -63,5 +78,8 @@ pub trait ModelSession: Send {
     fn reset(&mut self) -> Result<()>;
     fn kv_cache_metrics(&self) -> Result<KvCacheMetrics> {
         Ok(KvCacheMetrics::default())
+    }
+    fn allocator_metrics(&self) -> Result<AllocatorMetrics> {
+        Ok(AllocatorMetrics::default())
     }
 }

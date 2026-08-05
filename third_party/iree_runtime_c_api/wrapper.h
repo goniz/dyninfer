@@ -99,6 +99,23 @@ size_t dyninfer_iree_session_kv_page_count(
 size_t dyninfer_iree_session_kv_allocated_bytes(
     const dyninfer_iree_session_t* session);
 
+// Snapshot of IREE HAL allocator statistics (IREE_STATISTICS_ENABLE).
+// When statistics are compiled out, all fields are zeroed.
+typedef struct dyninfer_iree_allocator_statistics_t {
+  uint64_t host_bytes_peak;
+  uint64_t host_bytes_allocated;
+  uint64_t host_bytes_freed;
+  uint64_t device_bytes_peak;
+  uint64_t device_bytes_allocated;
+  uint64_t device_bytes_freed;
+} dyninfer_iree_allocator_statistics_t;
+
+// Query aggregate HAL allocator statistics for the session device.
+// Returns 0 on success; non-zero if session is null or has no allocator.
+int dyninfer_iree_session_allocator_statistics(
+    const dyninfer_iree_session_t* session,
+    dyninfer_iree_allocator_statistics_t* out_stats);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

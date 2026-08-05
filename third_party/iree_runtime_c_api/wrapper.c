@@ -921,3 +921,31 @@ size_t dyninfer_iree_session_kv_allocated_bytes(
     const dyninfer_iree_session_t* session) {
   return session ? session->kv_allocated_bytes : 0;
 }
+
+int dyninfer_iree_session_allocator_statistics(
+    const dyninfer_iree_session_t* session,
+    dyninfer_iree_allocator_statistics_t* out_stats) {
+  if (!session || !out_stats || !session->session) {
+    return 1;
+  }
+  memset(out_stats, 0, sizeof(*out_stats));
+  iree_hal_allocator_t* allocator =
+      iree_runtime_session_device_allocator(session->session);
+  if (!allocator) {
+    return 1;
+  }
+  iree_hal_allocator_statistics_t stats;
+  memset(&stats, 0, sizeof(stats));
+  iree_hal_allocator_query_statistics(allocator, &stats);
+#if IREE_STATISTICS_ENABLE
+  out_stats->host_bytes_peak = (uint64_t)stats.host_bytes_peak;
+  out_stats->host_bytes_allocated = (uint64_t)stats.host_bytes_allocated;
+  out_stats->host_bytes_freed = (uint64_t)stats.host_bytes_freed;
+  out_stats->device_bytes_peak = (uint64_t)stats.device_bytes_peak;
+  out_stats->device_bytes_allocated = (uint64_t)stats.device_bytes_allocated;
+  out_stats->device_bytes_freed = (uint64_t)stats.device_bytes_freed;
+#else
+  (void)stats;
+#endif
+  return 0;
+}

@@ -38,6 +38,17 @@ pub mod bindings {
         pub length: u64,
     }
 
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    pub struct dyninfer_iree_allocator_statistics_t {
+        pub host_bytes_peak: u64,
+        pub host_bytes_allocated: u64,
+        pub host_bytes_freed: u64,
+        pub device_bytes_peak: u64,
+        pub device_bytes_allocated: u64,
+        pub device_bytes_freed: u64,
+    }
+
     // Rust 2024 requires `unsafe extern` for FFI blocks.
     unsafe extern "C" {
         pub fn dyninfer_iree_session_create(
@@ -123,6 +134,10 @@ pub mod bindings {
         pub fn dyninfer_iree_session_kv_allocated_bytes(
             session: *const dyninfer_iree_session_t,
         ) -> usize;
+        pub fn dyninfer_iree_session_allocator_statistics(
+            session: *const dyninfer_iree_session_t,
+            out_stats: *mut dyninfer_iree_allocator_statistics_t,
+        ) -> c_int;
     }
 }
 

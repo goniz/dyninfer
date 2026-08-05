@@ -346,4 +346,16 @@ impl ModelSession for IreeSession {
             allocated_bytes,
         })
     }
+
+    fn allocator_metrics(&self) -> Result<crate::AllocatorMetrics> {
+        let s = self.context.allocator_statistics()?;
+        Ok(crate::AllocatorMetrics {
+            host_bytes_peak: s.host_bytes_peak,
+            host_bytes_allocated: s.host_bytes_allocated,
+            host_bytes_freed: s.host_bytes_freed,
+            device_bytes_peak: s.device_bytes_peak,
+            device_bytes_allocated: s.device_bytes_allocated,
+            device_bytes_freed: s.device_bytes_freed,
+        })
+    }
 }
