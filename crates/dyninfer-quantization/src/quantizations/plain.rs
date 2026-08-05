@@ -25,6 +25,16 @@ impl PlainDefinition {
         format!("plain.{}", self.storage_type)
     }
 
+    /// Rank of the checkpoint parameter consumed by `operation`.
+    fn logical_rank(operation: KernelOperationKind) -> usize {
+        match operation {
+            KernelOperationKind::RmsNorm | KernelOperationKind::PerHeadRmsNorm => 1,
+            // Depthwise short-conv weights are stored as `[channels, 1, kernel]`.
+            KernelOperationKind::ShortConv => 3,
+            _ => 2,
+        }
+    }
+
     fn candidate(
         &self,
         operation: KernelOperationKind,
@@ -42,16 +52,7 @@ impl PlainDefinition {
             output_types: vec![ScalarType::F32],
             accumulator_types: vec![ScalarType::F32],
             shape: ShapeConstraint {
-                logical_rank: Some(
-                    if matches!(
-                        operation,
-                        KernelOperationKind::RmsNorm | KernelOperationKind::PerHeadRmsNorm
-                    ) {
-                        1
-                    } else {
-                        2
-                    },
-                ),
+                logical_rank: Some(Self::logical_rank(operation)),
                 axis_multiples: vec![],
             },
             orientations: vec![ParameterOrientation::Native],
@@ -85,6 +86,7 @@ impl PlainDefinition {
             KernelOperationKind::RmsNorm => "rms_norm",
             KernelOperationKind::PerHeadRmsNorm => "per_head_rms_norm",
             KernelOperationKind::OutputProjection => "output_projection",
+            KernelOperationKind::ShortConv => "short_conv",
             _ => unreachable!(),
         };
         Some(KernelCandidateDescriptor {
@@ -100,16 +102,7 @@ impl PlainDefinition {
             // activation type is native f16/bf16.
             accumulator_types: vec![ScalarType::F32],
             shape: ShapeConstraint {
-                logical_rank: Some(
-                    if matches!(
-                        operation,
-                        KernelOperationKind::RmsNorm | KernelOperationKind::PerHeadRmsNorm
-                    ) {
-                        1
-                    } else {
-                        2
-                    },
-                ),
+                logical_rank: Some(Self::logical_rank(operation)),
                 axis_multiples: vec![],
             },
             orientations: vec![ParameterOrientation::Native],
@@ -235,6 +228,11 @@ impl QuantizationDefinition for PlainDefinition {
                 KernelOperationKind::OutputProjection,
                 "output_projection",
                 "dense.matmul.linalg",
+            ),
+            (
+                KernelOperationKind::ShortConv,
+                "short_conv",
+                "short_conv.gated.generated",
             ),
         ];
         let mut candidates = Vec::new();

@@ -182,6 +182,7 @@ pub fn build_bound_model(
 
 pub fn lower_bound_model(bound: &BoundModel) -> Result<LoweringOutput> {
     validate_bound_model_lowerings(bound)?;
+    reject_operations_outside_dense_decoder(bound)?;
     let config = DenseDecoderConfig::from_bound_model(bound);
     if let Some(binding) = bound.binding.bindings.iter().find(|binding| {
         !config
@@ -207,18 +208,31 @@ pub fn lower_bound_model(bound: &BoundModel) -> Result<LoweringOutput> {
         }));
     }
     let (mlir_text, decode_mlir_text) = if config.paged_kv {
-        (
-            lowering::emit_dense_decoder_cfg_program(
-                bound.architecture.architecture_id.as_str(),
-                &config,
-                lowering::PagedProgram::Prefill,
-            )?,
-            Some(lowering::emit_dense_decoder_cfg_program(
-                bound.architecture.architecture_id.as_str(),
-                &config,
-                lowering::PagedProgram::Decode,
-            )?),
-        )
+        if config.has_short_conv() {
+            // Hybrid short-conv keeps rolling `conv_state*` util.globals that
+            // must be shared by prefill and decode — emit one combined module.
+            (
+                lowering::emit_dense_decoder_cfg_program(
+                    bound.architecture.architecture_id.as_str(),
+                    &config,
+                    lowering::PagedProgram::Combined,
+                )?,
+                None,
+            )
+        } else {
+            (
+                lowering::emit_dense_decoder_cfg_program(
+                    bound.architecture.architecture_id.as_str(),
+                    &config,
+                    lowering::PagedProgram::Prefill,
+                )?,
+                Some(lowering::emit_dense_decoder_cfg_program(
+                    bound.architecture.architecture_id.as_str(),
+                    &config,
+                    lowering::PagedProgram::Decode,
+                )?),
+            )
+        }
     } else {
         (
             lowering::emit_dense_decoder_cfg(bound.architecture.architecture_id.as_str(), &config)?,
@@ -233,6 +247,13 @@ pub fn lower_bound_model(bound: &BoundModel) -> Result<LoweringOutput> {
         paged_kv: config.paged_kv,
         num_layers: config.num_layers,
     })
+}
+
+/// Reject operators the shared dense decoder emitter cannot lower. Short-conv
+/// hybrid schedules are supported via [`DenseDecoderConfig::resolved_layer_types`];
+/// keep this hook for future operator kinds that still need an explicit refuse.
+fn reject_operations_outside_dense_decoder(_bound: &BoundModel) -> Result<()> {
+    Ok(())
 }
 
 fn validate_bound_model_lowerings(bound: &BoundModel) -> Result<()> {
@@ -311,6 +332,7 @@ fn lowering_matches_operation(operation: &OperationKind, lowering: &str) -> bool
         OperationKind::Attention { .. } => {
             lowering == "attention.gqa.generated" || lowering == "attention.online_paged.generated"
         }
+        OperationKind::ShortConv { .. } => lowering == "short_conv.gated.generated",
         OperationKind::Elementwise {
             function: dyninfer_core::ElementwiseFunction::Silu,
         } => lowering == "elementwise.silu.generated",

@@ -64,6 +64,10 @@ pub struct DenseDecoderConfig {
     pub num_kv_heads: u32,
     pub head_dim: u32,
     pub num_layers: u32,
+    /// Causal depthwise short-conv channel width (LFM2 `conv_dim`).
+    pub conv_dim: u32,
+    /// Causal window of the short convolution (`conv_L_cache`).
+    pub conv_kernel: u32,
     /// Static prefill token window (prompt bucket).
     pub seq: u32,
     /// Mutable KV capacity (`>= seq`); decode positions use `[0, max_kv)`.
@@ -88,6 +92,15 @@ pub struct DenseDecoderConfig {
     pub param_bindings: BTreeMap<String, ParameterBinding>,
     /// Canonical slot + mode → lowering selected by strict coverage.
     pub param_lowerings: BTreeMap<(String, ExecutionMode), String>,
+    /// Per-layer operator kind resolved from an LFM2-style `layer_types` schedule.
+    pub resolved_layer_types: BTreeMap<u32, LayerKind>,
+}
+
+/// Operator assigned to an LFM2 hybrid layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerKind {
+    Attention,
+    ShortConv,
 }
 
 impl DenseDecoderConfig {
@@ -209,6 +222,8 @@ impl DenseDecoderConfig {
         Self {
             vocab,
             hidden,
+            conv_dim: u(&["conv_dim"], hidden),
+            conv_kernel: u(&["conv_kernel"], 3),
             intermediate: u(
                 &["intermediate_size", "llama.feed_forward_length"],
                 hidden * 2,
@@ -244,6 +259,7 @@ impl DenseDecoderConfig {
             param_compute_dtypes,
             param_bindings,
             param_lowerings,
+            resolved_layer_types: resolve_layer_types(&bound.resolved_config),
         }
     }
 
@@ -318,6 +334,17 @@ impl DenseDecoderConfig {
                 }
             && self.max_kv >= self.seq
             && self.max_kv <= if self.paged_kv { 1_048_576 } else { 512 }
+            && self.conv_dim >= 1
+            && self.conv_dim <= self.hidden.max(1)
+            && self.conv_kernel >= 1
+            && self.conv_kernel <= 16
+    }
+
+    /// True when any layer is scheduled as an LFM2 short convolution.
+    pub fn has_short_conv(&self) -> bool {
+        self.resolved_layer_types
+            .values()
+            .any(|kind| *kind == LayerKind::ShortConv)
     }
 }
 
@@ -334,6 +361,24 @@ pub enum PagedProgram {
     Combined,
     Prefill,
     Decode,
+}
+
+/// Resolve the per-layer `layer_types` schedule from the resolved config into a
+/// compact per-layer map. Unknown / missing entries fall back to attention so a
+/// plain decoder still lowers through the shared path.
+fn resolve_layer_types(config: &dyninfer_core::MetadataMap) -> BTreeMap<u32, LayerKind> {
+    let mut out = BTreeMap::new();
+    if let Some(types) = config.get("layer_types").and_then(|v| v.as_array()) {
+        for (index, entry) in types.iter().enumerate() {
+            let kind = match entry.as_str() {
+                Some("full_attention") => LayerKind::Attention,
+                Some("conv") => LayerKind::ShortConv,
+                _ => LayerKind::Attention,
+            };
+            out.insert(index as u32, kind);
+        }
+    }
+    out
 }
 
 pub fn emit_dense_decoder_cfg_program(
@@ -427,8 +472,13 @@ fn emit_paged_decoder(
     emit_paged_chunk_begin(module, c, variant)?;
     emit_paged_layer_page(module, c, variant)?;
     for layer in 0..c.num_layers {
-        emit_paged_layer_prepare(module, c, layer, variant)?;
-        emit_paged_layer_finish(module, c, layer, variant)?;
+        match layer_kind(c, layer) {
+            LayerKind::ShortConv => emit_paged_shortconv_layer(module, c, layer, variant)?,
+            LayerKind::Attention => {
+                emit_paged_layer_prepare(module, c, layer, variant)?;
+                emit_paged_layer_finish(module, c, layer, variant)?;
+            }
+        }
     }
     emit_paged_chunk_logits(module, c, variant)?;
     emit_paged_fused_chunk(module, c, variant)
@@ -482,44 +532,54 @@ fn emit_paged_fused_chunk(
     ));
     let mut page_ssas: Vec<String> = (0..num_pages).map(|pi| format!("page{pi}")).collect();
     for layer in 0..layers {
-        let prepare = variant.function(&format!("layer_prepare_{layer}"));
-        let finish = variant.function(&format!("layer_finish_{layer}"));
-        // Return query+chunk KV as SSA: util.global across outlined private
-        // calls is unreliable for these tensors (same class as attn out/max/sum).
-        f.op_asm(format!(
-            r#"  %query{layer}, %chunk_k{layer}, %chunk_v{layer}, %out_l{layer}_0, %max_l{layer}_0, %sum_l{layer}_0 = func.call @{prepare}() : () -> ({qg_ty}, {kv3_ty}, {kv3_ty}, {qg_ty}, {row_ty}, {row_ty})
+        match layer_kind(c, layer) {
+            LayerKind::ShortConv => {
+                // Short-conv layers update the hidden global only; page tensors
+                // pass through unchanged (no KV for this layer index).
+                let short = variant.function(&format!("layer_shortconv_{layer}"));
+                f.op_asm(format!("  func.call @{short}() : () -> ()\n"));
+            }
+            LayerKind::Attention => {
+                let prepare = variant.function(&format!("layer_prepare_{layer}"));
+                let finish = variant.function(&format!("layer_finish_{layer}"));
+                // Return query+chunk KV as SSA: util.global across outlined private
+                // calls is unreliable for these tensors (same class as attn out/max/sum).
+                f.op_asm(format!(
+                    r#"  %query{layer}, %chunk_k{layer}, %chunk_v{layer}, %out_l{layer}_0, %max_l{layer}_0, %sum_l{layer}_0 = func.call @{prepare}() : () -> ({qg_ty}, {kv3_ty}, {kv3_ty}, {qg_ty}, {row_ty}, {row_ty})
   %layer{layer}_i64 = arith.constant {layer} : i64
   %layer{layer}_e = tensor.empty() : tensor<i64>
   %layer{layer}_t = tensor.insert %layer{layer}_i64 into %layer{layer}_e[] : tensor<i64>
 "#
-        ));
-        let mut out_ssa = format!("out_l{layer}_0");
-        let mut max_ssa = format!("max_l{layer}_0");
-        let mut sum_ssa = format!("sum_l{layer}_0");
-        let mut next_pages = Vec::with_capacity(num_pages as usize);
-        for pi in 0..num_pages {
-            let page_in = &page_ssas[pi as usize];
-            let page_out = format!("page_l{layer}_p{pi}");
-            let out_next = format!("out_l{layer}_p{pi}");
-            let max_next = format!("max_l{layer}_p{pi}");
-            let sum_next = format!("sum_l{layer}_p{pi}");
-            f.op_asm(format!(
-                r#"  %pi{layer}_{pi}_i64 = arith.constant {pi} : i64
+                ));
+                let mut out_ssa = format!("out_l{layer}_0");
+                let mut max_ssa = format!("max_l{layer}_0");
+                let mut sum_ssa = format!("sum_l{layer}_0");
+                let mut next_pages = Vec::with_capacity(num_pages as usize);
+                for pi in 0..num_pages {
+                    let page_in = &page_ssas[pi as usize];
+                    let page_out = format!("page_l{layer}_p{pi}");
+                    let out_next = format!("out_l{layer}_p{pi}");
+                    let max_next = format!("max_l{layer}_p{pi}");
+                    let sum_next = format!("sum_l{layer}_p{pi}");
+                    f.op_asm(format!(
+                        r#"  %pi{layer}_{pi}_i64 = arith.constant {pi} : i64
   %pi{layer}_{pi}_e = tensor.empty() : tensor<i64>
   %pi{layer}_{pi}_t = tensor.insert %pi{layer}_{pi}_i64 into %pi{layer}_{pi}_e[] : tensor<i64>
   %{page_out}, %{out_next}, %{max_next}, %{sum_next} = func.call @{layer_page}(%{page_in}, %pi{layer}_{pi}_t, %start_pos, %layer{layer}_t, %query{layer}, %chunk_k{layer}, %chunk_v{layer}, %valid, %{out_ssa}, %{max_ssa}, %{sum_ssa}) : ({page_ty}, tensor<i64>, tensor<i64>, tensor<i64>, {qg_ty}, {kv3_ty}, {kv3_ty}, tensor<i64>, {qg_ty}, {row_ty}, {row_ty}) -> ({page_ty}, {qg_ty}, {row_ty}, {row_ty})
 "#
-            ));
-            next_pages.push(page_out);
-            out_ssa = out_next;
-            max_ssa = max_next;
-            sum_ssa = sum_next;
-        }
-        page_ssas = next_pages;
-        f.op_asm(format!(
-            r#"  func.call @{finish}(%{out_ssa}, %{sum_ssa}) : ({qg_ty}, {row_ty}) -> ()
+                    ));
+                    next_pages.push(page_out);
+                    out_ssa = out_next;
+                    max_ssa = max_next;
+                    sum_ssa = sum_next;
+                }
+                page_ssas = next_pages;
+                f.op_asm(format!(
+                    r#"  func.call @{finish}(%{out_ssa}, %{sum_ssa}) : ({qg_ty}, {row_ty}) -> ()
 "#
-        ));
+                ));
+            }
+        }
     }
     let page_rets = page_ssas
         .iter()
@@ -584,11 +644,25 @@ fn emit_paged_chunk_begin(
         ));
     }
     f.op_asm(format!(
-        "  %last64 = tensor.extract %last[] : tensor<i64>\n  %one64 = arith.constant 1 : i64\n  %valid64 = arith.addi %last64, %one64 : i64\n  %valid_e = tensor.empty() : tensor<i64>\n  %valid = tensor.insert %valid64 into %valid_e[] : tensor<i64>\n  util.global.store %h_acc{s}, @{hidden_global} : {hidden_ty}\n  util.global.store %start_pos, @{start_global} : tensor<i64>\n  util.global.store %valid, @{valid_global} : tensor<i64>\n  return %valid : tensor<i64>",
+        "  %last64 = tensor.extract %last[] : tensor<i64>\n  %one64 = arith.constant 1 : i64\n  %valid64 = arith.addi %last64, %one64 : i64\n  %valid_e = tensor.empty() : tensor<i64>\n  %valid = tensor.insert %valid64 into %valid_e[] : tensor<i64>\n  util.global.store %h_acc{s}, @{hidden_global} : {hidden_ty}\n  util.global.store %start_pos, @{start_global} : tensor<i64>\n  util.global.store %valid, @{valid_global} : tensor<i64>\n",
         hidden_global = variant.global("hidden"),
         start_global = variant.global("start_pos"),
         valid_global = variant.global("valid_count"),
     ));
+    // New prefill (start_pos==0) must clear rolling short-conv state so
+    // multi-chunk continuation does not see a previous session's cache.
+    if c.has_short_conv() {
+        f.op_asm(
+            r#"  %start64_reset = tensor.extract %start_pos[] : tensor<i64>
+  %c0_reset = arith.constant 0 : i64
+  %is_first_chunk = arith.cmpi eq, %start64_reset, %c0_reset : i64
+  scf.if %is_first_chunk {
+"#,
+        );
+        emit_zero_conv_states(&mut f, c, "    ");
+        f.op_asm("  }\n");
+    }
+    f.op_asm("  return %valid : tensor<i64>");
     f.finish(module)
 }
 
@@ -989,6 +1063,170 @@ fn emit_paged_layer_finish(
     f.finish(module)
 }
 
+/// Short-conv + FFN for one hybrid layer on the paged path.
+///
+/// Updates `paged_*_hidden` in place and leaves page tensors untouched (no KV).
+fn emit_paged_shortconv_layer(
+    module: &mut ModuleBuilder,
+    c: &DenseDecoderConfig,
+    layer: u32,
+    variant: PagedVariant,
+) -> Result<()> {
+    let (s, h, cc, i) = (c.seq, c.hidden, c.conv_dim, c.intermediate);
+    let p = format!("blk{layer}");
+    let n = format!("blk.{layer}");
+    let hidden_ty = format!("tensor<{s}x{h}xf32>");
+    let rms_norm = variant.helper("rms_norm");
+    let linear_h_c3 = variant.helper("linear_h_c3");
+    let linear_c_h = variant.helper("linear_c_h");
+    let linear_hi = variant.helper("linear_hi");
+    let linear_ih = variant.helper("linear_ih");
+    let conv_op = if variant.decode {
+        format!("conv_op{layer}_tok")
+    } else {
+        format!("conv_op{layer}")
+    };
+    let mut f = module.func_private(&variant.function(&format!("layer_shortconv_{layer}")));
+    for (ssa, sym, canonical, shape) in [
+        (
+            "attn_nw",
+            format!("{p}_attn_norm_weight"),
+            format!("{n}.attn_norm.weight"),
+            format!("{h}"),
+        ),
+        (
+            "conv_in",
+            format!("{p}_shortconv_in_proj_weight"),
+            format!("{n}.shortconv.in_proj.weight"),
+            format!("{}x{h}", 3 * cc),
+        ),
+        (
+            "conv_out_w",
+            format!("{p}_shortconv_out_proj_weight"),
+            format!("{n}.shortconv.out_proj.weight"),
+            format!("{h}x{cc}"),
+        ),
+        (
+            "ffn_nw",
+            format!("{p}_ffn_norm_weight"),
+            format!("{n}.ffn_norm.weight"),
+            format!("{h}"),
+        ),
+        (
+            "wgate",
+            format!("{p}_ffn_gate_weight"),
+            format!("{n}.ffn_gate.weight"),
+            format!("{i}x{h}"),
+        ),
+        (
+            "wup",
+            format!("{p}_ffn_up_weight"),
+            format!("{n}.ffn_up.weight"),
+            format!("{i}x{h}"),
+        ),
+        (
+            "wdown",
+            format!("{p}_ffn_down_weight"),
+            format!("{n}.ffn_down.weight"),
+            format!("{h}x{i}"),
+        ),
+    ] {
+        emit_load_compute(&mut f, c, ssa, &sym, &canonical, &shape);
+    }
+    f.op_asm(format!(
+        "  %hidden = util.global.load @{hidden_global} : {hidden_ty}\n  %xn = func.call @{rms_norm}(%hidden, %attn_nw) : ({hidden_ty}, tensor<{h}xf32>) -> {hidden_ty}\n",
+        hidden_global = variant.global("hidden"),
+    ));
+    emit_linear_call(
+        &mut f,
+        c,
+        "conv_inp",
+        &linear_h_c3,
+        "xn",
+        "conv_in",
+        &format!("{n}.shortconv.in_proj.weight"),
+        s,
+        h,
+        3 * cc,
+    );
+    f.op_asm(format!(
+        "  %conv_y = func.call @{conv_op}(%conv_inp) : (tensor<{s}x{}xf32>) -> tensor<{s}x{cc}xf32>\n",
+        3 * cc,
+    ));
+    emit_linear_call(
+        &mut f,
+        c,
+        "conv_proj",
+        &linear_c_h,
+        "conv_y",
+        "conv_out_w",
+        &format!("{n}.shortconv.out_proj.weight"),
+        s,
+        cc,
+        h,
+    );
+    f.op_asm(format!(
+        "  %h2 = arith.addf %hidden, %conv_proj : {hidden_ty}\n  %fn = func.call @{rms_norm}(%h2, %ffn_nw) : ({hidden_ty}, tensor<{h}xf32>) -> {hidden_ty}\n"
+    ));
+    emit_linear_call(
+        &mut f,
+        c,
+        "gate",
+        &linear_hi,
+        "fn",
+        "wgate",
+        &format!("{n}.ffn_gate.weight"),
+        s,
+        h,
+        i,
+    );
+    emit_linear_call(
+        &mut f,
+        c,
+        "up",
+        &linear_hi,
+        "fn",
+        "wup",
+        &format!("{n}.ffn_up.weight"),
+        s,
+        h,
+        i,
+    );
+    f.op_asm(format!(
+        r#"  %silu = linalg.generic {{
+      indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>],
+      iterator_types = ["parallel", "parallel"]}}
+    ins(%gate : tensor<{s}x{i}xf32>) outs(%gate : tensor<{s}x{i}xf32>) {{
+    ^bb0(%a: f32, %b: f32):
+      %neg = arith.negf %a : f32
+      %exp = math.exp %neg : f32
+      %one = arith.constant 1.0 : f32
+      %den = arith.addf %one, %exp : f32
+      %value = arith.divf %a, %den : f32
+      linalg.yield %value : f32
+  }} -> tensor<{s}x{i}xf32>
+  %ff = arith.mulf %silu, %up : tensor<{s}x{i}xf32>
+"#
+    ));
+    emit_linear_call(
+        &mut f,
+        c,
+        "down",
+        &linear_ih,
+        "ff",
+        "wdown",
+        &format!("{n}.ffn_down.weight"),
+        s,
+        i,
+        h,
+    );
+    f.op_asm(format!(
+        "  %next_hidden = arith.addf %h2, %down : {hidden_ty}\n  util.global.store %next_hidden, @{hidden_global} : {hidden_ty}\n  return",
+        hidden_global = variant.global("hidden"),
+    ));
+    f.finish(module)
+}
+
 fn emit_paged_chunk_logits(
     module: &mut ModuleBuilder,
     c: &DenseDecoderConfig,
@@ -1100,6 +1338,191 @@ fn emit_linear_call(
         .expect("selected linear lowering was validated before MLIR emission");
 }
 
+/// Fused gated causal depthwise short convolution (`Lfm2ShortConv`).
+///
+/// `gates` is the `in_proj` output `[s, 3*C]`. The op splits it into `B`, `C`,
+/// `x`, computes `Bx = B * x`, runs a causal depthwise conv of window `K` over
+/// `Bx`, multiplies by the `C` gate, and updates the per-layer `conv_state`
+/// (`[K, C]`, the trailing `K` activations — matching upstream `slow_forward`).
+/// Prefill continues from `conv_state` (prefix = `state[1:]`) so multi-chunk
+/// paged prefill stays causal; callers must zero state when `start_pos==0`.
+/// Decode rolls the state, writes the new token, and dots against the conv weight.
+fn emit_conv_op(
+    module: &mut ModuleBuilder,
+    c: &DenseDecoderConfig,
+    layer: u32,
+    mode: ExecutionMode,
+) -> Result<()> {
+    let s = if mode == ExecutionMode::Decode {
+        1
+    } else {
+        c.seq
+    };
+    let cc = c.conv_dim;
+    let k = c.conv_kernel;
+    let g = 3 * cc;
+    let tok = if mode == ExecutionMode::Decode {
+        "_tok"
+    } else {
+        ""
+    };
+    let name = format!("conv_op{layer}{tok}");
+    let mut f = module.func_private(&name);
+    f.arg("gates", format!("tensor<{s}x{g}xf32>"));
+    f.result_ty(format!("tensor<{s}x{cc}xf32>"));
+
+    // Conv weight is often bf16/f16 on disk; promote to f32 before the DW reduce.
+    emit_load_compute(
+        &mut f,
+        c,
+        "conv_w3",
+        &format!("blk{layer}_shortconv_conv_weight"),
+        &format!("blk.{layer}.shortconv.conv.weight"),
+        &format!("{cc}x1x{k}"),
+    );
+
+    f.op_asm(format!(
+        r#"  %c0f = arith.constant 0.0 : f32
+  %B = tensor.extract_slice %gates[0, 0] [{s}, {cc}] [1, 1] : tensor<{s}x{g}xf32> to tensor<{s}x{cc}xf32>
+  %Cgate = tensor.extract_slice %gates[0, {cc}] [{s}, {cc}] [1, 1] : tensor<{s}x{g}xf32> to tensor<{s}x{cc}xf32>
+  %x = tensor.extract_slice %gates[0, {two_c}] [{s}, {cc}] [1, 1] : tensor<{s}x{g}xf32> to tensor<{s}x{cc}xf32>
+  %Bx = arith.mulf %B, %x : tensor<{s}x{cc}xf32>
+  %w = tensor.collapse_shape %conv_w3 [[0], [1, 2]] : tensor<{cc}x1x{k}xf32> into tensor<{cc}x{k}xf32>
+"#,
+        s = s,
+        cc = cc,
+        g = g,
+        two_c = 2 * cc,
+        k = k,
+    ));
+
+    if mode == ExecutionMode::Decode {
+        if k == 1 {
+            f.op_asm(format!(
+                r#"  %out_e = tensor.empty() : tensor<1x{cc}xf32>
+  %out_z = linalg.fill ins(%c0f : f32) outs(%out_e : tensor<1x{cc}xf32>) -> tensor<1x{cc}xf32>
+  %conv = linalg.generic {{
+      indexing_maps = [
+        affine_map<(d0, d1, d2) -> (d0, d1)>,
+        affine_map<(d0, d1, d2) -> (d1, d2)>,
+        affine_map<(d0, d1, d2) -> (d0, d1)>],
+      iterator_types = ["parallel", "parallel", "reduction"]}}
+    ins(%Bx, %w : tensor<1x{cc}xf32>, tensor<{cc}x1xf32>)
+    outs(%out_z : tensor<1x{cc}xf32>) {{
+    ^bb0(%a: f32, %b: f32, %acc: f32):
+      %p = arith.mulf %a, %b : f32
+      %sum = arith.addf %acc, %p : f32
+      linalg.yield %sum : f32
+  }} -> tensor<1x{cc}xf32>
+  %y = arith.mulf %conv, %Cgate : tensor<1x{cc}xf32>
+  util.global.store %Bx, @conv_state{layer} : tensor<1x{cc}xf32>
+  return %y : tensor<1x{cc}xf32>"#,
+                cc = cc,
+                layer = layer,
+            ));
+        } else {
+            let km1 = k - 1;
+            f.op_asm(format!(
+                r#"  %state_old = util.global.load @conv_state{layer} : tensor<{k}x{cc}xf32>
+  %shift = tensor.extract_slice %state_old[1, 0] [{km1}, {cc}] [1, 1] : tensor<{k}x{cc}xf32> to tensor<{km1}x{cc}xf32>
+  %st_e = tensor.empty() : tensor<{k}x{cc}xf32>
+  %st_z = linalg.fill ins(%c0f : f32) outs(%st_e : tensor<{k}x{cc}xf32>) -> tensor<{k}x{cc}xf32>
+  %st_mid = tensor.insert_slice %shift into %st_z[0, 0] [{km1}, {cc}] [1, 1] : tensor<{km1}x{cc}xf32> into tensor<{k}x{cc}xf32>
+  %state_new = tensor.insert_slice %Bx into %st_mid[{km1}, 0] [1, {cc}] [1, 1] : tensor<1x{cc}xf32> into tensor<{k}x{cc}xf32>
+  %out_e = tensor.empty() : tensor<1x{cc}xf32>
+  %out_z = linalg.fill ins(%c0f : f32) outs(%out_e : tensor<1x{cc}xf32>) -> tensor<1x{cc}xf32>
+  %conv = linalg.generic {{
+      indexing_maps = [
+        affine_map<(d0, d1, d2) -> (d2, d1)>,
+        affine_map<(d0, d1, d2) -> (d1, d2)>,
+        affine_map<(d0, d1, d2) -> (d0, d1)>],
+      iterator_types = ["parallel", "parallel", "reduction"]}}
+    ins(%state_new, %w : tensor<{k}x{cc}xf32>, tensor<{cc}x{k}xf32>)
+    outs(%out_z : tensor<1x{cc}xf32>) {{
+    ^bb0(%a: f32, %b: f32, %acc: f32):
+      %p = arith.mulf %a, %b : f32
+      %sum = arith.addf %acc, %p : f32
+      linalg.yield %sum : f32
+  }} -> tensor<1x{cc}xf32>
+  %y = arith.mulf %conv, %Cgate : tensor<1x{cc}xf32>
+  util.global.store %state_new, @conv_state{layer} : tensor<{k}x{cc}xf32>
+  return %y : tensor<1x{cc}xf32>"#,
+                k = k,
+                km1 = km1,
+                cc = cc,
+                layer = layer,
+            ));
+        }
+    } else if k == 1 {
+        // K==1: padded == Bx; state is the last activation row.
+        let state_start = s.saturating_sub(1);
+        f.op_asm(format!(
+            r#"  %out_e = tensor.empty() : tensor<{s}x{cc}xf32>
+  %out_z = linalg.fill ins(%c0f : f32) outs(%out_e : tensor<{s}x{cc}xf32>) -> tensor<{s}x{cc}xf32>
+  %conv = linalg.generic {{
+      indexing_maps = [
+        affine_map<(d0, d1, d2) -> (d0, d1)>,
+        affine_map<(d0, d1, d2) -> (d1, d2)>,
+        affine_map<(d0, d1, d2) -> (d0, d1)>],
+      iterator_types = ["parallel", "parallel", "reduction"]}}
+    ins(%Bx, %w : tensor<{s}x{cc}xf32>, tensor<{cc}x1xf32>)
+    outs(%out_z : tensor<{s}x{cc}xf32>) {{
+    ^bb0(%a: f32, %b: f32, %acc: f32):
+      %p = arith.mulf %a, %b : f32
+      %sum = arith.addf %acc, %p : f32
+      linalg.yield %sum : f32
+  }} -> tensor<{s}x{cc}xf32>
+  %y = arith.mulf %conv, %Cgate : tensor<{s}x{cc}xf32>
+  %state_new = tensor.extract_slice %Bx[{state_start}, 0] [1, {cc}] [1, 1] : tensor<{s}x{cc}xf32> to tensor<1x{cc}xf32>
+  util.global.store %state_new, @conv_state{layer} : tensor<1x{cc}xf32>
+  return %y : tensor<{s}x{cc}xf32>"#,
+            s = s,
+            cc = cc,
+            state_start = state_start,
+            layer = layer,
+        ));
+    } else {
+        let pad = k - 1;
+        let plen = s + pad;
+        let state_start = s.saturating_sub(1);
+        f.op_asm(format!(
+            r#"  %state_old = util.global.load @conv_state{layer} : tensor<{k}x{cc}xf32>
+  %prefix = tensor.extract_slice %state_old[1, 0] [{pad}, {cc}] [1, 1] : tensor<{k}x{cc}xf32> to tensor<{pad}x{cc}xf32>
+  %pad_e = tensor.empty() : tensor<{plen}x{cc}xf32>
+  %pad_z = linalg.fill ins(%c0f : f32) outs(%pad_e : tensor<{plen}x{cc}xf32>) -> tensor<{plen}x{cc}xf32>
+  %pad_mid = tensor.insert_slice %prefix into %pad_z[0, 0] [{pad}, {cc}] [1, 1] : tensor<{pad}x{cc}xf32> into tensor<{plen}x{cc}xf32>
+  %padded = tensor.insert_slice %Bx into %pad_mid[{pad}, 0] [{s}, {cc}] [1, 1] : tensor<{s}x{cc}xf32> into tensor<{plen}x{cc}xf32>
+  %out_e = tensor.empty() : tensor<{s}x{cc}xf32>
+  %out_z = linalg.fill ins(%c0f : f32) outs(%out_e : tensor<{s}x{cc}xf32>) -> tensor<{s}x{cc}xf32>
+  %conv = linalg.generic {{
+      indexing_maps = [
+        affine_map<(d0, d1, d2) -> (d0 + d2, d1)>,
+        affine_map<(d0, d1, d2) -> (d1, d2)>,
+        affine_map<(d0, d1, d2) -> (d0, d1)>],
+      iterator_types = ["parallel", "parallel", "reduction"]}}
+    ins(%padded, %w : tensor<{plen}x{cc}xf32>, tensor<{cc}x{k}xf32>)
+    outs(%out_z : tensor<{s}x{cc}xf32>) {{
+    ^bb0(%a: f32, %b: f32, %acc: f32):
+      %p = arith.mulf %a, %b : f32
+      %sum = arith.addf %acc, %p : f32
+      linalg.yield %sum : f32
+  }} -> tensor<{s}x{cc}xf32>
+  %y = arith.mulf %conv, %Cgate : tensor<{s}x{cc}xf32>
+  %state_new = tensor.extract_slice %padded[{state_start}, 0] [{k}, {cc}] [1, 1] : tensor<{plen}x{cc}xf32> to tensor<{k}x{cc}xf32>
+  util.global.store %state_new, @conv_state{layer} : tensor<{k}x{cc}xf32>
+  return %y : tensor<{s}x{cc}xf32>"#,
+            plen = plen,
+            pad = pad,
+            s = s,
+            cc = cc,
+            k = k,
+            state_start = state_start,
+            layer = layer,
+        ));
+    }
+    f.finish(module)
+}
+
 /// Project hidden → vocab logits. Emits `%logits : tensor<{vocab}xf32>`.
 fn emit_output_proj(
     f: &mut FuncBuilder,
@@ -1159,55 +1582,85 @@ fn emit_globals(
             &format!("{n}.attn_norm.weight"),
             &format!("{h}"),
         )?;
-        emit_global(
-            builder,
-            c,
-            parameters,
-            &format!("{p}_attn_q_weight"),
-            &format!("{n}.attn_q.weight"),
-            &format!("{q}x{h}"),
-        )?;
-        emit_global(
-            builder,
-            c,
-            parameters,
-            &format!("{p}_attn_k_weight"),
-            &format!("{n}.attn_k.weight"),
-            &format!("{kv}x{h}"),
-        )?;
-        emit_global(
-            builder,
-            c,
-            parameters,
-            &format!("{p}_attn_v_weight"),
-            &format!("{n}.attn_v.weight"),
-            &format!("{kv}x{h}"),
-        )?;
-        emit_global(
-            builder,
-            c,
-            parameters,
-            &format!("{p}_attn_output_weight"),
-            &format!("{n}.attn_output.weight"),
-            &format!("{h}x{q}"),
-        )?;
-        if c.has_qk_norm {
-            emit_global(
-                builder,
-                c,
-                parameters,
-                &format!("{p}_attn_q_norm_weight"),
-                &format!("{n}.attn_q_norm.weight"),
-                &format!("{d}"),
-            )?;
-            emit_global(
-                builder,
-                c,
-                parameters,
-                &format!("{p}_attn_k_norm_weight"),
-                &format!("{n}.attn_k_norm.weight"),
-                &format!("{d}"),
-            )?;
+        match layer_kind(c, layer) {
+            LayerKind::Attention => {
+                emit_global(
+                    builder,
+                    c,
+                    parameters,
+                    &format!("{p}_attn_q_weight"),
+                    &format!("{n}.attn_q.weight"),
+                    &format!("{q}x{h}"),
+                )?;
+                emit_global(
+                    builder,
+                    c,
+                    parameters,
+                    &format!("{p}_attn_k_weight"),
+                    &format!("{n}.attn_k.weight"),
+                    &format!("{kv}x{h}"),
+                )?;
+                emit_global(
+                    builder,
+                    c,
+                    parameters,
+                    &format!("{p}_attn_v_weight"),
+                    &format!("{n}.attn_v.weight"),
+                    &format!("{kv}x{h}"),
+                )?;
+                emit_global(
+                    builder,
+                    c,
+                    parameters,
+                    &format!("{p}_attn_output_weight"),
+                    &format!("{n}.attn_output.weight"),
+                    &format!("{h}x{q}"),
+                )?;
+                if c.has_qk_norm {
+                    emit_global(
+                        builder,
+                        c,
+                        parameters,
+                        &format!("{p}_attn_q_norm_weight"),
+                        &format!("{n}.attn_q_norm.weight"),
+                        &format!("{d}"),
+                    )?;
+                    emit_global(
+                        builder,
+                        c,
+                        parameters,
+                        &format!("{p}_attn_k_norm_weight"),
+                        &format!("{n}.attn_k_norm.weight"),
+                        &format!("{d}"),
+                    )?;
+                }
+            }
+            LayerKind::ShortConv => {
+                emit_global(
+                    builder,
+                    c,
+                    parameters,
+                    &format!("{p}_shortconv_in_proj_weight"),
+                    &format!("{n}.shortconv.in_proj.weight"),
+                    &format!("{}x{h}", 3 * c.conv_dim),
+                )?;
+                emit_global(
+                    builder,
+                    c,
+                    parameters,
+                    &format!("{p}_shortconv_conv_weight"),
+                    &format!("{n}.shortconv.conv.weight"),
+                    &format!("{}x1x{}", c.conv_dim, c.conv_kernel),
+                )?;
+                emit_global(
+                    builder,
+                    c,
+                    parameters,
+                    &format!("{p}_shortconv_out_proj_weight"),
+                    &format!("{n}.shortconv.out_proj.weight"),
+                    &format!("{h}x{}", c.conv_dim),
+                )?;
+            }
         }
         emit_global(
             builder,
@@ -1259,6 +1712,8 @@ fn emit_globals(
         &format!("{v}x{h}"),
     )?;
     if c.paged_kv {
+        // Shared across prefill/decode modules — rolling short-conv cache.
+        emit_conv_state_globals(builder, c)?;
         if matches!(program, PagedProgram::Combined | PagedProgram::Prefill) {
             emit_paged_state_globals(builder, c, PagedVariant { decode: false })?;
         }
@@ -1272,6 +1727,9 @@ fn emit_globals(
     // Mutable KV cache (f32 compute). Prefill seeds [0, seq); decode grows to max_kv.
     let (mk, nkv, d) = (c.max_kv, c.num_kv_heads, c.head_dim);
     for layer in 0..c.num_layers {
+        if layer_kind(c, layer) != LayerKind::Attention {
+            continue;
+        }
         builder.util_global_mutable_zero(
             &format!("kv_k{layer}"),
             &format!("tensor<{mk}x{nkv}x{d}xf32>"),
@@ -1281,7 +1739,52 @@ fn emit_globals(
             &format!("tensor<{mk}x{nkv}x{d}xf32>"),
         )?;
     }
+    emit_conv_state_globals(builder, c)
+}
+
+/// Mutable short-convolution state: trailing `conv_kernel` activations `[K, C]`.
+fn emit_conv_state_globals(builder: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()> {
+    let k = c.conv_kernel;
+    for layer in 0..c.num_layers {
+        if layer_kind(c, layer) == LayerKind::ShortConv {
+            builder.util_global_mutable_zero(
+                &format!("conv_state{layer}"),
+                &format!("tensor<{k}x{}xf32>", c.conv_dim),
+            )?;
+        }
+    }
     Ok(())
+}
+
+/// Zero every short-conv rolling state (used at the start of a new prefill).
+fn emit_zero_conv_states(f: &mut FuncBuilder, c: &DenseDecoderConfig, indent: &str) {
+    if !c.has_short_conv() {
+        return;
+    }
+    let k = c.conv_kernel;
+    let cc = c.conv_dim;
+    f.op_asm(format!(
+        "{indent}%c0f_conv_reset = arith.constant 0.0 : f32\n"
+    ));
+    for layer in 0..c.num_layers {
+        if layer_kind(c, layer) != LayerKind::ShortConv {
+            continue;
+        }
+        f.op_asm(format!(
+            r#"{indent}%conv_z{layer}_e = tensor.empty() : tensor<{k}x{cc}xf32>
+{indent}%conv_z{layer} = linalg.fill ins(%c0f_conv_reset : f32) outs(%conv_z{layer}_e : tensor<{k}x{cc}xf32>) -> tensor<{k}x{cc}xf32>
+{indent}util.global.store %conv_z{layer}, @conv_state{layer} : tensor<{k}x{cc}xf32>
+"#
+        ));
+    }
+}
+
+/// Which operator the LFM2 layer schedule assigns to `layer`.
+fn layer_kind(c: &DenseDecoderConfig, layer: u32) -> LayerKind {
+    c.resolved_layer_types
+        .get(&layer)
+        .copied()
+        .unwrap_or(LayerKind::Attention)
 }
 
 fn emit_paged_state_globals(
@@ -1352,6 +1855,16 @@ fn emit_helpers(
         kernels::emit_linear(module, "linear_qh", s, q, h, true)?;
         kernels::emit_linear(module, "linear_hi", s, h, i, true)?;
         kernels::emit_linear(module, "linear_ih", s, i, h, true)?;
+        if c.has_short_conv() {
+            let cc = c.conv_dim;
+            kernels::emit_linear(module, "linear_h_c3", s, h, 3 * cc, true)?;
+            kernels::emit_linear(module, "linear_c_h", s, cc, h, true)?;
+            for layer in 0..c.num_layers {
+                if layer_kind(c, layer) == LayerKind::ShortConv {
+                    emit_conv_op(module, c, layer, ExecutionMode::Prefill)?;
+                }
+            }
+        }
     }
 
     parameters.emit_quantized_helpers(module, c)?;
@@ -1447,6 +1960,16 @@ fn emit_paged_decode_helpers(module: &mut ModuleBuilder, c: &DenseDecoderConfig)
     kernels::emit_linear(module, "linear_qh_tok", s, q, h, true)?;
     kernels::emit_linear(module, "linear_hi_tok", s, h, i, true)?;
     kernels::emit_linear(module, "linear_ih_tok", s, i, h, true)?;
+    if c.has_short_conv() {
+        let cc = c.conv_dim;
+        kernels::emit_linear(module, "linear_h_c3_tok", s, h, 3 * cc, true)?;
+        kernels::emit_linear(module, "linear_c_h_tok", s, cc, h, true)?;
+        for layer in 0..c.num_layers {
+            if layer_kind(c, layer) == LayerKind::ShortConv {
+                emit_conv_op(module, c, layer, ExecutionMode::Decode)?;
+            }
+        }
+    }
     if c.has_qk_norm {
         kernels::emit_rms_norm_heads(module, "rms_norm_q_heads_tok", s, nh, d, c.rms_norm_eps)?;
         if nkv != nh {
@@ -1754,6 +2277,11 @@ fn emit_decode_helpers(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Re
     kernels::emit_linear(module, "linear_qh_tok", 1, q, h, true)?;
     kernels::emit_linear(module, "linear_hi_tok", 1, h, i, true)?;
     kernels::emit_linear(module, "linear_ih_tok", 1, i, h, true)?;
+    if c.has_short_conv() {
+        let cc = c.conv_dim;
+        kernels::emit_linear(module, "linear_h_c3_tok", 1, h, 3 * cc, true)?;
+        kernels::emit_linear(module, "linear_c_h_tok", 1, cc, h, true)?;
+    }
 
     if c.has_qk_norm {
         kernels::emit_rms_norm_heads(module, "rms_norm_q_heads_tok", 1, nh, d, c.rms_norm_eps)?;
@@ -1766,6 +2294,13 @@ fn emit_decode_helpers(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Re
                 d,
                 c.rms_norm_eps,
             )?;
+        }
+    }
+
+    // Short-conv operator helpers (decode variants; prefill ops come from emit_helpers).
+    for layer in 0..c.num_layers {
+        if layer_kind(c, layer) == LayerKind::ShortConv {
+            emit_conv_op(module, c, layer, ExecutionMode::Decode)?;
         }
     }
 
@@ -2046,6 +2581,11 @@ fn emit_prefill(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()
     }
     let mut h_name = format!("h_acc{s}");
 
+    // Dense prefill always starts a fresh prompt window — clear rolling state.
+    if c.has_short_conv() {
+        emit_zero_conv_states(&mut f, c, "  ");
+    }
+
     for layer in 0..c.num_layers {
         let p = format!("blk{layer}");
         let n = format!("blk.{layer}");
@@ -2057,56 +2597,6 @@ fn emit_prefill(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()
             &format!("{n}.attn_norm.weight"),
             &format!("{h}"),
         );
-        emit_load_compute(
-            &mut f,
-            c,
-            &format!("{p}_wq"),
-            &format!("{p}_attn_q_weight"),
-            &format!("{n}.attn_q.weight"),
-            &format!("{q}x{h}"),
-        );
-        emit_load_compute(
-            &mut f,
-            c,
-            &format!("{p}_wk"),
-            &format!("{p}_attn_k_weight"),
-            &format!("{n}.attn_k.weight"),
-            &format!("{kv}x{h}"),
-        );
-        emit_load_compute(
-            &mut f,
-            c,
-            &format!("{p}_wv"),
-            &format!("{p}_attn_v_weight"),
-            &format!("{n}.attn_v.weight"),
-            &format!("{kv}x{h}"),
-        );
-        emit_load_compute(
-            &mut f,
-            c,
-            &format!("{p}_wo"),
-            &format!("{p}_attn_output_weight"),
-            &format!("{n}.attn_output.weight"),
-            &format!("{h}x{q}"),
-        );
-        if c.has_qk_norm {
-            emit_load_compute(
-                &mut f,
-                c,
-                &format!("{p}_qnw"),
-                &format!("{p}_attn_q_norm_weight"),
-                &format!("{n}.attn_q_norm.weight"),
-                &format!("{d}"),
-            );
-            emit_load_compute(
-                &mut f,
-                c,
-                &format!("{p}_knw"),
-                &format!("{p}_attn_k_norm_weight"),
-                &format!("{n}.attn_k_norm.weight"),
-                &format!("{d}"),
-            );
-        }
         emit_load_compute(
             &mut f,
             c,
@@ -2141,122 +2631,239 @@ fn emit_prefill(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()
         );
 
         let xin = h_name.clone();
-        f.op_asm(format!(
-            "  %{p}_xn = func.call @rms_norm(%{xin}, %{p}_attn_nw) : (tensor<{s}x{h}xf32>, tensor<{h}xf32>) -> tensor<{s}x{h}xf32>\n"
-        ));
-        emit_linear_call(
-            &mut f,
-            c,
-            &format!("{p}_q"),
-            "linear_hq",
-            &format!("{p}_xn"),
-            &format!("{p}_wq"),
-            &format!("{n}.attn_q.weight"),
-            s,
-            h,
-            q,
-        );
-        emit_linear_call(
-            &mut f,
-            c,
-            &format!("{p}_k"),
-            "linear_hkv",
-            &format!("{p}_xn"),
-            &format!("{p}_wk"),
-            &format!("{n}.attn_k.weight"),
-            s,
-            h,
-            kv,
-        );
-        emit_linear_call(
-            &mut f,
-            c,
-            &format!("{p}_v"),
-            "linear_hkv",
-            &format!("{p}_xn"),
-            &format!("{p}_wv"),
-            &format!("{n}.attn_v.weight"),
-            s,
-            h,
-            kv,
-        );
-        let nkv = c.num_kv_heads;
-        let mk = c.max_kv;
-        if c.paged_kv {
-            let g = c.gqa_group();
-            let qg_ty = format!("tensor<{nkv}x{g}x{s}x{d}xf32>");
-            let kv3_ty = format!("tensor<{s}x{nkv}x{d}xf32>");
-            let list_ty = format!(
-                "!util.list<tensor<{}x2x{}x{}x{}xf32>>",
-                c.num_layers, PAGED_KV_PAGE_SIZE, nkv, d
-            );
-            let norm_args = if c.has_qk_norm {
-                format!(", %{p}_qnw, %{p}_knw")
-            } else {
-                String::new()
-            };
-            let norm_types = if c.has_qk_norm {
-                format!(", tensor<{d}xf32>, tensor<{d}xf32>")
-            } else {
-                String::new()
-            };
-            f.op_asm(format!(
-                "  %{p}_qg, %{p}_kc, %{p}_vc = func.call @prepare_paged_attention(%{p}_q, %{p}_k, %{p}_v, %start_pos{norm_args}) : (tensor<{s}x{q}xf32>, tensor<{s}x{kv}xf32>, tensor<{s}x{kv}xf32>, tensor<i64>{norm_types}) -> ({qg_ty}, {kv3_ty}, {kv3_ty})\n"
-            ));
-            f.op_asm(format!(
-                "  func.call @store_paged_kv_{layer}(%{p}_kc, %{p}_vc, %start_pos, %pages) : ({kv3_ty}, {kv3_ty}, tensor<i64>, {list_ty}) -> ()\n"
-            ));
-            f.op_asm(format!(
-                "  %{p}_ctxg = func.call @attend_pages_{layer}(%{p}_qg, %start_pos, %pages) : ({qg_ty}, tensor<i64>, {list_ty}) -> {qg_ty}\n"
-            ));
-            f.op_asm(format!(
-                "  %{p}_ctx4e = tensor.empty() : tensor<{s}x{nkv}x{g}x{d}xf32>\n"
-            ));
-            f.op_asm(format!(
-                "  %{p}_ctx4 = linalg.transpose ins(%{p}_ctxg : {qg_ty}) outs(%{p}_ctx4e : tensor<{s}x{nkv}x{g}x{d}xf32>) permutation = [2, 0, 1, 3]\n"
-            ));
-            f.op_asm(format!(
-                "  %{p}_ctx = tensor.collapse_shape %{p}_ctx4 [[0], [1, 2, 3]] : tensor<{s}x{nkv}x{g}x{d}xf32> into tensor<{s}x{q}xf32>\n"
-            ));
-        } else {
-            if c.has_qk_norm {
+        match layer_kind(c, layer) {
+            LayerKind::ShortConv => {
+                let cc = c.conv_dim;
+                emit_load_compute(
+                    &mut f,
+                    c,
+                    &format!("{p}_conv_in"),
+                    &format!("{p}_shortconv_in_proj_weight"),
+                    &format!("{n}.shortconv.in_proj.weight"),
+                    &format!("{}x{h}", 3 * cc),
+                );
+                emit_load_compute(
+                    &mut f,
+                    c,
+                    &format!("{p}_conv_out_w"),
+                    &format!("{p}_shortconv_out_proj_weight"),
+                    &format!("{n}.shortconv.out_proj.weight"),
+                    &format!("{h}x{cc}"),
+                );
                 f.op_asm(format!(
-                    "  %{p}_ctx, %{p}_kc, %{p}_vc = func.call @attn(%{p}_q, %{p}_k, %{p}_v, %{p}_qnw, %{p}_knw) : (tensor<{s}x{q}xf32>, tensor<{s}x{kv}xf32>, tensor<{s}x{kv}xf32>, tensor<{d}xf32>, tensor<{d}xf32>) -> (tensor<{s}x{q}xf32>, tensor<{s}x{nkv}x{d}xf32>, tensor<{s}x{nkv}x{d}xf32>)\n"
+                    "  %{p}_xn = func.call @rms_norm(%{xin}, %{p}_attn_nw) : (tensor<{s}x{h}xf32>, tensor<{h}xf32>) -> tensor<{s}x{h}xf32>\n"
                 ));
-            } else {
+                emit_linear_call(
+                    &mut f,
+                    c,
+                    &format!("{p}_conv_inp"),
+                    "linear_h_c3",
+                    &format!("{p}_xn"),
+                    &format!("{p}_conv_in"),
+                    &format!("{n}.shortconv.in_proj.weight"),
+                    s,
+                    h,
+                    3 * cc,
+                );
                 f.op_asm(format!(
-                    "  %{p}_ctx, %{p}_kc, %{p}_vc = func.call @attn(%{p}_q, %{p}_k, %{p}_v) : (tensor<{s}x{q}xf32>, tensor<{s}x{kv}xf32>, tensor<{s}x{kv}xf32>) -> (tensor<{s}x{q}xf32>, tensor<{s}x{nkv}x{d}xf32>, tensor<{s}x{nkv}x{d}xf32>)\n"
+                    "  %{p}_conv_y = func.call @conv_op{layer}(%{p}_conv_inp) : (tensor<{s}x{}xf32>) -> tensor<{s}x{}xf32>\n",
+                    3 * cc,
+                    cc,
+                ));
+                emit_linear_call(
+                    &mut f,
+                    c,
+                    &format!("{p}_conv_proj"),
+                    "linear_c_h",
+                    &format!("{p}_conv_y"),
+                    &format!("{p}_conv_out_w"),
+                    &format!("{n}.shortconv.out_proj.weight"),
+                    s,
+                    cc,
+                    h,
+                );
+                f.op_asm(format!(
+                    "  %{p}_h2 = arith.addf %{xin}, %{p}_conv_proj : tensor<{s}x{h}xf32>\n"
                 ));
             }
-            // Seed mutable KV at positions [0, seq).
-            f.op_asm(format!(
-                "  %{p}_k_z = tensor.empty() : tensor<{mk}x{nkv}x{d}xf32>\n  %{p}_v_z = tensor.empty() : tensor<{mk}x{nkv}x{d}xf32>\n  %{p}_k_f0 = arith.constant 0.0 : f32\n"
-            ));
-            f.op_asm(format!(
-                "  %{p}_k_old = linalg.fill ins(%{p}_k_f0 : f32) outs(%{p}_k_z : tensor<{mk}x{nkv}x{d}xf32>) -> tensor<{mk}x{nkv}x{d}xf32>\n  %{p}_v_old = linalg.fill ins(%{p}_k_f0 : f32) outs(%{p}_v_z : tensor<{mk}x{nkv}x{d}xf32>) -> tensor<{mk}x{nkv}x{d}xf32>\n"
-            ));
-            f.op_asm(format!(
-                "  %{p}_k_new = tensor.insert_slice %{p}_kc into %{p}_k_old[0, 0, 0] [{s}, {nkv}, {d}] [1, 1, 1] : tensor<{s}x{nkv}x{d}xf32> into tensor<{mk}x{nkv}x{d}xf32>\n  %{p}_v_new = tensor.insert_slice %{p}_vc into %{p}_v_old[0, 0, 0] [{s}, {nkv}, {d}] [1, 1, 1] : tensor<{s}x{nkv}x{d}xf32> into tensor<{mk}x{nkv}x{d}xf32>\n"
-            ));
-            f.op_asm(format!(
-                "  util.global.store %{p}_k_new, @kv_k{layer} : tensor<{mk}x{nkv}x{d}xf32>\n  util.global.store %{p}_v_new, @kv_v{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
-            ));
+            LayerKind::Attention => {
+                emit_load_compute(
+                    &mut f,
+                    c,
+                    &format!("{p}_wq"),
+                    &format!("{p}_attn_q_weight"),
+                    &format!("{n}.attn_q.weight"),
+                    &format!("{q}x{h}"),
+                );
+                emit_load_compute(
+                    &mut f,
+                    c,
+                    &format!("{p}_wk"),
+                    &format!("{p}_attn_k_weight"),
+                    &format!("{n}.attn_k.weight"),
+                    &format!("{kv}x{h}"),
+                );
+                emit_load_compute(
+                    &mut f,
+                    c,
+                    &format!("{p}_wv"),
+                    &format!("{p}_attn_v_weight"),
+                    &format!("{n}.attn_v.weight"),
+                    &format!("{kv}x{h}"),
+                );
+                emit_load_compute(
+                    &mut f,
+                    c,
+                    &format!("{p}_wo"),
+                    &format!("{p}_attn_output_weight"),
+                    &format!("{n}.attn_output.weight"),
+                    &format!("{h}x{q}"),
+                );
+                if c.has_qk_norm {
+                    emit_load_compute(
+                        &mut f,
+                        c,
+                        &format!("{p}_qnw"),
+                        &format!("{p}_attn_q_norm_weight"),
+                        &format!("{n}.attn_q_norm.weight"),
+                        &format!("{d}"),
+                    );
+                    emit_load_compute(
+                        &mut f,
+                        c,
+                        &format!("{p}_knw"),
+                        &format!("{p}_attn_k_norm_weight"),
+                        &format!("{n}.attn_k_norm.weight"),
+                        &format!("{d}"),
+                    );
+                }
+                f.op_asm(format!(
+                    "  %{p}_xn = func.call @rms_norm(%{xin}, %{p}_attn_nw) : (tensor<{s}x{h}xf32>, tensor<{h}xf32>) -> tensor<{s}x{h}xf32>\n"
+                ));
+                emit_linear_call(
+                    &mut f,
+                    c,
+                    &format!("{p}_q"),
+                    "linear_hq",
+                    &format!("{p}_xn"),
+                    &format!("{p}_wq"),
+                    &format!("{n}.attn_q.weight"),
+                    s,
+                    h,
+                    q,
+                );
+                emit_linear_call(
+                    &mut f,
+                    c,
+                    &format!("{p}_k"),
+                    "linear_hkv",
+                    &format!("{p}_xn"),
+                    &format!("{p}_wk"),
+                    &format!("{n}.attn_k.weight"),
+                    s,
+                    h,
+                    kv,
+                );
+                emit_linear_call(
+                    &mut f,
+                    c,
+                    &format!("{p}_v"),
+                    "linear_hkv",
+                    &format!("{p}_xn"),
+                    &format!("{p}_wv"),
+                    &format!("{n}.attn_v.weight"),
+                    s,
+                    h,
+                    kv,
+                );
+                let nkv = c.num_kv_heads;
+                let mk = c.max_kv;
+                if c.paged_kv {
+                    let g = c.gqa_group();
+                    let qg_ty = format!("tensor<{nkv}x{g}x{s}x{d}xf32>");
+                    let kv3_ty = format!("tensor<{s}x{nkv}x{d}xf32>");
+                    let list_ty = format!(
+                        "!util.list<tensor<{}x2x{}x{}x{}xf32>>",
+                        c.num_layers, PAGED_KV_PAGE_SIZE, nkv, d
+                    );
+                    let norm_args = if c.has_qk_norm {
+                        format!(", %{p}_qnw, %{p}_knw")
+                    } else {
+                        String::new()
+                    };
+                    let norm_types = if c.has_qk_norm {
+                        format!(", tensor<{d}xf32>, tensor<{d}xf32>")
+                    } else {
+                        String::new()
+                    };
+                    f.op_asm(format!(
+                        "  %{p}_qg, %{p}_kc, %{p}_vc = func.call @prepare_paged_attention(%{p}_q, %{p}_k, %{p}_v, %start_pos{norm_args}) : (tensor<{s}x{q}xf32>, tensor<{s}x{kv}xf32>, tensor<{s}x{kv}xf32>, tensor<i64>{norm_types}) -> ({qg_ty}, {kv3_ty}, {kv3_ty})\n"
+                    ));
+                    f.op_asm(format!(
+                        "  func.call @store_paged_kv_{layer}(%{p}_kc, %{p}_vc, %start_pos, %pages) : ({kv3_ty}, {kv3_ty}, tensor<i64>, {list_ty}) -> ()\n"
+                    ));
+                    f.op_asm(format!(
+                        "  %{p}_ctxg = func.call @attend_pages_{layer}(%{p}_qg, %start_pos, %pages) : ({qg_ty}, tensor<i64>, {list_ty}) -> {qg_ty}\n"
+                    ));
+                    f.op_asm(format!(
+                        "  %{p}_ctx4e = tensor.empty() : tensor<{s}x{nkv}x{g}x{d}xf32>\n"
+                    ));
+                    f.op_asm(format!(
+                        "  %{p}_ctx4 = linalg.transpose ins(%{p}_ctxg : {qg_ty}) outs(%{p}_ctx4e : tensor<{s}x{nkv}x{g}x{d}xf32>) permutation = [2, 0, 1, 3]\n"
+                    ));
+                    f.op_asm(format!(
+                        "  %{p}_ctx = tensor.collapse_shape %{p}_ctx4 [[0], [1, 2, 3]] : tensor<{s}x{nkv}x{g}x{d}xf32> into tensor<{s}x{q}xf32>\n"
+                    ));
+                } else if c.has_qk_norm {
+                    f.op_asm(format!(
+                        "  %{p}_ctx, %{p}_kc, %{p}_vc = func.call @attn(%{p}_q, %{p}_k, %{p}_v, %{p}_qnw, %{p}_knw) : (tensor<{s}x{q}xf32>, tensor<{s}x{kv}xf32>, tensor<{s}x{kv}xf32>, tensor<{d}xf32>, tensor<{d}xf32>) -> (tensor<{s}x{q}xf32>, tensor<{s}x{nkv}x{d}xf32>, tensor<{s}x{nkv}x{d}xf32>)\n"
+                    ));
+                    f.op_asm(format!(
+                        "  %{p}_k_z = tensor.empty() : tensor<{mk}x{nkv}x{d}xf32>\n  %{p}_v_z = tensor.empty() : tensor<{mk}x{nkv}x{d}xf32>\n  %{p}_k_f0 = arith.constant 0.0 : f32\n"
+                    ));
+                    f.op_asm(format!(
+                        "  %{p}_k_old = linalg.fill ins(%{p}_k_f0 : f32) outs(%{p}_k_z : tensor<{mk}x{nkv}x{d}xf32>) -> tensor<{mk}x{nkv}x{d}xf32>\n  %{p}_v_old = linalg.fill ins(%{p}_k_f0 : f32) outs(%{p}_v_z : tensor<{mk}x{nkv}x{d}xf32>) -> tensor<{mk}x{nkv}x{d}xf32>\n"
+                    ));
+                    f.op_asm(format!(
+                        "  %{p}_k_new = tensor.insert_slice %{p}_kc into %{p}_k_old[0, 0, 0] [{s}, {nkv}, {d}] [1, 1, 1] : tensor<{s}x{nkv}x{d}xf32> into tensor<{mk}x{nkv}x{d}xf32>\n  %{p}_v_new = tensor.insert_slice %{p}_vc into %{p}_v_old[0, 0, 0] [{s}, {nkv}, {d}] [1, 1, 1] : tensor<{s}x{nkv}x{d}xf32> into tensor<{mk}x{nkv}x{d}xf32>\n"
+                    ));
+                    f.op_asm(format!(
+                        "  util.global.store %{p}_k_new, @kv_k{layer} : tensor<{mk}x{nkv}x{d}xf32>\n  util.global.store %{p}_v_new, @kv_v{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
+                    ));
+                } else {
+                    f.op_asm(format!(
+                        "  %{p}_ctx, %{p}_kc, %{p}_vc = func.call @attn(%{p}_q, %{p}_k, %{p}_v) : (tensor<{s}x{q}xf32>, tensor<{s}x{kv}xf32>, tensor<{s}x{kv}xf32>) -> (tensor<{s}x{q}xf32>, tensor<{s}x{nkv}x{d}xf32>, tensor<{s}x{nkv}x{d}xf32>)\n"
+                    ));
+                    f.op_asm(format!(
+                        "  %{p}_k_z = tensor.empty() : tensor<{mk}x{nkv}x{d}xf32>\n  %{p}_v_z = tensor.empty() : tensor<{mk}x{nkv}x{d}xf32>\n  %{p}_k_f0 = arith.constant 0.0 : f32\n"
+                    ));
+                    f.op_asm(format!(
+                        "  %{p}_k_old = linalg.fill ins(%{p}_k_f0 : f32) outs(%{p}_k_z : tensor<{mk}x{nkv}x{d}xf32>) -> tensor<{mk}x{nkv}x{d}xf32>\n  %{p}_v_old = linalg.fill ins(%{p}_k_f0 : f32) outs(%{p}_v_z : tensor<{mk}x{nkv}x{d}xf32>) -> tensor<{mk}x{nkv}x{d}xf32>\n"
+                    ));
+                    f.op_asm(format!(
+                        "  %{p}_k_new = tensor.insert_slice %{p}_kc into %{p}_k_old[0, 0, 0] [{s}, {nkv}, {d}] [1, 1, 1] : tensor<{s}x{nkv}x{d}xf32> into tensor<{mk}x{nkv}x{d}xf32>\n  %{p}_v_new = tensor.insert_slice %{p}_vc into %{p}_v_old[0, 0, 0] [{s}, {nkv}, {d}] [1, 1, 1] : tensor<{s}x{nkv}x{d}xf32> into tensor<{mk}x{nkv}x{d}xf32>\n"
+                    ));
+                    f.op_asm(format!(
+                        "  util.global.store %{p}_k_new, @kv_k{layer} : tensor<{mk}x{nkv}x{d}xf32>\n  util.global.store %{p}_v_new, @kv_v{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
+                    ));
+                }
+                emit_linear_call(
+                    &mut f,
+                    c,
+                    &format!("{p}_o"),
+                    "linear_qh",
+                    &format!("{p}_ctx"),
+                    &format!("{p}_wo"),
+                    &format!("{n}.attn_output.weight"),
+                    s,
+                    q,
+                    h,
+                );
+                f.op_asm(format!(
+                    "  %{p}_h2 = arith.addf %{xin}, %{p}_o : tensor<{s}x{h}xf32>\n"
+                ));
+            }
         }
-        emit_linear_call(
-            &mut f,
-            c,
-            &format!("{p}_o"),
-            "linear_qh",
-            &format!("{p}_ctx"),
-            &format!("{p}_wo"),
-            &format!("{n}.attn_output.weight"),
-            s,
-            q,
-            h,
-        );
-        f.op_asm(format!(
-            "  %{p}_h2 = arith.addf %{xin}, %{p}_o : tensor<{s}x{h}xf32>\n"
-        ));
         f.op_asm(format!(
             "  %{p}_fn = func.call @rms_norm(%{p}_h2, %{p}_ffn_nw) : (tensor<{s}x{h}xf32>, tensor<{h}xf32>) -> tensor<{s}x{h}xf32>\n"
         ));
@@ -2404,56 +3011,6 @@ fn emit_decode(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()>
         emit_load_compute(
             &mut f,
             c,
-            &format!("{p}_wq"),
-            &format!("{p}_attn_q_weight"),
-            &format!("{n}.attn_q.weight"),
-            &format!("{q}x{h}"),
-        );
-        emit_load_compute(
-            &mut f,
-            c,
-            &format!("{p}_wk"),
-            &format!("{p}_attn_k_weight"),
-            &format!("{n}.attn_k.weight"),
-            &format!("{kv}x{h}"),
-        );
-        emit_load_compute(
-            &mut f,
-            c,
-            &format!("{p}_wv"),
-            &format!("{p}_attn_v_weight"),
-            &format!("{n}.attn_v.weight"),
-            &format!("{kv}x{h}"),
-        );
-        emit_load_compute(
-            &mut f,
-            c,
-            &format!("{p}_wo"),
-            &format!("{p}_attn_output_weight"),
-            &format!("{n}.attn_output.weight"),
-            &format!("{h}x{q}"),
-        );
-        if c.has_qk_norm {
-            emit_load_compute(
-                &mut f,
-                c,
-                &format!("{p}_qnw"),
-                &format!("{p}_attn_q_norm_weight"),
-                &format!("{n}.attn_q_norm.weight"),
-                &format!("{d}"),
-            );
-            emit_load_compute(
-                &mut f,
-                c,
-                &format!("{p}_knw"),
-                &format!("{p}_attn_k_norm_weight"),
-                &format!("{n}.attn_k_norm.weight"),
-                &format!("{d}"),
-            );
-        }
-        emit_load_compute(
-            &mut f,
-            c,
             &format!("{p}_ffn_nw"),
             &format!("{p}_ffn_norm_weight"),
             &format!("{n}.ffn_norm.weight"),
@@ -2485,87 +3042,195 @@ fn emit_decode(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()>
         );
 
         let xin = h_name.clone();
-        f.op_asm(format!(
-            "  %{p}_xn = func.call @rms_norm_tok(%{xin}, %{p}_attn_nw) : (tensor<1x{h}xf32>, tensor<{h}xf32>) -> tensor<1x{h}xf32>\n"
-        ));
-        emit_linear_call(
-            &mut f,
-            c,
-            &format!("{p}_q"),
-            "linear_hq_tok",
-            &format!("{p}_xn"),
-            &format!("{p}_wq"),
-            &format!("{n}.attn_q.weight"),
-            1,
-            h,
-            q,
-        );
-        emit_linear_call(
-            &mut f,
-            c,
-            &format!("{p}_k"),
-            "linear_hkv_tok",
-            &format!("{p}_xn"),
-            &format!("{p}_wk"),
-            &format!("{n}.attn_k.weight"),
-            1,
-            h,
-            kv,
-        );
-        emit_linear_call(
-            &mut f,
-            c,
-            &format!("{p}_v"),
-            "linear_hkv_tok",
-            &format!("{p}_xn"),
-            &format!("{p}_wv"),
-            &format!("{n}.attn_v.weight"),
-            1,
-            h,
-            kv,
-        );
-        f.op_asm(format!(
-            "  %{p}_k3 = tensor.expand_shape %{p}_k [[0], [1, 2]] output_shape [1, {nkv}, {d}] : tensor<1x{kv}xf32> into tensor<1x{nkv}x{d}xf32>\n"
-        ));
-        f.op_asm(format!(
-            "  %{p}_v3 = tensor.expand_shape %{p}_v [[0], [1, 2]] output_shape [1, {nkv}, {d}] : tensor<1x{kv}xf32> into tensor<1x{nkv}x{d}xf32>\n"
-        ));
-        f.op_asm(format!(
-            "  %{p}_k_old = util.global.load @kv_k{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
-        ));
-        f.op_asm(format!(
-            "  %{p}_v_old = util.global.load @kv_v{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
-        ));
-        if c.has_qk_norm {
-            f.op_asm(format!(
-                "  %{p}_ctx, %{p}_k_new, %{p}_v_new = func.call @attn_decode(%{p}_q, %{p}_k_old, %{p}_v_old, %{p}_k3, %{p}_v3, %pos, %attn_bias, %{p}_qnw, %{p}_knw) : (tensor<1x{q}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<1x{nkv}x{d}xf32>, tensor<1x{nkv}x{d}xf32>, tensor<i64>, tensor<{mk}xf32>, tensor<{d}xf32>, tensor<{d}xf32>) -> (tensor<1x{q}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<{mk}x{nkv}x{d}xf32>)\n"
-            ));
-        } else {
-            f.op_asm(format!(
-                "  %{p}_ctx, %{p}_k_new, %{p}_v_new = func.call @attn_decode(%{p}_q, %{p}_k_old, %{p}_v_old, %{p}_k3, %{p}_v3, %pos, %attn_bias) : (tensor<1x{q}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<1x{nkv}x{d}xf32>, tensor<1x{nkv}x{d}xf32>, tensor<i64>, tensor<{mk}xf32>) -> (tensor<1x{q}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<{mk}x{nkv}x{d}xf32>)\n"
-            ));
+        match layer_kind(c, layer) {
+            LayerKind::ShortConv => {
+                let cc = c.conv_dim;
+                emit_load_compute(
+                    &mut f,
+                    c,
+                    &format!("{p}_conv_in"),
+                    &format!("{p}_shortconv_in_proj_weight"),
+                    &format!("{n}.shortconv.in_proj.weight"),
+                    &format!("{}x{h}", 3 * cc),
+                );
+                emit_load_compute(
+                    &mut f,
+                    c,
+                    &format!("{p}_conv_out_w"),
+                    &format!("{p}_shortconv_out_proj_weight"),
+                    &format!("{n}.shortconv.out_proj.weight"),
+                    &format!("{h}x{cc}"),
+                );
+                f.op_asm(format!(
+                    "  %{p}_xn = func.call @rms_norm_tok(%{xin}, %{p}_attn_nw) : (tensor<1x{h}xf32>, tensor<{h}xf32>) -> tensor<1x{h}xf32>\n"
+                ));
+                emit_linear_call(
+                    &mut f,
+                    c,
+                    &format!("{p}_conv_inp"),
+                    "linear_h_c3_tok",
+                    &format!("{p}_xn"),
+                    &format!("{p}_conv_in"),
+                    &format!("{n}.shortconv.in_proj.weight"),
+                    1,
+                    h,
+                    3 * cc,
+                );
+                f.op_asm(format!(
+                    "  %{p}_conv_y = func.call @conv_op{layer}_tok(%{p}_conv_inp) : (tensor<1x{}xf32>) -> tensor<1x{}xf32>\n",
+                    3 * cc,
+                    cc,
+                ));
+                emit_linear_call(
+                    &mut f,
+                    c,
+                    &format!("{p}_conv_proj"),
+                    "linear_c_h_tok",
+                    &format!("{p}_conv_y"),
+                    &format!("{p}_conv_out_w"),
+                    &format!("{n}.shortconv.out_proj.weight"),
+                    1,
+                    cc,
+                    h,
+                );
+                f.op_asm(format!(
+                    "  %{p}_h2 = arith.addf %{xin}, %{p}_conv_proj : tensor<1x{h}xf32>\n"
+                ));
+            }
+            LayerKind::Attention => {
+                emit_load_compute(
+                    &mut f,
+                    c,
+                    &format!("{p}_wq"),
+                    &format!("{p}_attn_q_weight"),
+                    &format!("{n}.attn_q.weight"),
+                    &format!("{q}x{h}"),
+                );
+                emit_load_compute(
+                    &mut f,
+                    c,
+                    &format!("{p}_wk"),
+                    &format!("{p}_attn_k_weight"),
+                    &format!("{n}.attn_k.weight"),
+                    &format!("{kv}x{h}"),
+                );
+                emit_load_compute(
+                    &mut f,
+                    c,
+                    &format!("{p}_wv"),
+                    &format!("{p}_attn_v_weight"),
+                    &format!("{n}.attn_v.weight"),
+                    &format!("{kv}x{h}"),
+                );
+                emit_load_compute(
+                    &mut f,
+                    c,
+                    &format!("{p}_wo"),
+                    &format!("{p}_attn_output_weight"),
+                    &format!("{n}.attn_output.weight"),
+                    &format!("{h}x{q}"),
+                );
+                if c.has_qk_norm {
+                    emit_load_compute(
+                        &mut f,
+                        c,
+                        &format!("{p}_qnw"),
+                        &format!("{p}_attn_q_norm_weight"),
+                        &format!("{n}.attn_q_norm.weight"),
+                        &format!("{d}"),
+                    );
+                    emit_load_compute(
+                        &mut f,
+                        c,
+                        &format!("{p}_knw"),
+                        &format!("{p}_attn_k_norm_weight"),
+                        &format!("{n}.attn_k_norm.weight"),
+                        &format!("{d}"),
+                    );
+                }
+                f.op_asm(format!(
+                    "  %{p}_xn = func.call @rms_norm_tok(%{xin}, %{p}_attn_nw) : (tensor<1x{h}xf32>, tensor<{h}xf32>) -> tensor<1x{h}xf32>\n"
+                ));
+                emit_linear_call(
+                    &mut f,
+                    c,
+                    &format!("{p}_q"),
+                    "linear_hq_tok",
+                    &format!("{p}_xn"),
+                    &format!("{p}_wq"),
+                    &format!("{n}.attn_q.weight"),
+                    1,
+                    h,
+                    q,
+                );
+                emit_linear_call(
+                    &mut f,
+                    c,
+                    &format!("{p}_k"),
+                    "linear_hkv_tok",
+                    &format!("{p}_xn"),
+                    &format!("{p}_wk"),
+                    &format!("{n}.attn_k.weight"),
+                    1,
+                    h,
+                    kv,
+                );
+                emit_linear_call(
+                    &mut f,
+                    c,
+                    &format!("{p}_v"),
+                    "linear_hkv_tok",
+                    &format!("{p}_xn"),
+                    &format!("{p}_wv"),
+                    &format!("{n}.attn_v.weight"),
+                    1,
+                    h,
+                    kv,
+                );
+                f.op_asm(format!(
+                    "  %{p}_k3 = tensor.expand_shape %{p}_k [[0], [1, 2]] output_shape [1, {nkv}, {d}] : tensor<1x{kv}xf32> into tensor<1x{nkv}x{d}xf32>\n"
+                ));
+                f.op_asm(format!(
+                    "  %{p}_v3 = tensor.expand_shape %{p}_v [[0], [1, 2]] output_shape [1, {nkv}, {d}] : tensor<1x{kv}xf32> into tensor<1x{nkv}x{d}xf32>\n"
+                ));
+                f.op_asm(format!(
+                    "  %{p}_k_old = util.global.load @kv_k{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
+                ));
+                f.op_asm(format!(
+                    "  %{p}_v_old = util.global.load @kv_v{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
+                ));
+                if c.has_qk_norm {
+                    f.op_asm(format!(
+                        "  %{p}_ctx, %{p}_k_new, %{p}_v_new = func.call @attn_decode(%{p}_q, %{p}_k_old, %{p}_v_old, %{p}_k3, %{p}_v3, %pos, %attn_bias, %{p}_qnw, %{p}_knw) : (tensor<1x{q}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<1x{nkv}x{d}xf32>, tensor<1x{nkv}x{d}xf32>, tensor<i64>, tensor<{mk}xf32>, tensor<{d}xf32>, tensor<{d}xf32>) -> (tensor<1x{q}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<{mk}x{nkv}x{d}xf32>)\n"
+                    ));
+                } else {
+                    f.op_asm(format!(
+                        "  %{p}_ctx, %{p}_k_new, %{p}_v_new = func.call @attn_decode(%{p}_q, %{p}_k_old, %{p}_v_old, %{p}_k3, %{p}_v3, %pos, %attn_bias) : (tensor<1x{q}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<1x{nkv}x{d}xf32>, tensor<1x{nkv}x{d}xf32>, tensor<i64>, tensor<{mk}xf32>) -> (tensor<1x{q}xf32>, tensor<{mk}x{nkv}x{d}xf32>, tensor<{mk}x{nkv}x{d}xf32>)\n"
+                    ));
+                }
+                f.op_asm(format!(
+                    "  util.global.store %{p}_k_new, @kv_k{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
+                ));
+                f.op_asm(format!(
+                    "  util.global.store %{p}_v_new, @kv_v{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
+                ));
+                emit_linear_call(
+                    &mut f,
+                    c,
+                    &format!("{p}_o"),
+                    "linear_qh_tok",
+                    &format!("{p}_ctx"),
+                    &format!("{p}_wo"),
+                    &format!("{n}.attn_output.weight"),
+                    1,
+                    q,
+                    h,
+                );
+                f.op_asm(format!(
+                    "  %{p}_h2 = arith.addf %{xin}, %{p}_o : tensor<1x{h}xf32>\n"
+                ));
+            }
         }
-        f.op_asm(format!(
-            "  util.global.store %{p}_k_new, @kv_k{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
-        ));
-        f.op_asm(format!(
-            "  util.global.store %{p}_v_new, @kv_v{layer} : tensor<{mk}x{nkv}x{d}xf32>\n"
-        ));
-        emit_linear_call(
-            &mut f,
-            c,
-            &format!("{p}_o"),
-            "linear_qh_tok",
-            &format!("{p}_ctx"),
-            &format!("{p}_wo"),
-            &format!("{n}.attn_output.weight"),
-            1,
-            q,
-            h,
-        );
-        f.op_asm(format!(
-            "  %{p}_h2 = arith.addf %{xin}, %{p}_o : tensor<1x{h}xf32>\n"
-        ));
         f.op_asm(format!(
             "  %{p}_fn = func.call @rms_norm_tok(%{p}_h2, %{p}_ffn_nw) : (tensor<1x{h}xf32>, tensor<{h}xf32>) -> tensor<1x{h}xf32>\n"
         ));
@@ -2665,6 +3330,8 @@ mod tests {
         let c = DenseDecoderConfig {
             vocab: 151_936,
             hidden: 1024,
+            conv_dim: 1024,
+            conv_kernel: 3,
             intermediate: 3072,
             num_heads: 16,
             num_kv_heads: 8,
@@ -2682,6 +3349,7 @@ mod tests {
             param_compute_dtypes: BTreeMap::new(),
             param_bindings: BTreeMap::new(),
             param_lowerings: BTreeMap::new(),
+            resolved_layer_types: BTreeMap::new(),
         };
         assert!(c.supports_dense_emit());
         assert_eq!(c.q_dim(), 2048);
@@ -2696,6 +3364,8 @@ mod tests {
         let mut c = DenseDecoderConfig {
             vocab: 32,
             hidden: 64,
+            conv_dim: 64,
+            conv_kernel: 3,
             intermediate: 128,
             num_heads: 4,
             num_kv_heads: 4,
@@ -2713,6 +3383,7 @@ mod tests {
             param_compute_dtypes: BTreeMap::new(),
             param_bindings: BTreeMap::new(),
             param_lowerings: BTreeMap::new(),
+            resolved_layer_types: BTreeMap::new(),
         };
         assert!(c.supports_dense_emit());
         assert!(c.is_synthetic_fixture());
@@ -2758,6 +3429,8 @@ mod tests {
         let c = DenseDecoderConfig {
             vocab: 32,
             hidden: 64,
+            conv_dim: 64,
+            conv_kernel: 3,
             intermediate: 128,
             num_heads: 4,
             num_kv_heads: 4,
@@ -2775,6 +3448,7 @@ mod tests {
             param_compute_dtypes: BTreeMap::new(),
             param_bindings: BTreeMap::new(),
             param_lowerings: BTreeMap::new(),
+            resolved_layer_types: BTreeMap::new(),
         };
         let mlir = emit_dense_decoder_cfg("test.decoder", &c).expect("mlir verify");
         assert!(
@@ -2808,6 +3482,8 @@ mod tests {
         let c = DenseDecoderConfig {
             vocab: 32,
             hidden: 64,
+            conv_dim: 64,
+            conv_kernel: 3,
             intermediate: 128,
             num_heads: 4,
             num_kv_heads: 2,
@@ -2825,6 +3501,7 @@ mod tests {
             param_compute_dtypes: BTreeMap::new(),
             param_bindings: BTreeMap::new(),
             param_lowerings: BTreeMap::new(),
+            resolved_layer_types: BTreeMap::new(),
         };
         let mlir = emit_dense_decoder_cfg("test.gqa", &c).expect("emit");
         assert!(mlir.contains("func.func private @attn_decode"));
@@ -2849,5 +3526,114 @@ mod tests {
             mlir.contains("linalg.fill") && mlir.contains("kv_k0"),
             "prefill should zero-fill KV globals before seeding"
         );
+    }
+
+    #[test]
+    fn tiny_hybrid_short_conv_emits_and_compiles() {
+        let mut resolved = BTreeMap::new();
+        resolved.insert(0, LayerKind::ShortConv);
+        resolved.insert(1, LayerKind::Attention);
+        let c = DenseDecoderConfig {
+            vocab: 32,
+            hidden: 64,
+            conv_dim: 64,
+            conv_kernel: 3,
+            intermediate: 128,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 16,
+            num_layers: 2,
+            seq: TINY_PREFILL_WINDOW,
+            max_kv: TINY_MAX_KV,
+            paged_kv: false,
+            iree_flash_attention: false,
+            rms_norm_eps: 1e-5,
+            rope_theta: Some(10000.0),
+            has_qk_norm: true,
+            param_keys: BTreeMap::new(),
+            param_dtypes: BTreeMap::new(),
+            param_compute_dtypes: BTreeMap::new(),
+            param_bindings: BTreeMap::new(),
+            param_lowerings: BTreeMap::new(),
+            resolved_layer_types: resolved,
+        };
+        assert!(c.supports_dense_emit());
+        assert!(c.has_short_conv());
+        let mlir = emit_dense_decoder_cfg("test.lfm2", &c).expect("hybrid MLIR verifies");
+        assert!(mlir.contains("func.func private @conv_op0"));
+        assert!(mlir.contains("func.func private @conv_op0_tok"));
+        assert!(mlir.contains("@conv_state0"));
+        assert!(mlir.contains("@blk0_shortconv_conv_weight"));
+        assert!(mlir.contains("@blk0_shortconv_in_proj_weight"));
+        assert!(!mlir.contains("@kv_k0"), "short-conv layer must not allocate KV");
+        assert!(mlir.contains("@kv_k1"), "attention layer still needs KV");
+        assert!(mlir.contains("@linear_h_c3"));
+        assert!(mlir.contains("@linear_c_h"));
+        crate::compile_mlir_prefer_inprocess(
+            &mlir,
+            &dyninfer_core::TargetProfile::llvm_cpu_host(),
+            false,
+            None,
+        )
+        .expect("hybrid short-conv MLIR compiles through IREE");
+    }
+
+    #[test]
+    fn tiny_hybrid_paged_short_conv_emits_and_compiles() {
+        let mut resolved = BTreeMap::new();
+        resolved.insert(0, LayerKind::ShortConv);
+        resolved.insert(1, LayerKind::Attention);
+        let mut c = DenseDecoderConfig {
+            vocab: 32,
+            hidden: 64,
+            conv_dim: 64,
+            conv_kernel: 3,
+            intermediate: 128,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 16,
+            num_layers: 2,
+            seq: TINY_PREFILL_WINDOW,
+            max_kv: 1024,
+            paged_kv: true,
+            iree_flash_attention: false,
+            rms_norm_eps: 1e-5,
+            rope_theta: Some(10000.0),
+            has_qk_norm: true,
+            param_keys: BTreeMap::new(),
+            param_dtypes: BTreeMap::new(),
+            param_compute_dtypes: BTreeMap::new(),
+            param_bindings: BTreeMap::new(),
+            param_lowerings: BTreeMap::new(),
+            resolved_layer_types: resolved,
+        };
+        assert!(c.supports_dense_emit());
+        assert!(c.has_short_conv());
+        let mlir = emit_dense_decoder_cfg("test.lfm2.paged", &c).expect("hybrid paged MLIR");
+        assert!(mlir.contains("@prefill_chunk"));
+        assert!(mlir.contains("@decode_chunk"));
+        assert!(mlir.contains("@conv_state0"));
+        assert!(mlir.contains("func.func private @conv_op0"));
+        assert!(mlir.contains("func.func private @conv_op0_tok"));
+        assert!(mlir.contains("@layer_shortconv_0"));
+        assert!(mlir.contains("@decode_layer_shortconv_0"));
+        assert!(mlir.contains("@layer_prepare_1"));
+        assert!(!mlir.contains("@layer_prepare_0"));
+        assert!(
+            mlir.contains("scf.if") && mlir.contains("@conv_state0"),
+            "chunk_begin should clear conv_state on the first prefill chunk"
+        );
+        crate::compile_mlir_prefer_inprocess(
+            &mlir,
+            &dyninfer_core::TargetProfile::llvm_cpu_host(),
+            false,
+            None,
+        )
+        .expect("hybrid paged short-conv MLIR compiles through IREE");
+        // Dense hybrid still works after the paged wiring.
+        c.paged_kv = false;
+        c.max_kv = TINY_MAX_KV;
+        assert!(c.supports_dense_emit());
+        emit_dense_decoder_cfg("test.lfm2.dense", &c).expect("dense hybrid still emits");
     }
 }

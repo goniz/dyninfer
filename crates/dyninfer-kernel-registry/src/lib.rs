@@ -27,6 +27,7 @@ pub enum KernelOperationKind {
     KvCacheWrite,
     KvCacheRead,
     Attention,
+    ShortConv,
     Silu,
     Multiply,
     Residual,
@@ -45,6 +46,7 @@ impl KernelOperationKind {
             OperationKind::KvCacheWrite { .. } => Self::KvCacheWrite,
             OperationKind::KvCacheRead { .. } => Self::KvCacheRead,
             OperationKind::Attention { .. } => Self::Attention,
+            OperationKind::ShortConv { .. } => Self::ShortConv,
             OperationKind::Elementwise {
                 function: dyninfer_core::ElementwiseFunction::Silu,
             } => Self::Silu,

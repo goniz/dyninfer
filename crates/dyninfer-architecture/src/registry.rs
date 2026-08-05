@@ -214,7 +214,7 @@ mod tests {
     fn built_in_architectures_pass_typed_graph_conformance() {
         let mut registry = ArchitectureRegistry::new();
         register_all(&mut registry);
-        for id in ["llama.decoder", "qwen3.decoder"] {
+        for id in ["llama.decoder", "qwen3.decoder", "lfm2.hybrid"] {
             let package = registry
                 .build_package(
                     &ArchitectureId::new(id),
@@ -246,6 +246,88 @@ mod tests {
                     .any(|export| export.name == "decode")
             );
         }
+    }
+
+    #[test]
+    fn lfm2_graph_follows_the_configured_layer_schedule() {
+        let mut registry = ArchitectureRegistry::new();
+        register_all(&mut registry);
+        let checkpoint_meta = MetadataMap::from([
+            ("num_layers".into(), serde_json::json!(4)),
+            (
+                "layer_types".into(),
+                serde_json::json!(["conv", "full_attention", "conv", "conv"]),
+            ),
+        ]);
+        let package = registry
+            .build_package(
+                &ArchitectureId::new("lfm2.hybrid"),
+                &MetadataMap::new(),
+                &checkpoint_meta,
+            )
+            .unwrap();
+        let count = |predicate: fn(&OperationKind) -> bool| {
+            package
+                .graph
+                .operations
+                .iter()
+                .filter(|operation| predicate(&operation.kind))
+                .count()
+        };
+        assert_eq!(
+            count(|kind| matches!(kind, OperationKind::ShortConv { .. })),
+            3
+        );
+        assert_eq!(
+            count(|kind| matches!(kind, OperationKind::Attention { .. })),
+            1
+        );
+        // Every layer keeps its feed-forward block regardless of operator kind.
+        assert_eq!(
+            count(|kind| matches!(kind, OperationKind::Residual)),
+            2 * 4
+        );
+        // The short-conv operator only exists on non-attention layers.
+        assert!(
+            package
+                .graph
+                .operations
+                .iter()
+                .any(|operation| operation.id.as_str() == "blk.0.shortconv"
+                    && matches!(
+                        operation.kind,
+                        OperationKind::ShortConv {
+                            layer: 0,
+                            channels: 256,
+                            kernel_size: 3,
+                        }
+                    ))
+        );
+        assert!(
+            !package
+                .graph
+                .operations
+                .iter()
+                .any(|operation| operation.id.as_str() == "blk.1.shortconv")
+        );
+    }
+
+    #[test]
+    fn lfm2_rejects_a_schedule_that_disagrees_with_num_layers() {
+        let mut registry = ArchitectureRegistry::new();
+        register_all(&mut registry);
+        let checkpoint_meta = MetadataMap::from([
+            ("num_layers".into(), serde_json::json!(4)),
+            ("layer_types".into(), serde_json::json!(["conv", "conv"])),
+        ]);
+        let error = registry
+            .build_package(
+                &ArchitectureId::new("lfm2.hybrid"),
+                &MetadataMap::new(),
+                &checkpoint_meta,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("layer_types"), "{error}");
     }
 
     #[test]

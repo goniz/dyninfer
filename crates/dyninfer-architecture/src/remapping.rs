@@ -8,6 +8,8 @@ pub const MODEL_REMAPPING: &[(&str, &str)] = &[
     ("MistralForCausalLM", "llama"),
     ("qwen3", "qwen3"),
     ("Qwen3ForCausalLM", "qwen3"),
+    ("lfm2", "lfm2"),
+    ("Lfm2ForCausalLM", "lfm2"),
 ];
 
 /// Map a remapped stem to a stable architecture id.
@@ -15,6 +17,7 @@ pub fn architecture_id_for_stem(stem: &str) -> Option<&'static str> {
     match stem {
         "llama" => Some("llama.decoder"),
         "qwen3" => Some("qwen3.decoder"),
+        "lfm2" => Some("lfm2.hybrid"),
         _ => None,
     }
 }

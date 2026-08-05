@@ -61,13 +61,35 @@ pub fn load_hf_config_metadata(checkpoint: &Path) -> MetadataMap {
         out.insert("context_length".into(), Value::from(v));
         out.insert("llama.context_length".into(), Value::from(v));
     }
-    if let Some(v) = f("rms_norm_eps") {
+    // `norm_eps` is the LFM2 spelling of the same RMSNorm epsilon.
+    if let Some(v) = f("rms_norm_eps").or_else(|| f("norm_eps")) {
         out.insert("rms_norm_eps".into(), Value::from(v));
     }
-    if let Some(v) = f("rope_theta").or_else(|| u("rope_theta").map(|x| x as f64)) {
+    // Transformers v5 nests RoPE settings under `rope_parameters`.
+    let nested_rope_theta = obj
+        .get("rope_parameters")
+        .or_else(|| obj.get("rope_scaling"))
+        .and_then(Value::as_object)
+        .and_then(|rope| rope.get("rope_theta"))
+        .and_then(|v| v.as_f64());
+    if let Some(v) = f("rope_theta")
+        .or_else(|| u("rope_theta").map(|x| x as f64))
+        .or(nested_rope_theta)
+    {
         out.insert("rope_theta".into(), Value::from(v));
     } else {
         out.insert("rope_theta".into(), Value::from(10000.0));
+    }
+    // LFM2 hybrid schedule: explicit per-layer operator kinds plus the causal
+    // window of the short convolution.
+    if let Some(v) = obj.get("layer_types").and_then(|v| v.as_array()) {
+        out.insert("layer_types".into(), Value::Array(v.clone()));
+    }
+    if let Some(v) = u("conv_L_cache").or_else(|| u("conv_kernel")) {
+        out.insert("conv_kernel".into(), Value::from(v));
+    }
+    if let Some(v) = u("conv_dim") {
+        out.insert("conv_dim".into(), Value::from(v));
     }
     if let Some(v) = u("bos_token_id") {
         out.insert("bos_token_id".into(), Value::from(v));
