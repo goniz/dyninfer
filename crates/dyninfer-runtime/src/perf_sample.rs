@@ -17,7 +17,10 @@ struct Sample {
     cpu_pct: Option<f64>,
     gpu_busy_pct: Option<f64>,
     mem_busy_pct: Option<f64>,
-    vram_used_bytes: Option<u64>,
+    /// Dedicated device VRAM used (sysfs `mem_info_vram_used`, device-wide).
+    dedicated_vram_bytes: Option<u64>,
+    /// GTT / unified pool used (sysfs `mem_info_gtt_used`, device-wide).
+    gtt_bytes: Option<u64>,
 }
 
 /// Aggregated samples collected during a timed phase.
@@ -33,7 +36,10 @@ pub struct PhaseSampleStats {
     pub mem_busy_avg_pct: Option<f64>,
     pub mem_busy_p50_pct: Option<f64>,
     pub mem_busy_p90_pct: Option<f64>,
-    pub peak_vram_bytes: Option<u64>,
+    /// Peak dedicated VRAM observed (device-wide sysfs; not process-local).
+    pub peak_dedicated_vram_bytes: Option<u64>,
+    /// Peak GTT / unified memory observed (device-wide sysfs; not process-local).
+    pub peak_gtt_bytes: Option<u64>,
     pub sample_count: usize,
 }
 
@@ -94,10 +100,7 @@ impl PhaseSampler {
     }
 
     pub fn stop(mut self) -> PhaseSampleStats {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        self.join_worker();
         let mut samples = self
             .samples
             .lock()
@@ -126,6 +129,20 @@ impl PhaseSampler {
         samples.push(take_sample(&gpu, None));
         aggregate_samples(&samples)
     }
+
+    fn join_worker(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for PhaseSampler {
+    fn drop(&mut self) {
+        // Always join so an early return / panic cannot leak the sampler thread.
+        self.join_worker();
+    }
 }
 
 fn aggregate_samples(samples: &[Sample]) -> PhaseSampleStats {
@@ -137,7 +154,11 @@ fn aggregate_samples(samples: &[Sample]) -> PhaseSampleStats {
         return stats;
     }
     stats.peak_rss_bytes = samples.iter().map(|s| s.rss_bytes).max().unwrap_or(0);
-    stats.peak_vram_bytes = samples.iter().filter_map(|s| s.vram_used_bytes).max();
+    stats.peak_dedicated_vram_bytes = samples
+        .iter()
+        .filter_map(|s| s.dedicated_vram_bytes)
+        .max();
+    stats.peak_gtt_bytes = samples.iter().filter_map(|s| s.gtt_bytes).max();
 
     let cpu: Vec<f64> = samples.iter().filter_map(|s| s.cpu_pct).collect();
     let (avg, p50, p90) = percentile_summary(&cpu);
@@ -197,7 +218,8 @@ fn take_sample(gpu: &Option<GpuPaths>, cpu_pct: Option<f64>) -> Sample {
         cpu_pct,
         gpu_busy_pct: gpu.as_ref().and_then(|g| read_percent_file(&g.gpu_busy)),
         mem_busy_pct: gpu.as_ref().and_then(|g| read_percent_file(&g.mem_busy)),
-        vram_used_bytes: gpu.as_ref().and_then(|g| read_u64_file(&g.vram_used)),
+        dedicated_vram_bytes: gpu.as_ref().and_then(|g| read_u64_file(&g.vram_used)),
+        gtt_bytes: gpu.as_ref().and_then(|g| read_u64_file(&g.gtt_used)),
     }
 }
 
@@ -206,6 +228,7 @@ struct GpuPaths {
     gpu_busy: PathBuf,
     mem_busy: PathBuf,
     vram_used: PathBuf,
+    gtt_used: PathBuf,
 }
 
 fn discover_gpu_paths() -> Option<GpuPaths> {
@@ -226,12 +249,14 @@ fn discover_gpu_paths() -> Option<GpuPaths> {
         let gpu_busy = device.join("gpu_busy_percent");
         let mem_busy = device.join("mem_busy_percent");
         let vram_used = device.join("mem_info_vram_used");
-        // Prefer cards that expose at least busy% or VRAM accounting.
-        if gpu_busy.is_file() || vram_used.is_file() {
+        let gtt_used = device.join("mem_info_gtt_used");
+        // Prefer cards that expose at least busy% or memory accounting.
+        if gpu_busy.is_file() || vram_used.is_file() || gtt_used.is_file() {
             return Some(GpuPaths {
                 gpu_busy,
                 mem_busy,
                 vram_used,
+                gtt_used,
             });
         }
     }
@@ -324,5 +349,11 @@ mod tests {
         let stats = sampler.stop();
         assert!(stats.sample_count >= 1);
         assert!(stats.peak_rss_bytes > 0);
+    }
+
+    #[test]
+    fn sampler_drop_joins_worker() {
+        let sampler = PhaseSampler::start();
+        drop(sampler);
     }
 }

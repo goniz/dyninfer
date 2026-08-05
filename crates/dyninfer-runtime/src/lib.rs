@@ -38,7 +38,7 @@ pub use reference::{
 pub use session::{IreeSession, Logits};
 pub use tokenizer_bpe::BpeTokenizer;
 
-use dyninfer_core::{ModelMetadata, SessionConfig, TokenId};
+use dyninfer_core::{ModelMetadata, ScalarType, SessionConfig, TokenId};
 use dyninfer_error::Result;
 
 pub trait CausalLanguageModel: Send + Sync {
@@ -46,10 +46,42 @@ pub trait CausalLanguageModel: Send + Sync {
     fn create_session(&self, config: SessionConfig) -> Result<Box<dyn ModelSession>>;
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct KvCacheMetrics {
     pub page_count: usize,
+    /// Runtime-backed footprint (paged pages, or static capacity when preallocated).
     pub allocated_bytes: usize,
+    /// Full K+V capacity at compiled max sequence length.
+    pub capacity_bytes: usize,
+    /// Bytes covering currently filled positions (static) or allocated pages (paged).
+    pub used_bytes: usize,
+    pub filled_tokens: u64,
+    pub layers: u32,
+    pub kv_heads: u32,
+    pub head_dim: u32,
+    pub max_sequence_length: u32,
+    pub key_dtype: ScalarType,
+    pub value_dtype: ScalarType,
+    pub paged: bool,
+}
+
+impl Default for KvCacheMetrics {
+    fn default() -> Self {
+        Self {
+            page_count: 0,
+            allocated_bytes: 0,
+            capacity_bytes: 0,
+            used_bytes: 0,
+            filled_tokens: 0,
+            layers: 0,
+            kv_heads: 0,
+            head_dim: 0,
+            max_sequence_length: 0,
+            key_dtype: ScalarType::F32,
+            value_dtype: ScalarType::F32,
+            paged: false,
+        }
+    }
 }
 
 /// IREE HAL allocator statistics (zeros when unavailable).
@@ -61,6 +93,20 @@ pub struct AllocatorMetrics {
     pub device_bytes_peak: u64,
     pub device_bytes_allocated: u64,
     pub device_bytes_freed: u64,
+}
+
+impl AllocatorMetrics {
+    /// Currently live host bytes (`allocated - freed`).
+    pub fn host_live_bytes(&self) -> u64 {
+        self.host_bytes_allocated
+            .saturating_sub(self.host_bytes_freed)
+    }
+
+    /// Currently live device bytes (`allocated - freed`). Includes weights + KV + temps.
+    pub fn device_live_bytes(&self) -> u64 {
+        self.device_bytes_allocated
+            .saturating_sub(self.device_bytes_freed)
+    }
 }
 
 pub trait ModelSession: Send {

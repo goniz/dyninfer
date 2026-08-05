@@ -80,6 +80,11 @@ pub struct GenerateStats {
     pub decode_secs: f64,
     pub kv_page_count: usize,
     pub kv_allocated_bytes: usize,
+    pub kv_capacity_bytes: usize,
+    pub kv_used_bytes: usize,
+    pub kv_key_dtype: String,
+    pub kv_value_dtype: String,
+    pub kv_paged: bool,
 }
 
 impl GenerateStats {
@@ -217,6 +222,11 @@ pub fn generate_greedy(
             decode_secs,
             kv_page_count: cache.page_count,
             kv_allocated_bytes: cache.allocated_bytes,
+            kv_capacity_bytes: cache.capacity_bytes,
+            kv_used_bytes: cache.used_bytes,
+            kv_key_dtype: cache.key_dtype.to_string(),
+            kv_value_dtype: cache.value_dtype.to_string(),
+            kv_paged: cache.paged,
         },
     })
 }

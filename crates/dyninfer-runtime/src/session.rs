@@ -336,14 +336,32 @@ impl ModelSession for IreeSession {
     }
 
     fn kv_cache_metrics(&self) -> Result<KvCacheMetrics> {
-        let (page_count, allocated_bytes) = if self.paged_geometry().is_some() {
+        let capacity = self.kv.capacity_bytes() as usize;
+        let paged = self.paged_geometry().is_some();
+        let (page_count, runtime_allocated) = if paged {
             self.context.paged_kv_metrics()?
         } else {
-            (0, 0)
+            // Static util.global KV is preallocated at compile-time max_kv.
+            (0, capacity)
+        };
+        let used = if paged {
+            runtime_allocated
+        } else {
+            self.kv.bytes_for_tokens(self.position) as usize
         };
         Ok(KvCacheMetrics {
             page_count,
-            allocated_bytes,
+            allocated_bytes: runtime_allocated,
+            capacity_bytes: capacity,
+            used_bytes: used,
+            filled_tokens: self.position,
+            layers: self.kv.layer_count,
+            kv_heads: self.kv.kv_head_count,
+            head_dim: self.kv.head_dimension,
+            max_sequence_length: self.kv.max_sequence_length,
+            key_dtype: self.kv.element_type,
+            value_dtype: self.kv.element_type,
+            paged,
         })
     }
 

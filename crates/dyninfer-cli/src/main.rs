@@ -167,7 +167,7 @@ enum Commands {
         iters: usize,
         #[arg(long)]
         output_bundle: Option<PathBuf>,
-        /// Legacy prefill window. Paged executables use chunks up to 512 tokens.
+        /// Compiled dense prefill window. Defaults to --prefill (paged chunking uses up to 512).
         #[arg(long)]
         prefill_window: Option<u32>,
         /// Session/model context limit. Defaults to --prefill + --tg.
@@ -621,9 +621,36 @@ fn main() -> anyhow::Result<()> {
             let id = loader.resolve_architecture(Some(&architecture), &ckpt)?;
             eprintln!("architecture {}", id);
             let mut overrides = parse_sets(&set)?;
-            if let Some(w) = prefill_window {
-                overrides.insert("prefill_window".into(), serde_json::json!(w));
+            // Dense executables reject prompts longer than the compiled window.
+            // Prefer --prefill-window, then --set, else size the window to --prefill.
+            let prefill_from_set = overrides
+                .get("prefill_window")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            let (effective_prefill_window, prefill_window_source) = match prefill_window {
+                Some(w) => (w, "--prefill-window"),
+                None => match prefill_from_set {
+                    Some(w) => (w, "--set prefill_window"),
+                    None => (
+                        prefill_tokens.try_into().map_err(|_| {
+                            anyhow::anyhow!("--prefill {prefill_tokens} exceeds u32")
+                        })?,
+                        "--prefill",
+                    ),
+                },
+            };
+            if (effective_prefill_window as usize) < prefill_tokens {
+                anyhow::bail!(
+                    "prefill_window {effective_prefill_window} ({prefill_window_source}) cannot fit --prefill ({prefill_tokens})"
+                );
             }
+            if prefill_window.is_none() && prefill_from_set.is_none() {
+                eprintln!("prefill_window={effective_prefill_window} (from --prefill)");
+            }
+            overrides.insert(
+                "prefill_window".into(),
+                serde_json::json!(effective_prefill_window),
+            );
             overrides.insert("max_kv".into(), serde_json::json!(effective_max_kv));
             let paths = loader.compile_to_bundle_with_overrides(
                 &id,
@@ -766,14 +793,25 @@ fn print_generate_result(out: &GenerateOutput) {
     println!("{}", out.text);
     let s = &out.stats;
     eprintln!(
-        "prefill: {} tok in {:.3}s ({:.1} tok/s)  decode: {} tok in {:.3}s ({:.1} tok/s)  KV: {} pages ({:.1} MiB)",
+        "prefill: {} tok in {:.3}s ({:.1} tok/s)  decode: {} tok in {:.3}s ({:.1} tok/s)",
         s.prompt_tokens,
         s.prefill_secs,
         s.prefill_tps(),
         s.generated_tokens,
         s.decode_secs,
         s.decode_tps(),
-        s.kv_page_count,
-        s.kv_allocated_bytes as f64 / (1024.0 * 1024.0),
+    );
+    let storage = if s.kv_paged { "paged" } else { "static" };
+    eprintln!(
+        "KV cache: capacity {:.2} MiB  used {:.2} MiB  K={} V={}  [{storage}{}]",
+        s.kv_capacity_bytes as f64 / (1024.0 * 1024.0),
+        s.kv_used_bytes as f64 / (1024.0 * 1024.0),
+        s.kv_key_dtype,
+        s.kv_value_dtype,
+        if s.kv_paged {
+            format!(", {} pages", s.kv_page_count)
+        } else {
+            String::new()
+        }
     );
 }
