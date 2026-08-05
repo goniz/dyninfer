@@ -142,6 +142,7 @@ impl CausalLanguageModel for LoadedModel {
                 self.manifest.kv_cache.kv_head_count as usize,
                 self.manifest.kv_cache.head_dimension as usize,
                 chunk_size as usize,
+                self.metadata.vocabulary_size as usize,
             )?;
         }
         Ok(Box::new(IreeSession::new(

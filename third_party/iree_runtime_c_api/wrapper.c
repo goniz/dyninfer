@@ -49,6 +49,7 @@ struct dyninfer_iree_session_t {
   size_t paged_tokens_len;
   iree_hal_buffer_view_t* paged_last;
   iree_hal_buffer_view_t* paged_start_pos;
+  iree_hal_buffer_view_t* paged_logits;
   float* logits_host;
   size_t logits_capacity;
   iree_hal_buffer_view_t** kv_pages;
@@ -59,6 +60,7 @@ struct dyninfer_iree_session_t {
   size_t kv_head_count;
   size_t kv_head_dim;
   size_t kv_chunk_size;
+  size_t kv_vocab_size;
   size_t kv_allocated_bytes;
   bool split_modules;
 };
@@ -485,6 +487,7 @@ void dyninfer_iree_session_destroy(dyninfer_iree_session_t* session) {
   iree_hal_buffer_view_release(session->paged_tokens);
   iree_hal_buffer_view_release(session->paged_last);
   iree_hal_buffer_view_release(session->paged_start_pos);
+  iree_hal_buffer_view_release(session->paged_logits);
   for (size_t i = 0; i < session->kv_page_count; ++i) {
     iree_hal_buffer_view_release(session->kv_pages[i]);
   }
@@ -652,9 +655,10 @@ int dyninfer_iree_session_invoke_decode(dyninfer_iree_session_t* session,
 
 int dyninfer_iree_session_configure_paged_kv(
     dyninfer_iree_session_t* session, size_t layer_count, size_t page_size,
-    size_t kv_head_count, size_t head_dim, size_t chunk_size) {
+    size_t kv_head_count, size_t head_dim, size_t chunk_size,
+    size_t vocab_size) {
   if (!session || layer_count == 0 || page_size == 0 || kv_head_count == 0 ||
-      head_dim == 0 || chunk_size == 0 ||
+      head_dim == 0 || chunk_size == 0 || vocab_size == 0 ||
       (page_size % chunk_size != 0 && chunk_size % page_size != 0)) {
     set_error_msg("invalid paged KV configuration");
     return 1;
@@ -668,6 +672,7 @@ int dyninfer_iree_session_configure_paged_kv(
   session->kv_head_count = kv_head_count;
   session->kv_head_dim = head_dim;
   session->kv_chunk_size = chunk_size;
+  session->kv_vocab_size = vocab_size;
   return 0;
 }
 
@@ -737,12 +742,47 @@ int dyninfer_iree_session_ensure_kv_pages(dyninfer_iree_session_t* session,
   return 0;
 }
 
+static iree_status_t ensure_paged_logits(dyninfer_iree_session_t* session) {
+  if (session->paged_logits) return iree_ok_status();
+  if (session->kv_vocab_size == 0) {
+    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
+                            "paged logits buffer requires vocab_size");
+  }
+  float* zeros = (float*)calloc(session->kv_vocab_size, sizeof(float));
+  if (!zeros) {
+    return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
+                            "allocating zero-filled logits staging");
+  }
+  iree_hal_dim_t shape[1] = {(iree_hal_dim_t)session->kv_vocab_size};
+  iree_status_t status =
+      allocate_f32_tensor(session->session, 1, shape, zeros,
+                          session->kv_vocab_size, &session->paged_logits);
+  free(zeros);
+  return status;
+}
+
+static iree_status_t copy_i64_scalar_view_to_host(iree_runtime_session_t* session,
+                                                  iree_hal_buffer_view_t* view,
+                                                  int64_t* out_value) {
+  iree_device_size_t byte_length = iree_hal_buffer_view_byte_length(view);
+  if (byte_length != sizeof(int64_t)) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "expected scalar i64 buffer view");
+  }
+  return iree_hal_device_transfer_d2h(
+      iree_runtime_session_device(session), iree_hal_buffer_view_buffer(view),
+      0, out_value, sizeof(int64_t), IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT,
+      iree_infinite_timeout());
+}
+
 static iree_status_t invoke_paged_chunk_once(
     dyninfer_iree_session_t* wrapper, dyninfer_cached_call_t* cached,
     const char* full_name, iree_hal_buffer_view_t* v_tokens,
     iree_hal_buffer_view_t* v_last, iree_hal_buffer_view_t* v_start,
-    float** out_logits, size_t* out_count) {
+    float** out_logits, size_t* out_count, int64_t* out_token,
+    bool want_logits) {
   IREE_RETURN_IF_ERROR(cached_call_prepare(wrapper, cached, full_name));
+  IREE_RETURN_IF_ERROR(ensure_paged_logits(wrapper));
   iree_runtime_call_t* call = &cached->call;
 
   iree_status_t status = iree_ok_status();
@@ -755,6 +795,10 @@ static iree_status_t invoke_paged_chunk_once(
   if (iree_status_is_ok(status)) {
     status = iree_runtime_call_inputs_push_back_buffer_view(call, v_start);
   }
+  if (iree_status_is_ok(status)) {
+    status = iree_runtime_call_inputs_push_back_buffer_view(call,
+                                                            wrapper->paged_logits);
+  }
   for (size_t i = 0; iree_status_is_ok(status) && i < wrapper->kv_page_count;
        ++i) {
     status = iree_runtime_call_inputs_push_back_buffer_view(
@@ -764,16 +808,23 @@ static iree_status_t invoke_paged_chunk_once(
     status = iree_runtime_call_invoke(call, /*flags=*/0);
   }
 
+  // Results: logits, pages..., argmax token. abi.output aliases caller storage
+  // for logits/pages — release aliasing views without replacing originals.
   iree_hal_buffer_view_t* logits_view = NULL;
   if (iree_status_is_ok(status)) {
     status =
         iree_runtime_call_outputs_pop_front_buffer_view(call, &logits_view);
   }
-  if (iree_status_is_ok(status)) {
-    status = copy_f32_view_to_host(wrapper->session, logits_view,
-                                   &wrapper->logits_host,
-                                   &wrapper->logits_capacity, out_logits,
-                                   out_count);
+  if (iree_status_is_ok(status) && want_logits) {
+    if (!out_logits || !out_count) {
+      status = iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                                "want_logits requires out_logits/out_count");
+    } else {
+      status = copy_f32_view_to_host(wrapper->session, logits_view,
+                                     &wrapper->logits_host,
+                                     &wrapper->logits_capacity, out_logits,
+                                     out_count);
+    }
   }
   iree_hal_buffer_view_release(logits_view);
 
@@ -782,10 +833,20 @@ static iree_status_t invoke_paged_chunk_once(
     iree_hal_buffer_view_t* updated = NULL;
     status = iree_runtime_call_outputs_pop_front_buffer_view(call, &updated);
     if (!iree_status_is_ok(status)) break;
-    iree_hal_buffer_view_release(wrapper->kv_pages[i]);
-    wrapper->kv_pages[i] = updated;
+    iree_hal_buffer_view_release(updated);
   }
-  // Clear retained input refs (pages may change identity after this invoke).
+
+  iree_hal_buffer_view_t* token_view = NULL;
+  if (iree_status_is_ok(status)) {
+    status =
+        iree_runtime_call_outputs_pop_front_buffer_view(call, &token_view);
+  }
+  if (iree_status_is_ok(status) && out_token) {
+    status = copy_i64_scalar_view_to_host(wrapper->session, token_view,
+                                          out_token);
+  }
+  iree_hal_buffer_view_release(token_view);
+
   iree_runtime_call_reset(call);
   return status;
 }
@@ -793,13 +854,18 @@ static iree_status_t invoke_paged_chunk_once(
 int dyninfer_iree_session_invoke_paged_chunk(
     dyninfer_iree_session_t* session, const int64_t* tokens,
     size_t token_count, int64_t last, int64_t start_pos, float** out_logits,
-    size_t* out_count) {
-  *out_logits = NULL;
-  *out_count = 0;
+    size_t* out_count, int64_t* out_token, int want_logits) {
+  if (out_logits) *out_logits = NULL;
+  if (out_count) *out_count = 0;
+  if (out_token) *out_token = -1;
   if (!session || !tokens ||
       (token_count != session->kv_chunk_size && token_count != 1) ||
       last < 0 || (size_t)last >= token_count || start_pos < 0) {
     set_error_msg("invalid paged chunk invocation");
+    return 1;
+  }
+  if (want_logits && (!out_logits || !out_count)) {
+    set_error_msg("want_logits requires out_logits/out_count");
     return 1;
   }
   const bool is_decode = token_count == 1;
@@ -823,10 +889,10 @@ int dyninfer_iree_session_invoke_paged_chunk(
   dyninfer_cached_call_t* cached =
       is_decode ? &session->call_paged_decode : &session->call_paged_prefill;
   if (iree_status_is_ok(status)) {
-    status = invoke_paged_chunk_once(session, cached, function_name,
-                                     session->paged_tokens, session->paged_last,
-                                     session->paged_start_pos, out_logits,
-                                     out_count);
+    status = invoke_paged_chunk_once(
+        session, cached, function_name, session->paged_tokens,
+        session->paged_last, session->paged_start_pos, out_logits, out_count,
+        out_token, want_logits != 0);
   }
   if (!iree_status_is_ok(status)) {
     set_error_status(status);

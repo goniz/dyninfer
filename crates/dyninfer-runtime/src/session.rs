@@ -132,13 +132,21 @@ impl ModelSession for IreeSession {
             // ceil(max_kv / page_size); allocate the full set up front.
             let max_pages = (self.max_seq() as usize).div_ceil(page_size).max(1);
             self.context.ensure_kv_pages(max_pages)?;
+            let chunks: Vec<_> = tokens.chunks(chunk_size).collect();
             let mut logits = Vec::new();
-            for (chunk_index, chunk) in tokens.chunks(chunk_size).enumerate() {
+            for (chunk_index, chunk) in chunks.iter().enumerate() {
                 let start = chunk_index * chunk_size;
                 let (window, last) = self.window_from_tokens(chunk);
-                logits = self
-                    .context
-                    .invoke_paged_chunk(&window, last, start as i64)?;
+                let want_logits = chunk_index + 1 == chunks.len();
+                let (chunk_logits, _) = self.context.invoke_paged_chunk_ex(
+                    &window,
+                    last,
+                    start as i64,
+                    want_logits,
+                )?;
+                if want_logits {
+                    logits = chunk_logits.expect("final prefill chunk returns logits");
+                }
             }
             logits
         } else {
@@ -207,6 +215,111 @@ impl ModelSession for IreeSession {
         self.history.push(token);
         self.position += 1;
         Ok(Logits { values })
+    }
+
+    fn prefill_argmax(&mut self, tokens: &[TokenId]) -> Result<TokenId> {
+        if self.paged_geometry().is_none() {
+            return Ok(crate::argmax(&self.prefill(tokens)?.values));
+        }
+        let _span = info_span!("runtime.prefill_argmax", tokens = tokens.len()).entered();
+        if self.config.batch_size != 1 {
+            return Err(DynInferError::IreeRuntime(IreeRuntimeError {
+                message: format!(
+                    "batch_size {} is not supported (only batch_size=1)",
+                    self.config.batch_size
+                ),
+                status_code: None,
+            }));
+        }
+        if tokens.is_empty() {
+            return Err(DynInferError::IreeRuntime(IreeRuntimeError {
+                message: "prefill requires a non-empty token list".into(),
+                status_code: None,
+            }));
+        }
+        let max_seq = self.max_seq() as usize;
+        if tokens.len() > max_seq {
+            return Err(DynInferError::IreeRuntime(IreeRuntimeError {
+                message: format!(
+                    "prefill length {} exceeds session/KV limit {}",
+                    tokens.len(),
+                    max_seq
+                ),
+                status_code: None,
+            }));
+        }
+        let (page_size, chunk_size) = self.paged_geometry().expect("paged");
+        self.history.clear();
+        self.history.extend_from_slice(tokens);
+        self.context.reset_paged_kv()?;
+        let max_pages = (self.max_seq() as usize).div_ceil(page_size).max(1);
+        self.context.ensure_kv_pages(max_pages)?;
+        let chunks: Vec<_> = tokens.chunks(chunk_size).collect();
+        let mut token = -1i64;
+        for (chunk_index, chunk) in chunks.iter().enumerate() {
+            let start = chunk_index * chunk_size;
+            let (window, last) = self.window_from_tokens(chunk);
+            let (_, tok) = self.context.invoke_paged_chunk_ex(
+                &window,
+                last,
+                start as i64,
+                /*want_logits=*/ false,
+            )?;
+            token = tok;
+        }
+        if token < 0 {
+            return Err(DynInferError::IreeRuntime(IreeRuntimeError {
+                message: format!("prefill_argmax returned invalid token {token}"),
+                status_code: None,
+            }));
+        }
+        self.position = tokens.len() as u64;
+        Ok(token as TokenId)
+    }
+
+    fn decode_argmax(&mut self, token: TokenId) -> Result<TokenId> {
+        if self.paged_geometry().is_none() {
+            return Ok(crate::argmax(&self.decode(token)?.values));
+        }
+        let _span = info_span!("runtime.decode_argmax", token, position = self.position).entered();
+        if self.config.batch_size != 1 {
+            return Err(DynInferError::IreeRuntime(IreeRuntimeError {
+                message: format!(
+                    "batch_size {} is not supported (only batch_size=1)",
+                    self.config.batch_size
+                ),
+                status_code: None,
+            }));
+        }
+        let max_seq = self.max_seq();
+        if self.position >= max_seq {
+            return Err(DynInferError::IreeRuntime(IreeRuntimeError {
+                message: format!(
+                    "decode position {} exceeds session/KV limit {}",
+                    self.position, max_seq
+                ),
+                status_code: None,
+            }));
+        }
+        let (page_size, _) = self.paged_geometry().expect("paged");
+        let max_pages = (self.max_seq() as usize).div_ceil(page_size).max(1);
+        self.context.ensure_kv_pages(max_pages)?;
+        let decode_token = [i64::from(token)];
+        let (_, next) = self.context.invoke_paged_chunk_ex(
+            &decode_token,
+            0,
+            self.position as i64,
+            /*want_logits=*/ false,
+        )?;
+        if next < 0 {
+            return Err(DynInferError::IreeRuntime(IreeRuntimeError {
+                message: format!("decode_argmax returned invalid token {next}"),
+                status_code: None,
+            }));
+        }
+        self.history.push(token);
+        self.position += 1;
+        Ok(next as TokenId)
     }
 
     fn position(&self) -> u64 {

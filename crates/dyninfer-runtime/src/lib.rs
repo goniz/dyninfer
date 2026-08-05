@@ -51,6 +51,14 @@ pub struct KvCacheMetrics {
 pub trait ModelSession: Send {
     fn prefill(&mut self, tokens: &[TokenId]) -> Result<Logits>;
     fn decode(&mut self, token: TokenId) -> Result<Logits>;
+    /// Prefill and return the device/host greedy token (skips vocab D2H when possible).
+    fn prefill_argmax(&mut self, tokens: &[TokenId]) -> Result<TokenId> {
+        Ok(crate::argmax(&self.prefill(tokens)?.values))
+    }
+    /// Decode and return the device/host greedy token (skips vocab D2H when possible).
+    fn decode_argmax(&mut self, token: TokenId) -> Result<TokenId> {
+        Ok(crate::argmax(&self.decode(token)?.values))
+    }
     fn position(&self) -> u64;
     fn reset(&mut self) -> Result<()>;
     fn kv_cache_metrics(&self) -> Result<KvCacheMetrics> {

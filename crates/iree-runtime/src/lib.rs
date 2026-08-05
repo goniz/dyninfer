@@ -443,6 +443,7 @@ impl Context {
         kv_head_count: usize,
         head_dim: usize,
         chunk_size: usize,
+        vocab_size: usize,
     ) -> Result<()> {
         self.with_session(|session| {
             let rc = unsafe {
@@ -453,6 +454,7 @@ impl Context {
                     kv_head_count,
                     head_dim,
                     chunk_size,
+                    vocab_size,
                 )
             };
             (rc == 0).then_some(()).ok_or_else(|| native_error(rc))
@@ -472,9 +474,23 @@ impl Context {
         last: i64,
         start_pos: i64,
     ) -> Result<Vec<f32>> {
+        self.invoke_paged_chunk_ex(tokens, last, start_pos, true)
+            .map(|(logits, _)| logits.expect("want_logits"))
+    }
+
+    /// Paged chunk invoke. When `want_logits` is false, only the device argmax
+    /// token is copied to the host (avoids vocab-sized D2H).
+    pub fn invoke_paged_chunk_ex(
+        &self,
+        tokens: &[i64],
+        last: i64,
+        start_pos: i64,
+        want_logits: bool,
+    ) -> Result<(Option<Vec<f32>>, i64)> {
         self.with_session(|session| {
             let mut out = ptr::null_mut();
             let mut count = 0usize;
+            let mut token = -1i64;
             let rc = unsafe {
                 sys::dyninfer_iree_session_invoke_paged_chunk(
                     session,
@@ -482,11 +498,29 @@ impl Context {
                     tokens.len(),
                     last,
                     start_pos,
-                    &mut out,
-                    &mut count,
+                    if want_logits {
+                        &mut out
+                    } else {
+                        ptr::null_mut()
+                    },
+                    if want_logits {
+                        &mut count
+                    } else {
+                        ptr::null_mut()
+                    },
+                    &mut token,
+                    if want_logits { 1 } else { 0 },
                 )
             };
-            take_f32_buf(rc, out, count)
+            if rc != 0 {
+                return Err(native_error(rc));
+            }
+            let logits = if want_logits {
+                Some(take_f32_buf(0, out, count)?)
+            } else {
+                None
+            };
+            Ok((logits, token))
         })
     }
 

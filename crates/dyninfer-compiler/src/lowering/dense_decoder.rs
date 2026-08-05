@@ -517,13 +517,25 @@ fn emit_paged_fused_chunk(
     f.arg("tokens", format!("tensor<{s}xi64>"));
     f.arg("last", "tensor<i64>");
     f.arg("start_pos", "tensor<i64>");
+    // Caller-owned storage for logits + pages (iree.abi.output). IREE writes
+    // results in place so the host can keep the same buffer views across steps.
+    f.arg_attrs(
+        "logits_buf",
+        format!("tensor<{v}xf32>"),
+        "{iree.abi.output = 0 : index}",
+    );
     for pi in 0..num_pages {
-        f.arg(format!("page{pi}"), &page_ty);
+        f.arg_attrs(
+            format!("page{pi}"),
+            page_ty.clone(),
+            format!("{{iree.abi.output = {} : index}}", pi + 1),
+        );
     }
     f.result_ty(format!("tensor<{v}xf32>"));
     for _pi in 0..num_pages {
         f.result_ty(&page_ty);
     }
+    f.result_ty("tensor<i64>");
     // Thread valid_count as SSA into layer_page. util.global load of the
     // scalar across outlined private calls has been unreliable (wrong mask /
     // diluted logits).
@@ -590,8 +602,30 @@ fn emit_paged_fused_chunk(
         .take(num_pages as usize)
         .collect::<Vec<_>>()
         .join(", ");
+    // Device argmax so the host can D2H a single i64 when repetition penalty is off.
+    // Use a linalg reduction (not scf.for+extract) — the latter serializes the full
+    // vocab on GPU and destroys decode throughput.
     f.op_asm(format!(
-        "  %logits = func.call @{logits_fn}(%last) : (tensor<i64>) -> tensor<{v}xf32>\n  return %logits, {page_rets} : tensor<{v}xf32>, {page_tys}"
+        r#"  %logits = func.call @{logits_fn}(%last) : (tensor<i64>) -> tensor<{v}xf32>
+  %neg_inf = arith.constant 0xFF800000 : f32
+  %zero_i64 = arith.constant 0 : i64
+  %seed_v_e = tensor.empty() : tensor<f32>
+  %seed_v = tensor.insert %neg_inf into %seed_v_e[] : tensor<f32>
+  %seed_i_e = tensor.empty() : tensor<i64>
+  %seed_i = tensor.insert %zero_i64 into %seed_i_e[] : tensor<i64>
+  %best_v, %best_i = linalg.generic {{indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> ()>, affine_map<(d0) -> ()>], iterator_types = ["reduction"]}} ins(%logits : tensor<{v}xf32>) outs(%seed_v, %seed_i : tensor<f32>, tensor<i64>) {{
+  ^bb0(%x: f32, %mv: f32, %mi: i64):
+    %i = linalg.index 0 : index
+    %ii = arith.index_cast %i : index to i64
+    %gt = arith.cmpf ogt, %x, %mv : f32
+    %nv = arith.select %gt, %x, %mv : f32
+    %ni = arith.select %gt, %ii, %mi : i64
+    linalg.yield %nv, %ni : f32, i64
+  }} -> (tensor<f32>, tensor<i64>)
+  %tok = tensor.extract %best_i[] : tensor<i64>
+  %tok_e = tensor.empty() : tensor<i64>
+  %tok_t = tensor.insert %tok into %tok_e[] : tensor<i64>
+  return %logits, {page_rets}, %tok_t : tensor<{v}xf32>, {page_tys}, tensor<i64>"#
     ));
     f.finish(module)
 }
@@ -3394,6 +3428,20 @@ mod tests {
         assert!(mlir.contains("@decode_chunk"));
         assert!(mlir.contains("func.func private @layer_page"));
         assert!(!mlir.contains("!util.list<!hal.buffer_view>"));
+        assert!(
+            mlir.contains("iree.abi.output = 0 : index"),
+            "paged chunk should take caller-owned logits via abi.output"
+        );
+        assert!(
+            mlir.contains("iree.abi.output = 1 : index"),
+            "paged chunk should take caller-owned pages via abi.output"
+        );
+        assert!(
+            mlir.contains("linalg.generic")
+                && mlir.contains("iterator_types = [\"reduction\"]")
+                && mlir.contains("arith.cmpf ogt"),
+            "paged chunk should emit device-side argmax over logits"
+        );
         // Chunk KV + attn state returned as SSA from prepare (not via util.global).
         assert!(mlir.contains("@paged_attn_max") || mlir.contains("@paged_decode_attn_max"));
         assert!(mlir.contains("@chunk_begin"));
