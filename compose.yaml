@@ -1,0 +1,41 @@
+# Build the dyninfer image and run the CLI inside it with ROCm/HIP device
+# access (Strix Halo, Radeon 8060S / gfx1151).
+#
+# Build:  docker compose build
+# Shell:  docker compose run --rm dyninfer
+# Generate (CPU):
+#   docker compose run --rm dyninfer \
+#     bazel run //crates/dyninfer-cli:dyninfer -- generate \
+#     --hf Qwen/Qwen3-0.6B --prompt "Hello" --target cpu
+# Generate (HIP/ROCm — devices below are passed through):
+#   docker compose run --rm dyninfer \
+#     bazel run //crates/dyninfer-cli:dyninfer -- generate \
+#     --hf Qwen/Qwen3-0.6B --prompt "Hello" --target rocm
+
+services:
+  dyninfer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dyninfer:latest
+    # Drop into a shell by default; override the command to generate.
+    command: ["bash"]
+    # ROCm userspace in the image is matched to the host kernel driver; the
+    # KFD + render devices must be exposed for the HIP HAL driver to load.
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    ipc: host
+    shm_size: 1g
+    # Hugging Face Hub cache is resolved read-only at runtime (no downloads);
+    # mount the host cache or `hf download` with HF_HUB_CACHE=/hf-cache.
+    volumes:
+      - ${HOME}/.cache/huggingface/hub:/hf-cache
+    environment:
+      - HF_HUB_CACHE=/hf-cache
+    # Uncomment if HSA reports a blocked ioctl on your host:
+    # security_opt:
+    #   - seccomp=unconfined
