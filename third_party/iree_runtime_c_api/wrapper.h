@@ -29,8 +29,10 @@ typedef struct dyninfer_iree_file_param_t {
 } dyninfer_iree_file_param_t;
 
 // Create a persistent session without external parameters (smoke modules).
-// |device_uri| is an IREE driver name: "hip", "local-task", "vulkan", …
+// |device_uri| is an IREE driver name: "hip", "local-task", …
 // Pass NULL / "" for local-task.
+// For HIP/ROCm, sets hipDeviceScheduleBlockingSync (unless
+// DYNINFER_HIP_ALLOW_BUSY_WAIT=1) so host waits sleep instead of spinning.
 // Returns 0 on success; non-zero on failure (see dyninfer_iree_last_error).
 int dyninfer_iree_session_create(const char* device_uri, const char* vmfb_path,
                                  dyninfer_iree_session_t** out_session);

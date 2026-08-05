@@ -1,5 +1,7 @@
 #include "wrapper.h"
 
+#include <dlfcn.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,15 +16,39 @@
 #include "iree/runtime/api.h"
 #include "iree/vm/api.h"
 
+// hipDeviceScheduleBlockingSync — sleep instead of spinning on GPU waits.
+#define DYNINFER_HIP_DEVICE_SCHEDULE_BLOCKING_SYNC 0x04u
+
+typedef struct dyninfer_cached_call_t {
+  iree_runtime_call_t call;
+  bool ready;
+  char name[96];
+} dyninfer_cached_call_t;
+
 struct dyninfer_iree_session_t {
   iree_runtime_instance_t* instance;
   iree_hal_device_t* device;
   iree_runtime_session_t* session;
-  // Reused across decode steps to avoid per-token device/host allocs.
+  // Cached entrypoints — avoid initialize_by_name + list alloc each step.
+  dyninfer_cached_call_t call_add;
+  dyninfer_cached_call_t call_prefill;
+  dyninfer_cached_call_t call_decode;
+  dyninfer_cached_call_t call_paged_prefill;
+  dyninfer_cached_call_t call_paged_decode;
+  // Dense decode scratch (mutated in place via H2D).
   iree_hal_buffer_view_t* decode_token;
   iree_hal_buffer_view_t* decode_pos;
   iree_hal_buffer_view_t* decode_bias;
   size_t decode_bias_len;
+  // Dense prefill scratch.
+  iree_hal_buffer_view_t* prefill_tokens;
+  size_t prefill_tokens_len;
+  iree_hal_buffer_view_t* prefill_last;
+  // Paged chunk scratch.
+  iree_hal_buffer_view_t* paged_tokens;
+  size_t paged_tokens_len;
+  iree_hal_buffer_view_t* paged_last;
+  iree_hal_buffer_view_t* paged_start_pos;
   float* logits_host;
   size_t logits_capacity;
   iree_hal_buffer_view_t** kv_pages;
@@ -55,6 +81,75 @@ static void set_error_status(iree_status_t status) {
 
 static void set_error_msg(const char* msg) {
   snprintf(g_last_error, sizeof(g_last_error), "%s", msg ? msg : "unknown error");
+}
+
+// Prefer BlockingSync so HIP/HSA sleeps on GPU waits instead of spinning a
+// host core (~100% CPU). Must run before IREE creates the HIP primary context.
+// Opt out: DYNINFER_HIP_ALLOW_BUSY_WAIT=1.
+static void configure_hip_blocking_sync(const char* device_uri) {
+  if (!device_uri || device_uri[0] == '\0') return;
+  if (strncmp(device_uri, "hip", 3) != 0 && strncmp(device_uri, "rocm", 4) != 0) {
+    return;
+  }
+  const char* allow_busy = getenv("DYNINFER_HIP_ALLOW_BUSY_WAIT");
+  if (allow_busy && allow_busy[0] == '1') return;
+
+  void* lib = dlopen("libamdhip64.so", RTLD_NOW | RTLD_NOLOAD);
+  if (!lib) {
+    lib = dlopen("libamdhip64.so", RTLD_LAZY | RTLD_LOCAL);
+  }
+  if (!lib) return;
+
+  typedef int (*hip_init_fn)(unsigned int);
+  typedef int (*hip_get_device_count_fn)(int*);
+  typedef int (*hip_set_device_fn)(int);
+  typedef int (*hip_set_device_flags_fn)(unsigned int);
+
+  hip_init_fn hipInit =
+      (hip_init_fn)dlsym(lib, "hipInit");
+  hip_get_device_count_fn hipGetDeviceCount =
+      (hip_get_device_count_fn)dlsym(lib, "hipGetDeviceCount");
+  hip_set_device_fn hipSetDevice =
+      (hip_set_device_fn)dlsym(lib, "hipSetDevice");
+  hip_set_device_flags_fn hipSetDeviceFlags =
+      (hip_set_device_flags_fn)dlsym(lib, "hipSetDeviceFlags");
+  if (!hipSetDeviceFlags) return;
+
+  if (hipInit) (void)hipInit(0);
+  int count = 1;
+  if (hipGetDeviceCount) {
+    if (hipGetDeviceCount(&count) != 0 || count < 1) count = 1;
+  }
+  for (int i = 0; i < count; ++i) {
+    if (hipSetDevice) (void)hipSetDevice(i);
+    (void)hipSetDeviceFlags(DYNINFER_HIP_DEVICE_SCHEDULE_BLOCKING_SYNC);
+  }
+}
+
+static iree_status_t cached_call_prepare(dyninfer_iree_session_t* session,
+                                         dyninfer_cached_call_t* cached,
+                                         const char* full_name) {
+  if (cached->ready && strcmp(cached->name, full_name) == 0) {
+    iree_runtime_call_reset(&cached->call);
+    return iree_ok_status();
+  }
+  if (cached->ready) {
+    iree_runtime_call_deinitialize(&cached->call);
+    cached->ready = false;
+    cached->name[0] = '\0';
+  }
+  IREE_RETURN_IF_ERROR(iree_runtime_call_initialize_by_name(
+      session->session, iree_make_cstring_view(full_name), &cached->call));
+  snprintf(cached->name, sizeof(cached->name), "%s", full_name);
+  cached->ready = true;
+  return iree_ok_status();
+}
+
+static void cached_call_release(dyninfer_cached_call_t* cached) {
+  if (!cached || !cached->ready) return;
+  iree_runtime_call_deinitialize(&cached->call);
+  cached->ready = false;
+  cached->name[0] = '\0';
 }
 
 const char* dyninfer_iree_last_error(void) { return g_last_error; }
@@ -190,6 +285,8 @@ static int session_create_common(const char* device_uri, const char* vmfb_path,
       &instance_options, iree_allocator_system(), &s->instance);
 
   if (iree_status_is_ok(status)) {
+    // Sleep on GPU completion instead of busy-waiting a host core.
+    configure_hip_blocking_sync(driver_or_uri);
     // Full HAL URIs (contain "://") select a specific device; bare driver
     // names fall back to the driver's default device.
     if (strstr(driver_or_uri, "://") != NULL) {
@@ -342,44 +439,52 @@ static iree_status_t copy_f32_view_to_host(iree_runtime_session_t* session,
   return iree_ok_status();
 }
 
-static iree_status_t invoke_named(dyninfer_iree_session_t* wrapper,
-                                  const char* full_name,
-                                  iree_hal_buffer_view_t** inputs,
-                                  iree_host_size_t input_count,
-                                  float** out_logits, size_t* out_count) {
-  iree_runtime_session_t* session = wrapper->session;
-  iree_runtime_call_t call;
-  IREE_RETURN_IF_ERROR(iree_runtime_call_initialize_by_name(
-      session, iree_make_cstring_view(full_name), &call));
+static iree_status_t invoke_with_cached_call(
+    dyninfer_iree_session_t* wrapper, dyninfer_cached_call_t* cached,
+    const char* full_name, iree_hal_buffer_view_t** inputs,
+    iree_host_size_t input_count, float** out_logits, size_t* out_count) {
+  IREE_RETURN_IF_ERROR(cached_call_prepare(wrapper, cached, full_name));
+  iree_runtime_call_t* call = &cached->call;
 
   iree_status_t status = iree_ok_status();
   for (iree_host_size_t i = 0; i < input_count; ++i) {
     if (!iree_status_is_ok(status)) break;
-    status = iree_runtime_call_inputs_push_back_buffer_view(&call, inputs[i]);
+    status = iree_runtime_call_inputs_push_back_buffer_view(call, inputs[i]);
   }
   if (iree_status_is_ok(status)) {
-    status = iree_runtime_call_invoke(&call, /*flags=*/0);
+    status = iree_runtime_call_invoke(call, /*flags=*/0);
   }
 
   iree_hal_buffer_view_t* ret = NULL;
   if (iree_status_is_ok(status)) {
-    status = iree_runtime_call_outputs_pop_front_buffer_view(&call, &ret);
+    status = iree_runtime_call_outputs_pop_front_buffer_view(call, &ret);
   }
   if (iree_status_is_ok(status)) {
-    status = copy_f32_view_to_host(session, ret, &wrapper->logits_host,
+    status = copy_f32_view_to_host(wrapper->session, ret, &wrapper->logits_host,
                                    &wrapper->logits_capacity, out_logits,
                                    out_count);
   }
   iree_hal_buffer_view_release(ret);
-  iree_runtime_call_deinitialize(&call);
+  // Drop retained input refs so the next prepare/reset starts clean.
+  iree_runtime_call_reset(call);
   return status;
 }
 
 void dyninfer_iree_session_destroy(dyninfer_iree_session_t* session) {
   if (!session) return;
+  cached_call_release(&session->call_add);
+  cached_call_release(&session->call_prefill);
+  cached_call_release(&session->call_decode);
+  cached_call_release(&session->call_paged_prefill);
+  cached_call_release(&session->call_paged_decode);
   iree_hal_buffer_view_release(session->decode_token);
   iree_hal_buffer_view_release(session->decode_pos);
   iree_hal_buffer_view_release(session->decode_bias);
+  iree_hal_buffer_view_release(session->prefill_tokens);
+  iree_hal_buffer_view_release(session->prefill_last);
+  iree_hal_buffer_view_release(session->paged_tokens);
+  iree_hal_buffer_view_release(session->paged_last);
+  iree_hal_buffer_view_release(session->paged_start_pos);
   for (size_t i = 0; i < session->kv_page_count; ++i) {
     iree_hal_buffer_view_release(session->kv_pages[i]);
   }
@@ -410,44 +515,11 @@ int dyninfer_iree_session_invoke_add(dyninfer_iree_session_t* session,
   }
   iree_hal_buffer_view_t* inputs[2] = {va, vb};
   if (iree_status_is_ok(status)) {
-    status = invoke_named(session, "module.add", inputs, 2, out_logits,
-                          out_count);
+    status = invoke_with_cached_call(session, &session->call_add, "module.add",
+                                     inputs, 2, out_logits, out_count);
   }
   iree_hal_buffer_view_release(va);
   iree_hal_buffer_view_release(vb);
-  if (!iree_status_is_ok(status)) {
-    set_error_status(status);
-    return 1;
-  }
-  return 0;
-}
-
-int dyninfer_iree_session_invoke_prefill(dyninfer_iree_session_t* session,
-                                         const int64_t* tokens,
-                                         size_t token_count, int64_t last,
-                                         float** out_logits, size_t* out_count) {
-  *out_logits = NULL;
-  *out_count = 0;
-  if (!session || !tokens || token_count == 0) {
-    set_error_msg("prefill requires session + non-empty tokens");
-    return 1;
-  }
-  iree_hal_dim_t tokens_shape[1] = {(iree_hal_dim_t)token_count};
-  iree_hal_buffer_view_t* v_tokens = NULL;
-  iree_hal_buffer_view_t* v_last = NULL;
-  iree_status_t status = allocate_i64_tensor(
-      session->session, 1, tokens_shape, tokens, token_count, &v_tokens);
-  if (iree_status_is_ok(status)) {
-    // 0-d tensor<i64>
-    status = allocate_i64_tensor(session->session, 0, NULL, &last, 1, &v_last);
-  }
-  iree_hal_buffer_view_t* inputs[2] = {v_tokens, v_last};
-  if (iree_status_is_ok(status)) {
-    status = invoke_named(session, "module.prefill", inputs, 2, out_logits,
-                          out_count);
-  }
-  iree_hal_buffer_view_release(v_tokens);
-  iree_hal_buffer_view_release(v_last);
   if (!iree_status_is_ok(status)) {
     set_error_status(status);
     return 1;
@@ -465,6 +537,60 @@ static iree_status_t ensure_i64_scalar_view(iree_runtime_session_t* session,
       iree_runtime_session_device(session), &value,
       iree_hal_buffer_view_buffer(*slot), 0, sizeof(value),
       IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT, iree_infinite_timeout());
+}
+
+static iree_status_t ensure_i64_vector_view(iree_runtime_session_t* session,
+                                            iree_hal_buffer_view_t** slot,
+                                            size_t* slot_len,
+                                            const int64_t* data,
+                                            size_t count) {
+  if (*slot == NULL || *slot_len != count) {
+    iree_hal_buffer_view_release(*slot);
+    *slot = NULL;
+    *slot_len = 0;
+    iree_hal_dim_t shape[1] = {(iree_hal_dim_t)count};
+    iree_status_t status =
+        allocate_i64_tensor(session, 1, shape, data, count, slot);
+    if (iree_status_is_ok(status)) {
+      *slot_len = count;
+    }
+    return status;
+  }
+  return iree_hal_device_transfer_h2d(
+      iree_runtime_session_device(session), data,
+      iree_hal_buffer_view_buffer(*slot), 0, count * sizeof(int64_t),
+      IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT, iree_infinite_timeout());
+}
+
+int dyninfer_iree_session_invoke_prefill(dyninfer_iree_session_t* session,
+                                         const int64_t* tokens,
+                                         size_t token_count, int64_t last,
+                                         float** out_logits, size_t* out_count) {
+  *out_logits = NULL;
+  *out_count = 0;
+  if (!session || !tokens || token_count == 0) {
+    set_error_msg("prefill requires session + non-empty tokens");
+    return 1;
+  }
+  iree_status_t status = ensure_i64_vector_view(
+      session->session, &session->prefill_tokens, &session->prefill_tokens_len,
+      tokens, token_count);
+  if (iree_status_is_ok(status)) {
+    status = ensure_i64_scalar_view(session->session, &session->prefill_last,
+                                    last);
+  }
+  iree_hal_buffer_view_t* inputs[2] = {session->prefill_tokens,
+                                       session->prefill_last};
+  if (iree_status_is_ok(status)) {
+    status = invoke_with_cached_call(session, &session->call_prefill,
+                                     "module.prefill", inputs, 2, out_logits,
+                                     out_count);
+  }
+  if (!iree_status_is_ok(status)) {
+    set_error_status(status);
+    return 1;
+  }
+  return 0;
 }
 
 static iree_status_t ensure_f32_bias_view(iree_runtime_session_t* session,
@@ -513,8 +639,9 @@ int dyninfer_iree_session_invoke_decode(dyninfer_iree_session_t* session,
   iree_hal_buffer_view_t* inputs[3] = {session->decode_token, session->decode_pos,
                                        session->decode_bias};
   if (iree_status_is_ok(status)) {
-    status = invoke_named(session, "module.decode", inputs, 3, out_logits,
-                          out_count);
+    status = invoke_with_cached_call(session, &session->call_decode,
+                                     "module.decode", inputs, 3, out_logits,
+                                     out_count);
   }
   if (!iree_status_is_ok(status)) {
     set_error_status(status);
@@ -611,36 +738,36 @@ int dyninfer_iree_session_ensure_kv_pages(dyninfer_iree_session_t* session,
 }
 
 static iree_status_t invoke_paged_chunk_once(
-    dyninfer_iree_session_t* wrapper, const char* full_name,
-    iree_hal_buffer_view_t* v_tokens, iree_hal_buffer_view_t* v_last,
-    iree_hal_buffer_view_t* v_start, float** out_logits, size_t* out_count) {
-  iree_runtime_call_t call;
-  IREE_RETURN_IF_ERROR(iree_runtime_call_initialize_by_name(
-      wrapper->session, iree_make_cstring_view(full_name), &call));
+    dyninfer_iree_session_t* wrapper, dyninfer_cached_call_t* cached,
+    const char* full_name, iree_hal_buffer_view_t* v_tokens,
+    iree_hal_buffer_view_t* v_last, iree_hal_buffer_view_t* v_start,
+    float** out_logits, size_t* out_count) {
+  IREE_RETURN_IF_ERROR(cached_call_prepare(wrapper, cached, full_name));
+  iree_runtime_call_t* call = &cached->call;
 
   iree_status_t status = iree_ok_status();
   if (iree_status_is_ok(status)) {
-    status = iree_runtime_call_inputs_push_back_buffer_view(&call, v_tokens);
+    status = iree_runtime_call_inputs_push_back_buffer_view(call, v_tokens);
   }
   if (iree_status_is_ok(status)) {
-    status = iree_runtime_call_inputs_push_back_buffer_view(&call, v_last);
+    status = iree_runtime_call_inputs_push_back_buffer_view(call, v_last);
   }
   if (iree_status_is_ok(status)) {
-    status = iree_runtime_call_inputs_push_back_buffer_view(&call, v_start);
+    status = iree_runtime_call_inputs_push_back_buffer_view(call, v_start);
   }
   for (size_t i = 0; iree_status_is_ok(status) && i < wrapper->kv_page_count;
        ++i) {
     status = iree_runtime_call_inputs_push_back_buffer_view(
-        &call, wrapper->kv_pages[i]);
+        call, wrapper->kv_pages[i]);
   }
   if (iree_status_is_ok(status)) {
-    status = iree_runtime_call_invoke(&call, /*flags=*/0);
+    status = iree_runtime_call_invoke(call, /*flags=*/0);
   }
 
   iree_hal_buffer_view_t* logits_view = NULL;
   if (iree_status_is_ok(status)) {
     status =
-        iree_runtime_call_outputs_pop_front_buffer_view(&call, &logits_view);
+        iree_runtime_call_outputs_pop_front_buffer_view(call, &logits_view);
   }
   if (iree_status_is_ok(status)) {
     status = copy_f32_view_to_host(wrapper->session, logits_view,
@@ -653,13 +780,13 @@ static iree_status_t invoke_paged_chunk_once(
   for (size_t i = 0; iree_status_is_ok(status) && i < wrapper->kv_page_count;
        ++i) {
     iree_hal_buffer_view_t* updated = NULL;
-    status =
-        iree_runtime_call_outputs_pop_front_buffer_view(&call, &updated);
+    status = iree_runtime_call_outputs_pop_front_buffer_view(call, &updated);
     if (!iree_status_is_ok(status)) break;
     iree_hal_buffer_view_release(wrapper->kv_pages[i]);
     wrapper->kv_pages[i] = updated;
   }
-  iree_runtime_call_deinitialize(&call);
+  // Clear retained input refs (pages may change identity after this invoke).
+  iree_runtime_call_reset(call);
   return status;
 }
 
@@ -682,22 +809,25 @@ int dyninfer_iree_session_invoke_paged_chunk(
   char function_name[96];
   snprintf(function_name, sizeof(function_name), "%s.%s", module_name, entry);
 
-  iree_hal_dim_t token_shape[1] = {(iree_hal_dim_t)token_count};
-  iree_hal_buffer_view_t *v_tokens = NULL, *v_last = NULL, *v_start = NULL;
-  iree_status_t status = allocate_i64_tensor(session->session, 1, token_shape,
-                                              tokens, token_count, &v_tokens);
-  if (iree_status_is_ok(status))
-    status = allocate_i64_tensor(session->session, 0, NULL, &last, 1, &v_last);
-  if (iree_status_is_ok(status))
-    status =
-        allocate_i64_tensor(session->session, 0, NULL, &start_pos, 1, &v_start);
+  iree_status_t status = ensure_i64_vector_view(
+      session->session, &session->paged_tokens, &session->paged_tokens_len,
+      tokens, token_count);
   if (iree_status_is_ok(status)) {
-    status = invoke_paged_chunk_once(session, function_name, v_tokens, v_last,
-                                     v_start, out_logits, out_count);
+    status =
+        ensure_i64_scalar_view(session->session, &session->paged_last, last);
   }
-  iree_hal_buffer_view_release(v_tokens);
-  iree_hal_buffer_view_release(v_last);
-  iree_hal_buffer_view_release(v_start);
+  if (iree_status_is_ok(status)) {
+    status = ensure_i64_scalar_view(session->session, &session->paged_start_pos,
+                                    start_pos);
+  }
+  dyninfer_cached_call_t* cached =
+      is_decode ? &session->call_paged_decode : &session->call_paged_prefill;
+  if (iree_status_is_ok(status)) {
+    status = invoke_paged_chunk_once(session, cached, function_name,
+                                     session->paged_tokens, session->paged_last,
+                                     session->paged_start_pos, out_logits,
+                                     out_count);
+  }
   if (!iree_status_is_ok(status)) {
     set_error_status(status);
     return 1;
