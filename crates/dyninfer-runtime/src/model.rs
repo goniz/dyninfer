@@ -142,6 +142,7 @@ impl CausalLanguageModel for LoadedModel {
                 self.manifest.kv_cache.kv_head_count as usize,
                 self.manifest.kv_cache.head_dimension as usize,
                 chunk_size as usize,
+                self.metadata.vocabulary_size as usize,
             )?;
         }
         Ok(Box::new(IreeSession::new(
@@ -368,16 +369,9 @@ impl ModelLoader {
         let manifest: ExecutableManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
         let decode_vmfb_path =
             (manifest.version == 6).then(|| bundle.join("executables").join("decode.vmfb"));
-        if decode_vmfb_path
-            .as_ref()
-            .is_some_and(|path| !path.is_file())
-        {
-            return Err(DynInferError::Cache(CacheError {
-                message: "paged ABI v6 bundle is missing decode.vmfb".into(),
-                digest: None,
-                path: Some(bundle.display().to_string()),
-            }));
-        }
+        let decode_vmfb_path = decode_vmfb_path.filter(|path| path.is_file());
+        // Hybrid paged (short-conv) ships a single combined VMFB; attention-only
+        // paged keeps the split prefill/decode pair.
         validate_executable_abi(&manifest, bundle)?;
         let binding: BindingPlan = serde_json::from_slice(&fs::read(&bindings_path)?)?;
         let checkpoint = checkpoint.as_ref();
@@ -591,13 +585,7 @@ impl ModelLoader {
         } else {
             None
         };
-        if manifest.version == 6 && decode_vmfb_path.is_none() {
-            return Err(DynInferError::Cache(CacheError {
-                message: "paged ABI v6 cache entry is missing decode.vmfb".into(),
-                digest: None,
-                path: Some(root.display().to_string()),
-            }));
-        }
+        // Hybrid combined paged modules omit decode.vmfb intentionally.
         let manifest_path = root.join("manifest.json");
         fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
         let bindings_path = root.join("bindings.json");

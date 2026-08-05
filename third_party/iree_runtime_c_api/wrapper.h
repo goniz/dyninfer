@@ -29,8 +29,10 @@ typedef struct dyninfer_iree_file_param_t {
 } dyninfer_iree_file_param_t;
 
 // Create a persistent session without external parameters (smoke modules).
-// |device_uri| is an IREE driver name: "hip", "local-task", "vulkan", …
+// |device_uri| is an IREE driver name: "hip", "local-task", …
 // Pass NULL / "" for local-task.
+// For HIP/ROCm, sets hipDeviceScheduleBlockingSync (unless
+// DYNINFER_HIP_ALLOW_BUSY_WAIT=1) so host waits sleep instead of spinning.
 // Returns 0 on success; non-zero on failure (see dyninfer_iree_last_error).
 int dyninfer_iree_session_create(const char* device_uri, const char* vmfb_path,
                                  dyninfer_iree_session_t** out_session);
@@ -79,16 +81,18 @@ int dyninfer_iree_session_invoke_decode(dyninfer_iree_session_t* session,
                                         float** out_logits, size_t* out_count);
 
 // Paged KV. Pages are independent device-local tensors with shape
-// [layers, 2, page_size, kv_heads, head_dim].
+// [layers, 2, page_size, kv_heads, head_dim]. Prefill/decode chunk entrypoints
+// take caller-owned logits + page buffers via iree.abi.output (in-place write).
 int dyninfer_iree_session_configure_paged_kv(
     dyninfer_iree_session_t* session, size_t layer_count, size_t page_size,
-    size_t kv_head_count, size_t head_dim, size_t chunk_size);
+    size_t kv_head_count, size_t head_dim, size_t chunk_size,
+    size_t vocab_size);
 int dyninfer_iree_session_ensure_kv_pages(dyninfer_iree_session_t* session,
                                           size_t page_count);
 int dyninfer_iree_session_invoke_paged_chunk(
     dyninfer_iree_session_t* session, const int64_t* tokens,
     size_t token_count, int64_t last, int64_t start_pos, float** out_logits,
-    size_t* out_count);
+    size_t* out_count, int64_t* out_token, int want_logits);
 int dyninfer_iree_session_reset_paged_kv(dyninfer_iree_session_t* session);
 size_t dyninfer_iree_session_kv_page_count(
     const dyninfer_iree_session_t* session);

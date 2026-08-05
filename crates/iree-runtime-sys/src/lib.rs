@@ -98,6 +98,7 @@ pub mod bindings {
             kv_head_count: usize,
             head_dim: usize,
             chunk_size: usize,
+            vocab_size: usize,
         ) -> c_int;
         pub fn dyninfer_iree_session_ensure_kv_pages(
             session: *mut dyninfer_iree_session_t,
@@ -111,6 +112,8 @@ pub mod bindings {
             start_pos: i64,
             out_logits: *mut *mut f32,
             out_count: *mut usize,
+            out_token: *mut i64,
+            want_logits: c_int,
         ) -> c_int;
         pub fn dyninfer_iree_session_reset_paged_kv(session: *mut dyninfer_iree_session_t)
         -> c_int;

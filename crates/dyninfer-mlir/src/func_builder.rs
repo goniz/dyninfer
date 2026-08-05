@@ -36,8 +36,24 @@ impl FuncBuilder {
     }
 
     pub fn arg(&mut self, name: impl Into<String>, ty: impl Into<String>) -> Value {
+        self.arg_attrs(name, ty, "")
+    }
+
+    /// Like [`Self::arg`], with optional MLIR attribute dict (e.g. `{iree.abi.output = 1 : index}`).
+    pub fn arg_attrs(
+        &mut self,
+        name: impl Into<String>,
+        ty: impl Into<String>,
+        attrs: impl AsRef<str>,
+    ) -> Value {
         let name = name.into();
-        self.args.push((name.clone(), ty.into()));
+        let attrs = attrs.as_ref().trim();
+        let ty = if attrs.is_empty() {
+            ty.into()
+        } else {
+            format!("{} {attrs}", ty.into())
+        };
+        self.args.push((name.clone(), ty));
         Value::new(name)
     }
 

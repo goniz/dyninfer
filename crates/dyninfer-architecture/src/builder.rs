@@ -50,6 +50,28 @@ pub struct DecoderBlockSpec {
     pub rope_theta: Option<f64>,
 }
 
+/// Attributes of an LFM2-style gated short-convolution operator sublayer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShortConvBlockSpec {
+    pub hidden_size: u32,
+    /// Convolution channel width (`conv_dim`, normally equal to `hidden_size`).
+    pub channels: u32,
+    /// Causal window (`conv_L_cache`).
+    pub kernel_size: u32,
+    pub rms_norm_epsilon: f64,
+}
+
+impl ShortConvBlockSpec {
+    fn validate(&self) -> Result<()> {
+        if self.hidden_size == 0 || self.channels == 0 || self.kernel_size == 0 {
+            return Err(DynInferError::internal(
+                "short-conv dimensions and kernel size must be non-zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl DecoderBlockSpec {
     fn validate(&self) -> Result<()> {
         if self.hidden_size == 0
@@ -425,8 +447,48 @@ impl ModelBuilder {
         Ok(output)
     }
 
+    fn short_conv(
+        &mut self,
+        operation_id: &str,
+        input: Value,
+        weight: &str,
+        layer: u32,
+        channels: u32,
+        kernel_size: u32,
+    ) -> Result<Value> {
+        // Depthwise conv weights arrive as `[channels, 1, kernel_size]`.
+        let slot = self.push_slot(
+            weight,
+            ParameterRole::Other("shortconv.conv".into()),
+            /*rank=*/ 3,
+        )?;
+        self.unary(
+            operation_id,
+            OperationKind::ShortConv {
+                layer,
+                channels,
+                kernel_size,
+            },
+            input,
+            SemanticTensorType::activations(channels),
+            vec![slot],
+        )
+    }
+
     /// Expand a causal decoder layer into its typed semantic operations.
     pub fn decoder_block(
+        &mut self,
+        input: Value,
+        layer: u32,
+        has_qk_norm: bool,
+        spec: &DecoderBlockSpec,
+    ) -> Result<Value> {
+        let after_attention = self.attention_sublayer(input, layer, has_qk_norm, spec)?;
+        self.feed_forward_sublayer(after_attention, layer, spec)
+    }
+
+    /// Pre-norm self-attention sublayer including its residual add.
+    pub fn attention_sublayer(
         &mut self,
         input: Value,
         layer: u32,
@@ -541,17 +603,75 @@ impl ModelBuilder {
             spec.hidden_size,
             ParameterRole::AttentionO,
         )?;
-        let after_attention = self.binary(
+        self.binary(
             &format!("{prefix}.attn_residual"),
             OperationKind::Residual,
             residual,
             projected,
-        )?;
+        )
+    }
 
-        let ffn_residual = after_attention.clone();
+    /// Pre-norm gated short-convolution operator sublayer including its
+    /// residual add. This is the non-attention half of an LFM2 layer schedule.
+    pub fn short_conv_sublayer(
+        &mut self,
+        input: Value,
+        layer: u32,
+        spec: &ShortConvBlockSpec,
+    ) -> Result<Value> {
+        spec.validate()?;
+        let prefix = format!("blk.{layer}");
+        let residual = input.clone();
+        let normalized = self.rms_norm(
+            &format!("{prefix}.attn_norm"),
+            input,
+            &format!("{prefix}.attn_norm.weight"),
+            spec.rms_norm_epsilon,
+        )?;
+        // `in_proj` emits the concatenated `[B, C, x]` gates consumed by the
+        // fused convolution.
+        let gates = self.linear(
+            &format!("{prefix}.shortconv_in"),
+            normalized,
+            &format!("{prefix}.shortconv.in_proj.weight"),
+            3 * spec.channels,
+            ParameterRole::Other("shortconv.in".into()),
+        )?;
+        let mixed = self.short_conv(
+            &format!("{prefix}.shortconv"),
+            gates,
+            &format!("{prefix}.shortconv.conv.weight"),
+            layer,
+            spec.channels,
+            spec.kernel_size,
+        )?;
+        let projected = self.linear(
+            &format!("{prefix}.shortconv_out"),
+            mixed,
+            &format!("{prefix}.shortconv.out_proj.weight"),
+            spec.hidden_size,
+            ParameterRole::Other("shortconv.out".into()),
+        )?;
+        self.binary(
+            &format!("{prefix}.shortconv_residual"),
+            OperationKind::Residual,
+            residual,
+            projected,
+        )
+    }
+
+    /// Pre-norm SwiGLU feed-forward sublayer including its residual add.
+    pub fn feed_forward_sublayer(
+        &mut self,
+        input: Value,
+        layer: u32,
+        spec: &DecoderBlockSpec,
+    ) -> Result<Value> {
+        let prefix = format!("blk.{layer}");
+        let ffn_residual = input.clone();
         let ffn_input = self.rms_norm(
             &format!("{prefix}.ffn_norm"),
-            after_attention,
+            input,
             &format!("{prefix}.ffn_norm.weight"),
             spec.rms_norm_epsilon,
         )?;

@@ -157,28 +157,46 @@ pub fn generate_greedy(
     }
 
     let mut session = model.create_session(session_cfg)?;
+    let skip_logits_d2h = (config.repetition_penalty - 1.0).abs() < f32::EPSILON;
     let t0 = Instant::now();
-    let mut logits: Logits = session.prefill(&ids)?;
-    let prefill_secs = t0.elapsed().as_secs_f64();
     let mut generated = Vec::new();
-
-    let t1 = Instant::now();
-    for _ in 0..config.max_new_tokens {
-        apply_repetition_penalty(
-            &mut logits.values,
-            &seen,
-            config.repetition_penalty,
-        );
-        let next = argmax(&logits.values);
-        if stop.contains(&next) {
-            break;
+    let prefill_secs;
+    let decode_secs;
+    if skip_logits_d2h {
+        let mut next = session.prefill_argmax(&ids)?;
+        prefill_secs = t0.elapsed().as_secs_f64();
+        let t1 = Instant::now();
+        for _ in 0..config.max_new_tokens {
+            if stop.contains(&next) {
+                break;
+            }
+            generated.push(next);
+            ids.push(next);
+            *seen.entry(next).or_insert(0) += 1;
+            next = session.decode_argmax(next)?;
         }
-        generated.push(next);
-        ids.push(next);
-        *seen.entry(next).or_insert(0) += 1;
-        logits = session.decode(next)?;
+        decode_secs = t1.elapsed().as_secs_f64();
+    } else {
+        let mut logits: Logits = session.prefill(&ids)?;
+        prefill_secs = t0.elapsed().as_secs_f64();
+        let t1 = Instant::now();
+        for _ in 0..config.max_new_tokens {
+            apply_repetition_penalty(
+                &mut logits.values,
+                &seen,
+                config.repetition_penalty,
+            );
+            let next = argmax(&logits.values);
+            if stop.contains(&next) {
+                break;
+            }
+            generated.push(next);
+            ids.push(next);
+            *seen.entry(next).or_insert(0) += 1;
+            logits = session.decode(next)?;
+        }
+        decode_secs = t1.elapsed().as_secs_f64();
     }
-    let decode_secs = t1.elapsed().as_secs_f64();
     let cache = session.kv_cache_metrics()?;
 
     // Decode only the assistant continuation so ChatML markup stays out of `text`.

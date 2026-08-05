@@ -693,3 +693,52 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod lfm2_chat_template_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn lfm2_dir() -> Option<PathBuf> {
+        crate::resolve_hf_snapshot("LiquidAI/LFM2.5-2.6B", Some("main")).ok()
+    }
+
+    #[test]
+    fn lfm2_chat_template_matches_transformers_shape() {
+        let Some(dir) = lfm2_dir() else {
+            eprintln!("skip: LFM2.5-2.6B not in HF cache");
+            return;
+        };
+        let tok = BpeTokenizer::from_file(&dir).expect("load tokenizer");
+        assert!(tok.has_chat_template());
+        let rendered = tok
+            .apply_chat_template("What is 2+2?", true)
+            .unwrap()
+            .expect("template should render");
+        eprintln!("rendered={rendered:?}");
+        let ids = tok.encode(&rendered, false).unwrap();
+        eprintln!("n_ids={} ids={ids:?}", ids.len());
+        // HF reference for this prompt: 17 tokens ending with <think>
+        assert!(
+            rendered.starts_with("<|startoftext|><|im_start|>user\n"),
+            "missing bos+user turn: {rendered:?}"
+        );
+        assert!(
+            rendered.ends_with("<|im_start|>assistant\n<think>"),
+            "missing assistant generation prompt: {rendered:?}"
+        );
+        assert_eq!(
+            rendered,
+            "<|startoftext|><|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>"
+        );
+        assert_eq!(ids.len(), 17, "token count mismatch vs transformers");
+        assert_eq!(
+            ids,
+            vec![
+                124894, 124899, 5922, 207, 2992, 355, 229, 26, 19, 26, 39, 124900, 207,
+                124899, 63514, 207, 124901,
+            ],
+            "token ids mismatch vs transformers"
+        );
+    }
+}

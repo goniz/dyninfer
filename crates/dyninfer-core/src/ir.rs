@@ -142,6 +142,19 @@ pub enum OperationKind {
         head_dim: u32,
         causal: bool,
     },
+    /// LFM2-style gated causal depthwise short convolution (`Lfm2ShortConv`).
+    ///
+    /// The single input is the `3 * channels`-wide projection `[B, C, x]`. The
+    /// operation computes `C * depthwise_conv1d(B * x)` over the causal window
+    /// `kernel_size`, so the gating multiplies and the channel-local recurrence
+    /// stay fused. `layer` addresses the per-layer convolution state that
+    /// carries the trailing `kernel_size` inputs across decode steps, the
+    /// same role [`KvCacheWrite`](Self::KvCacheWrite) plays for attention.
+    ShortConv {
+        layer: u32,
+        channels: u32,
+        kernel_size: u32,
+    },
     Elementwise {
         function: ElementwiseFunction,
     },

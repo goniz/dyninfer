@@ -15,12 +15,12 @@ mod remapping;
 mod slots;
 
 pub use builder::{
-    ArchitectureDefinition, DecoderBlockSpec, ModelBuilder, ModelModule, Value,
+    ArchitectureDefinition, DecoderBlockSpec, ModelBuilder, ModelModule, ShortConvBlockSpec, Value,
     verify_architecture_catalog_conformance, verify_architecture_conformance,
     verify_architecture_graph,
 };
 pub use config::{ConfigField, ConfigSchema, ResolvedModelConfig};
-pub use models::{LlamaArchitecture, Qwen3Architecture};
+pub use models::{Lfm2Architecture, LlamaArchitecture, Qwen3Architecture};
 pub use package::ArchitecturePackage;
 pub use registry::ArchitectureRegistry;
 pub use remapping::{MODEL_REMAPPING, remap_model_type};
@@ -32,6 +32,7 @@ use dyninfer_error::{ArchitectureMismatchError, DynInferError, Result};
 pub fn register_all(registry: &mut ArchitectureRegistry) {
     registry.register(LlamaArchitecture);
     registry.register(Qwen3Architecture);
+    registry.register(Lfm2Architecture);
 }
 
 /// Resolve architecture id from an optional CLI override and/or checkpoint metadata.
