@@ -129,7 +129,7 @@ enum Commands {
         #[arg(long)]
         prefill_window: Option<u32>,
         /// Session/model context limit. Defaults to prompt tokens + --max-new-tokens.
-        /// Values above 512 select paged KV ABI v6.
+        /// Values above 512 select paged KV ABI v7 (packed pool).
         #[arg(long)]
         max_kv: Option<u32>,
     },
@@ -631,21 +631,35 @@ fn main() -> anyhow::Result<()> {
                 Some(w) => (w, "--prefill-window"),
                 None => match prefill_from_set {
                     Some(w) => (w, "--set prefill_window"),
-                    None => (
-                        prefill_tokens.try_into().map_err(|_| {
-                            anyhow::anyhow!("--prefill {prefill_tokens} exceeds u32")
-                        })?,
-                        "--prefill",
-                    ),
+                    None => {
+                        // Paged path (max_kv > 512) compiles a 512-token chunk;
+                        // dense path needs a window that fits --prefill.
+                        if effective_max_kv > 512 {
+                            (512u32, "paged chunk default")
+                        } else {
+                            (
+                                prefill_tokens.try_into().map_err(|_| {
+                                    anyhow::anyhow!("--prefill {prefill_tokens} exceeds u32")
+                                })?,
+                                "--prefill",
+                            )
+                        }
+                    }
                 },
             };
-            if (effective_prefill_window as usize) < prefill_tokens {
+            if effective_max_kv <= 512 && (effective_prefill_window as usize) < prefill_tokens {
                 anyhow::bail!(
                     "prefill_window {effective_prefill_window} ({prefill_window_source}) cannot fit --prefill ({prefill_tokens})"
                 );
             }
             if prefill_window.is_none() && prefill_from_set.is_none() {
-                eprintln!("prefill_window={effective_prefill_window} (from --prefill)");
+                if effective_max_kv > 512 {
+                    eprintln!(
+                        "paged: prefill_chunk=512 max_kv={effective_max_kv} (page size scales with max_kv)"
+                    );
+                } else {
+                    eprintln!("prefill_window={effective_prefill_window} (from --prefill)");
+                }
             }
             overrides.insert(
                 "prefill_window".into(),

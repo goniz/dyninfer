@@ -54,6 +54,27 @@ pub const PAGED_KV_PAGE_SIZE: u32 = 256;
 /// short-prompt greedy decode on HIP (flash and portable); 512 stays correct
 /// and long prompts are covered by multiple chunks.
 pub const PAGED_PREFILL_CHUNK_SIZE: u32 = 512;
+/// Soft cap on ABI v6 page arity (one IREE arg + `abi.output` per page).
+/// Past this, HIP compile time explodes; a packed single-tensor pool (v7)
+/// hangs on HIP `hal.fence.await` even for tiny pools — keep per-page args
+/// and grow `page_size` instead.
+pub const PAGED_KV_MAX_PAGES: u32 = 32;
+
+/// Page length for a given `max_kv` so `ceil(max_kv / page) <= PAGED_KV_MAX_PAGES`.
+///
+/// Always a multiple of [`PAGED_KV_PAGE_SIZE`]. When larger than the prefill
+/// chunk, also a multiple of [`PAGED_PREFILL_CHUNK_SIZE`] so
+/// `page % chunk == 0` (runtime configure check).
+pub fn paged_kv_page_size_for(max_kv: u32) -> u32 {
+    let max_kv = max_kv.max(1);
+    let needed = max_kv.div_ceil(PAGED_KV_MAX_PAGES).max(PAGED_KV_PAGE_SIZE);
+    let page = needed.div_ceil(PAGED_KV_PAGE_SIZE) * PAGED_KV_PAGE_SIZE;
+    if page > PAGED_PREFILL_CHUNK_SIZE {
+        page.div_ceil(PAGED_PREFILL_CHUNK_SIZE) * PAGED_PREFILL_CHUNK_SIZE
+    } else {
+        page
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DenseDecoderConfig {
@@ -72,6 +93,9 @@ pub struct DenseDecoderConfig {
     pub seq: u32,
     /// Mutable KV capacity (`>= seq`); decode positions use `[0, max_kv)`.
     pub max_kv: u32,
+    /// Tokens per KV page (ABI v6). Scaled with `max_kv` via
+    /// [`paged_kv_page_size_for`] so page arity stays ≤ [`PAGED_KV_MAX_PAGES`].
+    pub page_size: u32,
     /// Runtime-owned paged KV shared by split prefill/decode modules (ABI v6).
     pub paged_kv: bool,
     /// HIP uses IREE's fused online-attention op with WMMA flash configs;
@@ -234,6 +258,11 @@ impl DenseDecoderConfig {
             num_layers,
             seq,
             max_kv: max_kv.max(seq),
+            page_size: if paged_kv {
+                paged_kv_page_size_for(max_kv.max(seq))
+            } else {
+                PAGED_KV_PAGE_SIZE
+            },
             paged_kv,
             // IREE online attention (`iree_linalg_ext.online_attention`) is
             // emitted only for HIP: the flash configs hardcode
@@ -493,7 +522,7 @@ fn emit_paged_fused_chunk(
         c.seq,
         c.vocab,
         c.num_layers,
-        PAGED_KV_PAGE_SIZE,
+        c.page_size,
         c.num_kv_heads,
         c.gqa_group(),
         c.head_dim,
@@ -854,7 +883,7 @@ fn emit_paged_layer_page(
         c.gqa_group(),
         c.head_dim,
         c.num_layers,
-        PAGED_KV_PAGE_SIZE,
+        c.page_size,
     );
     let qg_ty = format!("tensor<{nkv}x{g}x{s}x{d}xf32>");
     let kv3_ty = format!("tensor<{s}x{nkv}x{d}xf32>");
@@ -1931,7 +1960,7 @@ fn emit_helpers(
                     module,
                     "online_attention_page",
                     s,
-                    PAGED_KV_PAGE_SIZE,
+                    c.page_size,
                     nkv,
                     g,
                     d,
@@ -1941,7 +1970,7 @@ fn emit_helpers(
                     module,
                     "online_attention_page",
                     s,
-                    PAGED_KV_PAGE_SIZE,
+                    c.page_size,
                     nkv,
                     g,
                     d,
@@ -1951,7 +1980,7 @@ fn emit_helpers(
                 module,
                 "paged_causal_mask",
                 s,
-                PAGED_KV_PAGE_SIZE,
+                c.page_size,
                 nkv,
                 g,
             )?;
@@ -2022,7 +2051,7 @@ fn emit_paged_decode_helpers(module: &mut ModuleBuilder, c: &DenseDecoderConfig)
             module,
             "online_attention_page_tok",
             s,
-            PAGED_KV_PAGE_SIZE,
+            c.page_size,
             nkv,
             g,
             d,
@@ -2032,7 +2061,7 @@ fn emit_paged_decode_helpers(module: &mut ModuleBuilder, c: &DenseDecoderConfig)
             module,
             "online_attention_page_tok",
             s,
-            PAGED_KV_PAGE_SIZE,
+            c.page_size,
             nkv,
             g,
             d,
@@ -2042,7 +2071,7 @@ fn emit_paged_decode_helpers(module: &mut ModuleBuilder, c: &DenseDecoderConfig)
         module,
         "paged_causal_mask_tok",
         s,
-        PAGED_KV_PAGE_SIZE,
+        c.page_size,
         nkv,
         g,
     )?;
@@ -2566,7 +2595,7 @@ fn emit_prefill(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()
         f.arg("start_pos", "tensor<i64>");
         f.op_asm(format!(
             "  %pages = util.global.load @kv_pages : !util.list<tensor<{}x2x{}x{}x{}xf32>>\n",
-            c.num_layers, PAGED_KV_PAGE_SIZE, c.num_kv_heads, c.head_dim
+            c.num_layers, c.page_size, c.num_kv_heads, c.head_dim
         ));
     }
     f.result_ty(format!("tensor<{v}xf32>"));
@@ -2818,7 +2847,7 @@ fn emit_prefill(module: &mut ModuleBuilder, c: &DenseDecoderConfig) -> Result<()
                     let kv3_ty = format!("tensor<{s}x{nkv}x{d}xf32>");
                     let list_ty = format!(
                         "!util.list<tensor<{}x2x{}x{}x{}xf32>>",
-                        c.num_layers, PAGED_KV_PAGE_SIZE, nkv, d
+                        c.num_layers, c.page_size, nkv, d
                     );
                     let norm_args = if c.has_qk_norm {
                         format!(", %{p}_qnw, %{p}_knw")
@@ -3373,6 +3402,8 @@ mod tests {
             num_layers: 28,
             seq: LARGE_PREFILL_WINDOW,
             max_kv: LARGE_MAX_KV,
+
+            page_size: PAGED_KV_PAGE_SIZE,
             paged_kv: false,
             iree_flash_attention: false,
             rms_norm_eps: 1e-6,
@@ -3407,6 +3438,8 @@ mod tests {
             num_layers: 1,
             seq: TINY_PREFILL_WINDOW,
             max_kv: TINY_MAX_KV,
+
+            page_size: PAGED_KV_PAGE_SIZE,
             paged_kv: false,
             iree_flash_attention: false,
             rms_norm_eps: 1e-5,
@@ -3423,6 +3456,7 @@ mod tests {
         assert!(c.is_synthetic_fixture());
         c.paged_kv = true;
         c.max_kv = 1024;
+        c.page_size = paged_kv_page_size_for(1024);
         let mlir = emit_dense_decoder_cfg("test.paged", &c).expect("paged MLIR verifies");
         assert!(mlir.contains("@prefill_chunk"));
         assert!(mlir.contains("@decode_chunk"));
@@ -3486,6 +3520,8 @@ mod tests {
             num_layers: 1,
             seq: TINY_PREFILL_WINDOW,
             max_kv: TINY_MAX_KV,
+
+            page_size: PAGED_KV_PAGE_SIZE,
             paged_kv: false,
             iree_flash_attention: false,
             rms_norm_eps: 1e-5,
@@ -3539,6 +3575,8 @@ mod tests {
             num_layers: 1,
             seq: 4,
             max_kv: 8,
+
+            page_size: PAGED_KV_PAGE_SIZE,
             paged_kv: false,
             iree_flash_attention: false,
             rms_norm_eps: 1e-5,
@@ -3593,6 +3631,8 @@ mod tests {
             num_layers: 2,
             seq: TINY_PREFILL_WINDOW,
             max_kv: TINY_MAX_KV,
+
+            page_size: PAGED_KV_PAGE_SIZE,
             paged_kv: false,
             iree_flash_attention: false,
             rms_norm_eps: 1e-5,
@@ -3643,6 +3683,8 @@ mod tests {
             num_layers: 2,
             seq: TINY_PREFILL_WINDOW,
             max_kv: 1024,
+
+            page_size: PAGED_KV_PAGE_SIZE,
             paged_kv: true,
             iree_flash_attention: false,
             rms_norm_eps: 1e-5,
@@ -3681,7 +3723,22 @@ mod tests {
         // Dense hybrid still works after the paged wiring.
         c.paged_kv = false;
         c.max_kv = TINY_MAX_KV;
+        c.page_size = PAGED_KV_PAGE_SIZE;
         assert!(c.supports_dense_emit());
         emit_dense_decoder_cfg("test.lfm2.dense", &c).expect("dense hybrid still emits");
+    }
+
+    #[test]
+    fn page_size_scales_to_cap_arity() {
+        assert_eq!(paged_kv_page_size_for(1024), PAGED_KV_PAGE_SIZE);
+        assert_eq!(paged_kv_page_size_for(8192), PAGED_KV_PAGE_SIZE);
+        let p32k = paged_kv_page_size_for(33_024);
+        assert!(p32k >= PAGED_PREFILL_CHUNK_SIZE);
+        assert_eq!(p32k % PAGED_PREFILL_CHUNK_SIZE, 0);
+        let pages = 33_024u32.div_ceil(p32k);
+        assert!(
+            pages <= PAGED_KV_MAX_PAGES,
+            "33k context should stay within {PAGED_KV_MAX_PAGES} pages, got {pages} (page={p32k})"
+        );
     }
 }

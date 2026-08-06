@@ -72,6 +72,7 @@ pub struct LoweringOutput {
     pub decode_mlir_text: Option<String>,
     pub prefill_window: u32,
     pub max_kv: u32,
+    pub page_size: u32,
     pub paged_kv: bool,
     pub num_layers: u32,
 }
@@ -244,6 +245,7 @@ pub fn lower_bound_model(bound: &BoundModel) -> Result<LoweringOutput> {
         decode_mlir_text,
         prefill_window: config.seq,
         max_kv: config.max_kv,
+        page_size: config.page_size,
         paged_kv: config.paged_kv,
         num_layers: config.num_layers,
     })
@@ -444,6 +446,7 @@ impl ModelCompiler for LocalCompiler {
                 decode_mlir_text: None,
                 prefill_window: 4,
                 max_kv: 4,
+                page_size: lowering::PAGED_KV_PAGE_SIZE,
                 paged_kv: false,
                 num_layers: 0,
             }
@@ -578,7 +581,7 @@ impl ModelCompiler for LocalCompiler {
                 alignment: 64,
                 storage: if paged_kv {
                     KvCacheStorage::Paged {
-                        page_size: lowering::PAGED_KV_PAGE_SIZE,
+                        page_size: lowering.page_size,
                         chunk_size: lowering::PAGED_PREFILL_CHUNK_SIZE,
                     }
                 } else {
