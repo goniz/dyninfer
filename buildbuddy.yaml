@@ -1,0 +1,10 @@
+actions:
+  - name: Build and test
+    container_image: ubuntu-24.04
+    triggers:
+      pull_request:
+        branches:
+          - "*"
+    steps:
+      - run: bazel build //...
+      - run: bazel test //...
