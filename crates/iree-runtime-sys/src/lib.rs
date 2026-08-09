@@ -42,11 +42,13 @@ pub mod bindings {
     unsafe extern "C" {
         pub fn dyninfer_iree_session_create(
             device_uri: *const c_char,
+            rocm_root: *const c_char,
             vmfb_path: *const c_char,
             out_session: *mut *mut dyninfer_iree_session_t,
         ) -> c_int;
         pub fn dyninfer_iree_session_create_with_file_params(
             device_uri: *const c_char,
+            rocm_root: *const c_char,
             vmfb_path: *const c_char,
             files: *const dyninfer_iree_parameter_file_t,
             file_count: usize,
@@ -56,6 +58,7 @@ pub mod bindings {
         ) -> c_int;
         pub fn dyninfer_iree_session_create_modules_with_file_params(
             device_uri: *const c_char,
+            rocm_root: *const c_char,
             prefill_vmfb_path: *const c_char,
             decode_vmfb_path: *const c_char,
             files: *const dyninfer_iree_parameter_file_t,

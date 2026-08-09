@@ -45,3 +45,12 @@ IREE 3.11.0 targets Bazel 7; dyninfer uses Bazel 9.1.1. Required flags
 `//bazel/iree:iree-compile` / `libIREECompiler` remain for compile; invoke path
 uses `//third_party/iree_runtime_c_api` → `//bazel/iree:runtime_cc` (in-process).
 `iree-run-module` is still used for `--dump_devices` discovery.
+
+## ROCm SDK
+
+The HIP userspace is the Bazel-pinned TheRock 7.14 `gfx1151` distribution in
+[`//bazel/therock`](../therock/README.md), not a system `/opt/rocm` install.
+`dyninfer-rocm` locates it in runfiles. The compiler uses its device bitcode and
+`ld.lld`; CLI subprocesses receive its `PATH`/`LD_LIBRARY_PATH`; and the native
+runtime loads its `libamdhip64.so` by absolute path before IREE creates a HIP
+device.

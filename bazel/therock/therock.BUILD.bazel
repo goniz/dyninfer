@@ -1,0 +1,28 @@
+package(default_visibility = ["//visibility:public"])
+
+# Keep the complete distribution together: HIP loads sibling libraries and
+# gfx-specific .kpack bundles dynamically at runtime.
+filegroup(
+    name = "sdk",
+    srcs = glob(
+        ["**"],
+        exclude = [
+            "BUILD",
+            "BUILD.bazel",
+        ],
+    ),
+)
+
+# Smaller runfiles surface used by dyninfer. The full SDK remains available as
+# :sdk for future native build rules without staging headers/docs into every
+# Rust binary's runfiles tree.
+filegroup(
+    name = "runtime",
+    srcs = glob([
+        ".kpack/**",
+        "bin/**",
+        "lib/**",
+        "lib64/**",
+        "share/therock/therock_manifest.json",
+    ]),
+)

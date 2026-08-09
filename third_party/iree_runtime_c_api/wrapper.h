@@ -31,25 +31,28 @@ typedef struct dyninfer_iree_file_param_t {
 // Create a persistent session without external parameters (smoke modules).
 // |device_uri| is an IREE driver name: "hip", "local-task", …
 // Pass NULL / "" for local-task.
+// |rocm_root| is the extracted TheRock SDK root and is required for HIP; it is
+// ignored by non-HIP drivers.
 // For HIP/ROCm, sets hipDeviceScheduleBlockingSync (unless
 // DYNINFER_HIP_ALLOW_BUSY_WAIT=1) so host waits sleep instead of spinning.
 // Returns 0 on success; non-zero on failure (see dyninfer_iree_last_error).
-int dyninfer_iree_session_create(const char* device_uri, const char* vmfb_path,
+int dyninfer_iree_session_create(const char* device_uri, const char* rocm_root,
+                                 const char* vmfb_path,
                                  dyninfer_iree_session_t** out_session);
 
 // Creates a session with an explicit descriptor index over original checkpoint
 // files. Each file is opened once; entries may reference different files and
 // arbitrary container-independent byte ranges under scope "weights".
 int dyninfer_iree_session_create_with_file_params(
-    const char* device_uri, const char* vmfb_path,
+    const char* device_uri, const char* rocm_root, const char* vmfb_path,
     const dyninfer_iree_parameter_file_t* files, size_t file_count,
     const dyninfer_iree_file_param_t* params, size_t param_count,
     dyninfer_iree_session_t** out_session);
 
-// ABI v6: appends independently compiled prefill and decode modules to one
+// ABI v7: appends independently compiled prefill and decode modules to one
 // session so both share the same device and runtime-owned KV pages.
 int dyninfer_iree_session_create_modules_with_file_params(
-    const char* device_uri, const char* prefill_vmfb_path,
+    const char* device_uri, const char* rocm_root, const char* prefill_vmfb_path,
     const char* decode_vmfb_path, const dyninfer_iree_parameter_file_t* files,
     size_t file_count, const dyninfer_iree_file_param_t* params,
     size_t param_count, dyninfer_iree_session_t** out_session);

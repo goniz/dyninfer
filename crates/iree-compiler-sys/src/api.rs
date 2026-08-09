@@ -124,11 +124,22 @@ pub fn flags_for_target(driver: &str, gpu_arch: Option<&str>) -> Result<Vec<Stri
                 format!("--iree-cuda-target={arch}"),
             ])
         }
-        "local" | "local-task" | "local-sync" => Ok(vec![
-            "--iree-hal-target-device=local".into(),
-            "--iree-hal-local-target-device-backends=llvm-cpu".into(),
-            "--iree-llvmcpu-target-cpu=host".into(),
-        ]),
+        "local" | "local-task" | "local-sync" => {
+            let mut flags = vec![
+                "--iree-hal-target-device=local".into(),
+                "--iree-hal-local-target-device-backends=llvm-cpu".into(),
+                "--iree-llvmcpu-target-cpu=host".into(),
+            ];
+            if let Some(sdk) = dyninfer_rocm::RocmSdk::discover() {
+                let linker = sdk.linker();
+                debug!(path = %linker.display(), "using TheRock lld");
+                flags.push(format!(
+                    "--iree-llvmcpu-embedded-linker-path={}",
+                    linker.display()
+                ));
+            }
+            Ok(flags)
+        }
         _ => Err(ApiError {
             message: format!("unsupported IREE target driver `{driver}`"),
         }),
@@ -139,8 +150,9 @@ pub fn flags_for_target(driver: &str, gpu_arch: Option<&str>) -> Result<Vec<Stri
 ///
 /// Resolution order:
 /// 1. `DYNINFER_IREE_ROCM_BC_DIR`
-/// 2. Bazel runfiles under the IREE compiler external repo
-/// 3. `iree_platform_libs/rocm` next to the loaded `libIREECompiler.so`
+/// 2. Bazel-pinned TheRock SDK
+/// 3. Bazel runfiles under the IREE compiler external repo
+/// 4. `iree_platform_libs/rocm` next to the loaded `libIREECompiler.so`
 pub fn discover_rocm_bc_dir() -> Option<std::path::PathBuf> {
     use std::path::{Path, PathBuf};
 
@@ -152,6 +164,13 @@ pub fn discover_rocm_bc_dir() -> Option<std::path::PathBuf> {
         let p = PathBuf::from(p);
         if is_rocm_bc(&p) {
             return Some(p);
+        }
+    }
+
+    if let Some(sdk) = dyninfer_rocm::RocmSdk::discover() {
+        let candidate = sdk.bitcode_dir();
+        if is_rocm_bc(&candidate) {
+            return Some(candidate);
         }
     }
 

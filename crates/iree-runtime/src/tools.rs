@@ -55,6 +55,9 @@ impl IreeRunTools {
     /// stderr; we still return stdout so other drivers remain usable.
     pub fn dump_devices(&self) -> Result<String> {
         let mut cmd = Command::new(&self.run_module);
+        if let Some(sdk) = dyninfer_rocm::RocmSdk::discover() {
+            sdk.configure_command(&mut cmd);
+        }
         cmd.arg("--dump_devices");
         debug!(?cmd, "invoking iree-run-module --dump_devices");
         let output = cmd.output().map_err(|e| {
@@ -157,6 +160,9 @@ impl IreeRunTools {
         device: Option<&str>,
     ) -> Result<String> {
         let mut cmd = Command::new(&self.run_module);
+        if let Some(sdk) = dyninfer_rocm::RocmSdk::discover() {
+            sdk.configure_command(&mut cmd);
+        }
         cmd.arg(format!("--module={}", module.display()))
             .arg(format!("--function={function}"))
             // Default (1024) elides large logits with `...`; we need full buffers.

@@ -8,6 +8,7 @@ license.workspace = true
 links = "IREECompiler"
 
 [dependencies]
+dyninfer-rocm = { workspace = true }
 tracing = { workspace = true }
 
 [build-dependencies]

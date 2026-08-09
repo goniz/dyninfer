@@ -32,7 +32,10 @@ rust_library(
     },
     # Avoid cargo build.rs under Bazel; bindings come from rust_bindgen.
     rustc_flags = ["--cfg=bazel"],
-    data = ["//bazel/iree:compiler_libs"],
+    data = [
+        "//bazel/iree:compiler_libs",
+        "//bazel/therock:runtime",
+    ],
     deps = all_crate_deps(normal = True) + [
         "//bazel/iree:libIREECompiler",
     ],
@@ -45,6 +48,9 @@ rust_test(
     rustc_env = {
         "IREE_COMPILER_BINDINGS": "$(execpath :iree_compiler_bindings)",
     },
-    data = ["//bazel/iree:compiler_libs"],
+    data = [
+        "//bazel/iree:compiler_libs",
+        "//bazel/therock:runtime",
+    ],
     deps = all_crate_deps(normal_dev = True),
 )

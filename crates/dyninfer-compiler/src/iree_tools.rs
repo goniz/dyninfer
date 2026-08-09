@@ -142,6 +142,9 @@ impl IreeTools {
             })?;
             cmd.env("PATH", joined);
         }
+        if let Some(sdk) = dyninfer_rocm::RocmSdk::discover() {
+            sdk.configure_command(&mut cmd);
+        }
 
         info!(?cmd, "invoking iree-compile");
         let output = cmd.output().map_err(|e| {
