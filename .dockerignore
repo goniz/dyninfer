@@ -1,5 +1,6 @@
 .git
 .gitignore
+MODULE.bazel.lock
 bazel-*
 target/
 third_party/iree-venv/

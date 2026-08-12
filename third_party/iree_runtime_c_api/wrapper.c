@@ -9,6 +9,7 @@
 
 #include "iree/base/api.h"
 #include "iree/hal/api.h"
+#include "iree/hal/drivers/hip/api.h"
 #include "iree/io/file_handle.h"
 #include "iree/io/parameter_index.h"
 #include "iree/io/parameter_index_provider.h"
@@ -144,6 +145,47 @@ static bool configure_hip_blocking_sync(const char* device_uri,
     (void)hipSetDeviceFlags(DYNINFER_HIP_DEVICE_SCHEDULE_BLOCKING_SYNC);
   }
   return true;
+}
+
+// Creates a HIP device with an explicit TheRock runtime path. Preloading the
+// library above is not enough when its SONAME differs from the unversioned name
+// requested by IREE, so pass the absolute file to the HIP driver itself.
+static iree_status_t create_hip_device(const char* device_uri,
+                                       const char* rocm_root,
+                                       iree_allocator_t host_allocator,
+                                       iree_hal_device_t** out_device) {
+  char hip_path[PATH_MAX];
+  int path_length = snprintf(hip_path, sizeof(hip_path),
+                             "file:%s/lib/libamdhip64.so", rocm_root);
+  if (path_length < 0 || (size_t)path_length >= sizeof(hip_path)) {
+    return iree_make_status(IREE_STATUS_OUT_OF_RANGE,
+                            "TheRock SDK path is too long");
+  }
+
+  iree_string_view_t search_path = iree_make_cstring_view(hip_path);
+  iree_hal_hip_driver_options_t driver_options;
+  iree_hal_hip_driver_options_initialize(&driver_options);
+  driver_options.hip_lib_search_paths = &search_path;
+  driver_options.hip_lib_search_path_count = 1;
+
+  iree_hal_hip_device_params_t device_params;
+  iree_hal_hip_device_params_initialize(&device_params);
+  iree_hal_driver_t* driver = NULL;
+  iree_status_t status = iree_hal_hip_driver_create(
+      iree_make_cstring_view("hip"), &driver_options, &device_params,
+      host_allocator, &driver);
+  if (iree_status_is_ok(status)) {
+    if (strstr(device_uri, "://") != NULL) {
+      status = iree_hal_driver_create_device_by_uri(
+          driver, iree_make_cstring_view(device_uri), host_allocator,
+          out_device);
+    } else {
+      status = iree_hal_driver_create_default_device(driver, host_allocator,
+                                                     out_device);
+    }
+  }
+  if (driver) iree_hal_driver_release(driver);
+  return status;
 }
 
 static iree_status_t cached_call_prepare(dyninfer_iree_session_t* session,
@@ -311,9 +353,14 @@ static int session_create_common(const char* device_uri, const char* rocm_root,
       &instance_options, iree_allocator_system(), &s->instance);
 
   if (iree_status_is_ok(status)) {
-    // Full HAL URIs (contain "://") select a specific device; bare driver
-    // names fall back to the driver's default device.
-    if (strstr(driver_or_uri, "://") != NULL) {
+    if (strncmp(driver_or_uri, "hip", 3) == 0 ||
+        strncmp(driver_or_uri, "rocm", 4) == 0) {
+      status = create_hip_device(
+          driver_or_uri, rocm_root,
+          iree_runtime_instance_host_allocator(s->instance), &s->device);
+      // Full non-HIP HAL URIs select a specific device; bare driver names fall
+      // back to the registered driver's default device.
+    } else if (strstr(driver_or_uri, "://") != NULL) {
       iree_hal_driver_registry_t* registry =
           iree_runtime_instance_driver_registry(s->instance);
       status = iree_hal_create_device(

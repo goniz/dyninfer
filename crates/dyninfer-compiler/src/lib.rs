@@ -392,6 +392,16 @@ fn compile_flags_for(target: &TargetProfile) -> Result<Vec<String>> {
         if let Some(bc) = iree_compiler_sys::discover_rocm_bc_dir() {
             flags.push(format!("--iree-rocm-bc-dir={}", bc.display()));
         }
+    } else if matches!(target.driver.as_str(), "local" | "local-task" | "local-sync")
+        && !flags
+            .iter()
+            .any(|flag| flag.starts_with("--iree-llvmcpu-embedded-linker-path="))
+        && let Some(sdk) = dyninfer_rocm::RocmSdk::discover()
+    {
+        flags.push(format!(
+            "--iree-llvmcpu-embedded-linker-path={}",
+            sdk.linker().display()
+        ));
     }
     Ok(flags)
 }
@@ -403,7 +413,11 @@ fn compile_mlir_prefer_inprocess(
     tools: Option<&IreeTools>,
 ) -> Result<Vec<u8>> {
     let flags = compile_flags_for(target)?;
-    if !force_subprocess {
+    // The ROCm backend locates lld from the process-wide PATH. The Bazel-pinned
+    // TheRock SDK lives in a separate runfiles tree, so use the subprocess path
+    // where we can configure PATH without mutating a multithreaded process.
+    let inprocess_supported = !matches!(target.driver.as_str(), "hip" | "rocm");
+    if !force_subprocess && inprocess_supported {
         match iree_compiler_sys::compile_mlir_to_vmfb(mlir, &flags) {
             Ok(bytes) => {
                 info!(
