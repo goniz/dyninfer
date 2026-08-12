@@ -63,6 +63,8 @@ pub struct KvCacheMetrics {
     pub key_dtype: ScalarType,
     pub value_dtype: ScalarType,
     pub paged: bool,
+    /// Prefill chunk length for paged ABI (0 when static).
+    pub chunk_size: u32,
 }
 
 impl Default for KvCacheMetrics {
@@ -80,6 +82,7 @@ impl Default for KvCacheMetrics {
             key_dtype: ScalarType::F32,
             value_dtype: ScalarType::F32,
             paged: false,
+            chunk_size: 0,
         }
     }
 }

@@ -337,7 +337,9 @@ impl ModelSession for IreeSession {
 
     fn kv_cache_metrics(&self) -> Result<KvCacheMetrics> {
         let capacity = self.kv.capacity_bytes() as usize;
-        let paged = self.paged_geometry().is_some();
+        let geometry = self.paged_geometry();
+        let paged = geometry.is_some();
+        let chunk_size = geometry.map(|(_, chunk)| chunk as u32).unwrap_or(0);
         let (page_count, runtime_allocated) = if paged {
             self.context.paged_kv_metrics()?
         } else {
@@ -362,6 +364,7 @@ impl ModelSession for IreeSession {
             key_dtype: self.kv.element_type,
             value_dtype: self.kv.element_type,
             paged,
+            chunk_size,
         })
     }
 

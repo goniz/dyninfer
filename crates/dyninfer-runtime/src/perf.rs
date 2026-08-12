@@ -131,8 +131,11 @@ pub fn run_perf(
             samples: prefill.samples,
             kv: prefill_kv,
             alloc: prefill_alloc,
-            // Prefill streams weights once per measured phase.
-            weight_passes: 1,
+            weight_passes: prefill_weight_passes(
+                config.prefill_tokens,
+                prefill_kv.paged,
+                prefill_kv.chunk_size,
+            ),
             weight_bytes: config.weight_bytes,
         });
 
@@ -199,6 +202,15 @@ struct RawPhase {
     /// How many full weight-tensor streams this phase performs.
     weight_passes: u64,
     weight_bytes: u64,
+}
+
+/// Prefill invokes the executable once (dense) or once per paged chunk.
+fn prefill_weight_passes(tokens: usize, paged: bool, chunk_size: u32) -> u64 {
+    if !paged || chunk_size == 0 {
+        1
+    } else {
+        tokens.div_ceil(chunk_size as usize) as u64
+    }
 }
 
 fn max_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
@@ -505,6 +517,24 @@ mod tests {
         // 2e9 bytes / 1s = 2 GB/s
         let m = aggregate_phases(&[raw_phase(128, 1.0, 1, 2_000_000_000)]);
         assert!((m.eff_weight_bw_gbs.unwrap() - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn prefill_weight_passes_counts_paged_chunks() {
+        assert_eq!(prefill_weight_passes(128, false, 0), 1);
+        assert_eq!(prefill_weight_passes(128, false, 512), 1);
+        assert_eq!(prefill_weight_passes(512, true, 512), 1);
+        assert_eq!(prefill_weight_passes(513, true, 512), 2);
+        assert_eq!(prefill_weight_passes(4096, true, 512), 8);
+        assert_eq!(prefill_weight_passes(4096, true, 0), 1);
+    }
+
+    #[test]
+    fn eff_weight_bw_counts_one_pass_per_paged_prefill_chunk() {
+        // 1e9 bytes * 8 chunks / 2s = 4 GB/s  (4k tokens / 512 chunk)
+        let m = aggregate_phases(&[raw_phase(4096, 2.0, 8, 1_000_000_000)]);
+        assert!((m.eff_weight_bw_gbs.unwrap() - 4.0).abs() < 1e-9);
+        assert_eq!(prefill_weight_passes(4096, true, 512), 8);
     }
 
     #[test]
