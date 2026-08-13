@@ -585,7 +585,7 @@ mod tests {
             )
             .unwrap();
         let model = loader.load_bundle(&bundle, &ckpt).unwrap();
-        assert_eq!(model.manifest.version, 6);
+        assert_eq!(model.manifest.version, 7);
         assert!(
             model.manifest.prefill_window == 512 || model.manifest.prefill_window == 64,
             "unexpected prefill_window {}",
@@ -613,7 +613,7 @@ mod tests {
             logits.values.len()
         );
         let metrics = session.kv_cache_metrics().unwrap();
-        assert_eq!(metrics.page_count, 4); // ceil(1024/256) for ABI v6 fixed arity
+        assert_eq!(metrics.page_count, 4); // ceil(1024/256) packed pool capacity
         assert!(metrics.allocated_bytes > 0);
 
         // Multi-step greedy decode must stay finite and not collapse into a
@@ -642,6 +642,7 @@ mod tests {
         );
 
         session.reset().unwrap();
-        assert_eq!(session.kv_cache_metrics().unwrap().page_count, 0);
+        // Pool stays allocated (zeroed in place); capacity is unchanged.
+        assert_eq!(session.kv_cache_metrics().unwrap().page_count, 4);
     }
 }

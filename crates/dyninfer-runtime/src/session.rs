@@ -128,10 +128,17 @@ impl ModelSession for IreeSession {
         self.history.extend_from_slice(tokens);
         let values = if let Some((page_size, chunk_size)) = self.paged_geometry() {
             self.context.reset_paged_kv()?;
-            // ABI v6 fused entrypoints take a compile-time page arity of
-            // ceil(max_kv / page_size); allocate the full set up front.
+            // ABI v7 packed kv_pool; capacity is ceil(max_kv / page_size).
             let max_pages = (self.max_seq() as usize).div_ceil(page_size).max(1);
             self.context.ensure_kv_pages(max_pages)?;
+            if let Ok((_, bytes)) = self.context.paged_kv_metrics() {
+                if bytes > 256 * 1024 * 1024 {
+                    eprintln!(
+                        "paged KV pool: {max_pages} pages × {page_size} tok ≈ {:.2} GiB",
+                        bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+                    );
+                }
+            }
             let chunks: Vec<_> = tokens.chunks(chunk_size).collect();
             let mut logits = Vec::new();
             for (chunk_index, chunk) in chunks.iter().enumerate() {

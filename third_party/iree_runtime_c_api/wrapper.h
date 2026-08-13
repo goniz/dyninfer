@@ -46,8 +46,8 @@ int dyninfer_iree_session_create_with_file_params(
     const dyninfer_iree_file_param_t* params, size_t param_count,
     dyninfer_iree_session_t** out_session);
 
-// ABI v6: appends independently compiled prefill and decode modules to one
-// session so both share the same device and runtime-owned KV pages.
+// ABI v7: appends independently compiled prefill and decode modules to one
+// session so both share the same device and runtime-owned packed KV pool.
 int dyninfer_iree_session_create_modules_with_file_params(
     const char* device_uri, const char* prefill_vmfb_path,
     const char* decode_vmfb_path, const dyninfer_iree_parameter_file_t* files,
@@ -80,9 +80,12 @@ int dyninfer_iree_session_invoke_decode(dyninfer_iree_session_t* session,
                                         const float* attn_bias, size_t bias_len,
                                         float** out_logits, size_t* out_count);
 
-// Paged KV. Pages are independent device-local tensors with shape
-// [layers, 2, page_size, kv_heads, head_dim]. Prefill/decode chunk entrypoints
-// take caller-owned logits + page buffers via iree.abi.output (in-place write).
+// Paged KV ABI v7: one packed pool tensor
+// [num_pages * layers, 2, page_size, kv_heads, head_dim]. Prefill/decode chunk
+// entrypoints take caller-owned logits via iree.abi.output. The packed
+// kv_pool is a read-only input; page writes come back as a small delta
+// tensor that the runtime scatters with D2D copies (HIP cannot clone the
+// imported pool).
 int dyninfer_iree_session_configure_paged_kv(
     dyninfer_iree_session_t* session, size_t layer_count, size_t page_size,
     size_t kv_head_count, size_t head_dim, size_t chunk_size,

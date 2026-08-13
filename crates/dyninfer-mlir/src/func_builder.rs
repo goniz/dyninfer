@@ -16,6 +16,7 @@ pub struct FuncBuilder {
     results: Vec<String>,
     body: Vec<String>,
     next_id: u32,
+    attrs: Option<String>,
 }
 
 impl FuncBuilder {
@@ -27,11 +28,17 @@ impl FuncBuilder {
             results: Vec::new(),
             body: Vec::new(),
             next_id: 0,
+            attrs: None,
         }
     }
 
     pub fn private(mut self) -> Self {
         self.private = true;
+        self
+    }
+
+    pub fn attrs(&mut self, attrs: impl Into<String>) -> &mut Self {
+        self.attrs = Some(attrs.into());
         self
     }
 
@@ -425,7 +432,12 @@ impl FuncBuilder {
         } else {
             format!(" -> ({})", self.results.join(", "))
         };
-        let mut out = format!("func.func{priv_kw} @{}({}){rets} {{\n", self.name, args);
+        let attr = self
+            .attrs
+            .as_ref()
+            .map(|a| format!(" attributes {a}"))
+            .unwrap_or_default();
+        let mut out = format!("func.func{priv_kw} @{}({}){rets}{attr} {{\n", self.name, args);
         for line in &self.body {
             out.push_str(line);
             if !line.ends_with('\n') {

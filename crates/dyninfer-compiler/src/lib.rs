@@ -25,7 +25,7 @@ use dyninfer_error::{CompilationError, Diagnostic, DynInferError, Result, Severi
 use serde::{Deserialize, Serialize};
 use tracing::{info, info_span};
 
-pub const COMPILER_VERSION: &str = "0.3.0-iree-3.11.0-paged-kv-v6";
+pub const COMPILER_VERSION: &str = "0.3.0-iree-3.11.0-paged-kv-v7.35-outlined-attn";
 /// Pinned IREE pip / source revision identity for executable cache keys (spec §19.1).
 pub const IREE_REVISION: &str = "3.11.0+e4a3b0405d7d";
 /// Kernel registry policy version included in executable cache keys.
@@ -528,7 +528,7 @@ impl ModelCompiler for LocalCompiler {
         validate_binding_for_compile(&request.bound_model.binding)?;
         let manifest = ExecutableManifest {
             format: "dyninfer.bundle".into(),
-            version: if paged_kv { 6 } else { 2 },
+            version: if paged_kv { 7 } else { 2 },
             architecture_id: request.bound_model.architecture.architecture_id.clone(),
             architecture_revision: request.architecture_revision.into(),
             checkpoint_schema: request.checkpoint_schema.clone(),

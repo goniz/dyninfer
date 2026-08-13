@@ -54,27 +54,6 @@ pub const PAGED_KV_PAGE_SIZE: u32 = 256;
 /// short-prompt greedy decode on HIP (flash and portable); 512 stays correct
 /// and long prompts are covered by multiple chunks.
 pub const PAGED_PREFILL_CHUNK_SIZE: u32 = 512;
-/// Soft cap on ABI v6 page arity (one IREE arg + `abi.output` per page).
-/// Past this, HIP compile time explodes; a packed single-tensor pool (v7)
-/// hangs on HIP `hal.fence.await` even for tiny pools — keep per-page args
-/// and grow `page_size` instead.
-pub const PAGED_KV_MAX_PAGES: u32 = 32;
-
-/// Page length for a given `max_kv` so `ceil(max_kv / page) <= PAGED_KV_MAX_PAGES`.
-///
-/// Always a multiple of [`PAGED_KV_PAGE_SIZE`]. When larger than the prefill
-/// chunk, also a multiple of [`PAGED_PREFILL_CHUNK_SIZE`] so
-/// `page % chunk == 0` (runtime configure check).
-pub fn paged_kv_page_size_for(max_kv: u32) -> u32 {
-    let max_kv = max_kv.max(1);
-    let needed = max_kv.div_ceil(PAGED_KV_MAX_PAGES).max(PAGED_KV_PAGE_SIZE);
-    let page = needed.div_ceil(PAGED_KV_PAGE_SIZE) * PAGED_KV_PAGE_SIZE;
-    if page > PAGED_PREFILL_CHUNK_SIZE {
-        page.div_ceil(PAGED_PREFILL_CHUNK_SIZE) * PAGED_PREFILL_CHUNK_SIZE
-    } else {
-        page
-    }
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DenseDecoderConfig {
@@ -93,10 +72,10 @@ pub struct DenseDecoderConfig {
     pub seq: u32,
     /// Mutable KV capacity (`>= seq`); decode positions use `[0, max_kv)`.
     pub max_kv: u32,
-    /// Tokens per KV page (ABI v6). Scaled with `max_kv` via
-    /// [`paged_kv_page_size_for`] so page arity stays ≤ [`PAGED_KV_MAX_PAGES`].
+    /// Tokens per KV page (ABI v7 packed pool). Fixed at [`PAGED_KV_PAGE_SIZE`];
+    /// arity is O(1) so page length no longer scales with `max_kv`.
     pub page_size: u32,
-    /// Runtime-owned paged KV shared by split prefill/decode modules (ABI v6).
+    /// Runtime-owned paged KV shared by split prefill/decode modules (ABI v7).
     pub paged_kv: bool,
     /// HIP uses IREE's fused online-attention op with WMMA flash configs;
     /// CPU keeps the portable page-local linalg fallback.
@@ -258,18 +237,18 @@ impl DenseDecoderConfig {
             num_layers,
             seq,
             max_kv: max_kv.max(seq),
-            page_size: if paged_kv {
-                paged_kv_page_size_for(max_kv.max(seq))
-            } else {
-                PAGED_KV_PAGE_SIZE
-            },
+            page_size: PAGED_KV_PAGE_SIZE,
             paged_kv,
             // IREE online attention (`iree_linalg_ext.online_attention`) is
             // emitted only for HIP: the flash configs hardcode
             // `LLVMGPUVectorDistribute` + `WMMAR3_*` MMA layouts other backends
             // cannot lower. They use portable page-local linalg attention
             // (`emit_online_attention_page`).
-            iree_flash_attention: bound.target.driver == "hip",
+            //
+            // `DYNINFER_PORTABLE_ATTN=1` forces portable even on HIP (debug when
+            // flash aborts/hangs the HIP semaphore).
+            iree_flash_attention: bound.target.driver == "hip"
+                && std::env::var_os("DYNINFER_PORTABLE_ATTN").is_none(),
             rms_norm_eps: f(
                 &["rms_norm_eps", "llama.attention.layer_norm_rms_epsilon"],
                 1e-5,
@@ -499,6 +478,7 @@ fn emit_paged_decoder(
     variant: PagedVariant,
 ) -> Result<()> {
     emit_paged_chunk_begin(module, c, variant)?;
+    emit_paged_layer_store(module, c, variant)?;
     emit_paged_layer_page(module, c, variant)?;
     for layer in 0..c.num_layers {
         match layer_kind(c, layer) {
@@ -510,7 +490,200 @@ fn emit_paged_decoder(
         }
     }
     emit_paged_chunk_logits(module, c, variant)?;
+    emit_paged_page_clone(module, c, variant)?;
     emit_paged_fused_chunk(module, c, variant)
+}
+
+fn paged_max_writes(seq: u32, page: u32) -> u32 {
+    seq.div_ceil(page).saturating_add(1).max(1)
+}
+
+fn paged_attn_layers(c: &DenseDecoderConfig) -> u32 {
+    (0..c.num_layers)
+        .filter(|&layer| layer_kind(c, layer) == LayerKind::Attention)
+        .count()
+        .max(1) as u32
+}
+
+fn emit_paged_page_clone(
+    module: &mut ModuleBuilder,
+    c: &DenseDecoderConfig,
+    variant: PagedVariant,
+) -> Result<()> {
+    let (layers, page, nkv, d) = (c.num_layers, c.page_size, c.num_kv_heads, c.head_dim);
+    let num_pages = c.max_kv.div_ceil(page).max(1);
+    let pool_rows = num_pages.saturating_mul(layers).max(1);
+    let pool_ty = format!("tensor<{pool_rows}x2x{page}x{nkv}x{d}xf32>");
+    let kv1_ty = format!("tensor<1x2x{page}x{nkv}x{d}xf32>");
+    let clone = variant.function("page_clone");
+    let extract = variant.function("page_extract");
+    module.append_toplevel_asm(&format!(
+        r#"func.func private @{clone}(%src: {kv1_ty}) -> {kv1_ty} attributes {{noinline}} {{
+  %e = tensor.empty() : {kv1_ty}
+  %c = linalg.copy ins(%src : {kv1_ty}) outs(%e : {kv1_ty}) -> {kv1_ty}
+  return %c : {kv1_ty}
+}}
+func.func private @{extract}(%pool: {pool_ty}, %flat: index) -> {kv1_ty} attributes {{noinline}} {{
+  %c0 = arith.constant 0 : index
+  %flat64 = arith.index_cast %flat : index to i64
+  %idx_e = tensor.empty() : tensor<1xi64>
+  %idx = tensor.insert %flat64 into %idx_e[%c0] : tensor<1xi64>
+  %e = tensor.empty() : {kv1_ty}
+  %out = iree_linalg_ext.gather dimension_map = [0] ins(%pool, %idx : {pool_ty}, tensor<1xi64>) outs(%e : {kv1_ty}) -> {kv1_ty}
+  return %out : {kv1_ty}
+}}
+"#
+    ))?;
+    Ok(())
+}
+
+fn emit_paged_fused_attn_layer(
+    module: &mut ModuleBuilder,
+    c: &DenseDecoderConfig,
+    variant: PagedVariant,
+    layer: u32,
+) -> Result<()> {
+    let (s, layers, page, nkv, g, d) = (
+        c.seq,
+        c.num_layers,
+        c.page_size,
+        c.num_kv_heads,
+        c.gqa_group(),
+        c.head_dim,
+    );
+    let num_pages = c.max_kv.div_ceil(page).max(1);
+    let nlast = num_pages.saturating_sub(1);
+    let pool_rows = num_pages.saturating_mul(layers).max(1);
+    let max_writes = paged_max_writes(s, page);
+    let pool_ty = format!("tensor<{pool_rows}x2x{page}x{nkv}x{d}xf32>");
+    let kv1_ty = format!("tensor<1x2x{page}x{nkv}x{d}xf32>");
+    let kv_ty = format!("tensor<2x{page}x{nkv}x{d}xf32>");
+    let qg_ty = format!("tensor<{nkv}x{g}x{s}x{d}xf32>");
+    let kv3_ty = format!("tensor<{s}x{nkv}x{d}xf32>");
+    let row_ty = format!("tensor<{nkv}x{g}x{s}xf32>");
+    let lwp_ty = format!("tensor<{max_writes}x2x{page}x{nkv}x{d}xf32>");
+    let lwf_ty = format!("tensor<{max_writes}xi64>");
+    let name = variant.function(&format!("fused_attn_{layer}"));
+    let prepare = variant.function(&format!("layer_prepare_{layer}"));
+    let finish = variant.function(&format!("layer_finish_{layer}"));
+    let layer_store = variant.function("layer_store");
+    let layer_page = variant.function("layer_page");
+    let page_extract = variant.function("page_extract");
+    let mut write_consts = String::new();
+    for w in 0..max_writes {
+        write_consts.push_str(&format!("  %c{w}_w = arith.constant {w} : index\n"));
+    }
+    let mut writes = String::new();
+    for w in 0..max_writes {
+        writes.push_str(&format!(
+            r#"  %pi_w{w} = arith.addi %page_lo, %c{w}_w : index
+  %pi_w{w}_c = arith.minui %pi_w{w}, %nlast : index
+  %flat_w{w}_m = arith.muli %pi_w{w}_c, %clayers : index
+  %flat_w{w} = arith.addi %flat_w{w}_m, %clayer : index
+  %pi_i64_w{w} = arith.index_cast %pi_w{w}_c : index to i64
+  %pi_e_w{w} = tensor.empty() : tensor<i64>
+  %pi_t_w{w} = tensor.insert %pi_i64_w{w} into %pi_e_w{w}[] : tensor<i64>
+  %kv1_s_w{w}_0 = func.call @{page_extract}(%kv_pool, %flat_w{w}) : ({pool_ty}, index) -> {kv1_ty}
+"#
+        ));
+        let mut src_ssa = format!("kv1_s_w{w}_0");
+        for prev in 0..w {
+            let next_ssa = format!("kv1_s_w{w}_{}", prev + 1);
+            writes.push_str(&format!(
+                r#"  %same_w{w}_p{prev} = arith.cmpi eq, %flat_w{w}, %flat_w{prev} : index
+  %{next_ssa} = scf.if %same_w{w}_p{prev} -> ({kv1_ty}) {{
+    scf.yield %kv1o_w{prev} : {kv1_ty}
+  }} else {{
+    scf.yield %{src_ssa} : {kv1_ty}
+  }}
+"#
+            ));
+            src_ssa = next_ssa;
+        }
+        writes.push_str(&format!(
+            r#"  %kv_w{w} = tensor.collapse_shape %{src_ssa} [[0, 1], [2], [3], [4]] : {kv1_ty} into {kv_ty}
+  %kv2_w{w} = func.call @{layer_store}(%kv_w{w}, %pi_t_w{w}, %start_pos, %chunk_k, %chunk_v, %valid) : ({kv_ty}, tensor<i64>, tensor<i64>, {kv3_ty}, {kv3_ty}, tensor<i64>) -> ({kv_ty})
+  %kv1o_w{w} = tensor.expand_shape %kv2_w{w} [[0, 1], [2], [3], [4]] output_shape [1, 2, {page}, {nkv}, {d}] : {kv_ty} into {kv1_ty}
+"#
+        ));
+    }
+    let (select, sel_ssa) = {
+        fn rec(w: u32, max_writes: u32, kv1_ty: &str, indent: usize) -> (String, String) {
+            let pad = " ".repeat(indent);
+            if w >= max_writes {
+                return (String::new(), "hist".to_string());
+            }
+            let (inner, inner_ssa) = rec(w + 1, max_writes, kv1_ty, indent + 2);
+            let ssa = if w == 0 {
+                "kv1a".to_string()
+            } else {
+                format!("sel_w{w}")
+            };
+            let code = format!(
+                "{pad}%eq_w{w} = arith.cmpi eq, %pi, %pi_w{w}_c : index\n\
+                 {pad}%{ssa} = scf.if %eq_w{w} -> ({kv1_ty}) {{\n\
+                 {pad}  scf.yield %kv1o_w{w} : {kv1_ty}\n\
+                 {pad}}} else {{\n\
+                 {inner}\
+                 {pad}  scf.yield %{inner_ssa} : {kv1_ty}\n\
+                 {pad}}}\n"
+            );
+            (code, ssa)
+        }
+        rec(0, max_writes, &kv1_ty, 4)
+    };
+    let mut pack = String::new();
+    pack.push_str(&format!("  %lwp_e = tensor.empty() : {lwp_ty}\n"));
+    pack.push_str(&format!("  %lwf_e = tensor.empty() : {lwf_ty}\n"));
+    let mut wp_ssa = String::from("lwp_e");
+    let mut wf_ssa = String::from("lwf_e");
+    for w in 0..max_writes {
+        let next_wp = format!("lwp{w}");
+        let next_wf = format!("lwf{w}");
+        pack.push_str(&format!(
+            r#"  %c{w}_slot = arith.constant {w} : index
+  %fi{w} = arith.index_cast %flat_w{w} : index to i64
+  %{next_wf} = tensor.insert %fi{w} into %{wf_ssa}[%c{w}_slot] : {lwf_ty}
+  %{next_wp} = tensor.insert_slice %kv1o_w{w} into %{wp_ssa}[{w}, 0, 0, 0, 0] [1, 2, {page}, {nkv}, {d}] [1, 1, 1, 1, 1] : {kv1_ty} into {lwp_ty}
+"#
+        ));
+        wp_ssa = next_wp;
+        wf_ssa = next_wf;
+    }
+    module.append_toplevel_asm(&format!(
+        r#"func.func private @{name}(%kv_pool: {pool_ty}, %start_pos: tensor<i64>, %valid: tensor<i64>) -> ({lwp_ty}, {lwf_ty}) attributes {{noinline}} {{
+  %c0_page = arith.constant 0 : index
+  %c1_page = arith.constant 1 : index
+  %npages = arith.constant {num_pages} : index
+  %nlast = arith.constant {nlast} : index
+  %clayers = arith.constant {layers} : index
+  %clayer = arith.constant {layer} : index
+  %page_size_idx = arith.constant {page} : index
+  %start64 = tensor.extract %start_pos[] : tensor<i64>
+  %valid64 = tensor.extract %valid[] : tensor<i64>
+  %chunk_end64 = arith.addi %start64, %valid64 : i64
+  %chunk_end = arith.index_cast %chunk_end64 : i64 to index
+  %page_hi_raw = arith.ceildivui %chunk_end, %page_size_idx : index
+  %page_hi = arith.minui %page_hi_raw, %npages : index
+  %start_idx = arith.index_cast %start64 : i64 to index
+  %page_lo = arith.divui %start_idx, %page_size_idx : index
+{write_consts}  %query, %chunk_k, %chunk_v, %out_0, %max_0, %sum_0 = func.call @{prepare}() : () -> ({qg_ty}, {kv3_ty}, {kv3_ty}, {qg_ty}, {row_ty}, {row_ty})
+{writes}  %out_f, %max_f, %sum_f = scf.for %pi = %c0_page to %page_hi step %c1_page iter_args(%out_i = %out_0, %max_i = %max_0, %sum_i = %sum_0) -> ({qg_ty}, {row_ty}, {row_ty}) {{
+    %pi_i64 = arith.index_cast %pi : index to i64
+    %pi_e = tensor.empty() : tensor<i64>
+    %pi_t = tensor.insert %pi_i64 into %pi_e[] : tensor<i64>
+    %flat_h_m = arith.muli %pi, %clayers : index
+    %flat_h = arith.addi %flat_h_m, %clayer : index
+    %hist = func.call @{page_extract}(%kv_pool, %flat_h) : ({pool_ty}, index) -> {kv1_ty}
+{select}    %kva = tensor.collapse_shape %{sel_ssa} [[0, 1], [2], [3], [4]] : {kv1_ty} into {kv_ty}
+    %out_n, %max_n, %sum_n = func.call @{layer_page}(%kva, %pi_t, %start_pos, %query, %valid, %out_i, %max_i, %sum_i) : ({kv_ty}, tensor<i64>, tensor<i64>, {qg_ty}, tensor<i64>, {qg_ty}, {row_ty}, {row_ty}) -> ({qg_ty}, {row_ty}, {row_ty})
+    scf.yield %out_n, %max_n, %sum_n : {qg_ty}, {row_ty}, {row_ty}
+  }}
+  func.call @{finish}(%out_f, %sum_f) : ({qg_ty}, {row_ty}) -> ()
+{pack}  return %{wp_ssa}, %{wf_ssa} : {lwp_ty}, {lwf_ty}
+}}
+"#
+    ))
 }
 
 fn emit_paged_fused_chunk(
@@ -518,122 +691,107 @@ fn emit_paged_fused_chunk(
     c: &DenseDecoderConfig,
     variant: PagedVariant,
 ) -> Result<()> {
-    let (s, v, layers, page, nkv, g, d) = (
+    let (s, v, layers, page, nkv, d) = (
         c.seq,
         c.vocab,
         c.num_layers,
         c.page_size,
         c.num_kv_heads,
-        c.gqa_group(),
         c.head_dim,
     );
-    // Fixed page arity keeps HIP on the proven tensor ABI (list<!hal.buffer_view>
-    // import/alias faults on current ROCm). Host always passes ceil(max_kv/page).
+    // ABI v7: packed pool is a read-only imported HAL buffer. HIP faults if
+    // we insert/concat/clone that external resource, so:
+    //   * historical pages: noinline extract + copy into a fresh tensor
+    //   * writes: page SSA packed into caller-owned write_pages/write_flats
+    //   * runtime scatters those deltas into kv_pool with D2D copies
+    // Decode must not feed layer_store insert_slice results into attention
+    // (GPU page-fault); overlay into tensor.empty() instead.
     let num_pages = c.max_kv.div_ceil(page).max(1);
-    let page_ty = format!("tensor<{layers}x2x{page}x{nkv}x{d}xf32>");
-    let qg_ty = format!("tensor<{nkv}x{g}x{s}x{d}xf32>");
-    let kv3_ty = format!("tensor<{s}x{nkv}x{d}xf32>");
-    let row_ty = format!("tensor<{nkv}x{g}x{s}xf32>");
+    let pool_rows = num_pages.saturating_mul(layers).max(1);
+    let max_writes = paged_max_writes(c.seq, page);
+    let n_attn = paged_attn_layers(c);
+    let n_writes = max_writes.saturating_mul(n_attn).max(1);
+    let pool_ty = format!("tensor<{pool_rows}x2x{page}x{nkv}x{d}xf32>");
+    let lwp_ty = format!("tensor<{max_writes}x2x{page}x{nkv}x{d}xf32>");
+    let lwf_ty = format!("tensor<{max_writes}xi64>");
+    let wp_ty = format!("tensor<{n_writes}x2x{page}x{nkv}x{d}xf32>");
+    let wf_ty = format!("tensor<{n_writes}xi64>");
+    for layer in 0..layers {
+        if layer_kind(c, layer) == LayerKind::Attention {
+            emit_paged_fused_attn_layer(module, c, variant, layer)?;
+        }
+    }
     let entry = if variant.decode {
         "decode_chunk"
     } else {
         "prefill_chunk"
     };
     let begin = variant.function("chunk_begin");
-    let layer_page = variant.function("layer_page");
     let logits_fn = variant.function("chunk_logits");
     let mut f = module.func(entry);
     f.arg("tokens", format!("tensor<{s}xi64>"));
     f.arg("last", "tensor<i64>");
     f.arg("start_pos", "tensor<i64>");
-    // Caller-owned storage for logits + pages (iree.abi.output). IREE writes
-    // results in place so the host can keep the same buffer views across steps.
     f.arg_attrs(
         "logits_buf",
         format!("tensor<{v}xf32>"),
         "{iree.abi.output = 0 : index}",
     );
-    for pi in 0..num_pages {
-        f.arg_attrs(
-            format!("page{pi}"),
-            page_ty.clone(),
-            format!("{{iree.abi.output = {} : index}}", pi + 1),
-        );
-    }
+    f.arg_attrs(
+        "write_pages",
+        wp_ty.clone(),
+        "{iree.abi.output = 1 : index}",
+    );
+    f.arg_attrs(
+        "write_flats",
+        wf_ty.clone(),
+        "{iree.abi.output = 2 : index}",
+    );
+    f.arg("kv_pool", &pool_ty);
     f.result_ty(format!("tensor<{v}xf32>"));
-    for _pi in 0..num_pages {
-        f.result_ty(&page_ty);
-    }
+    f.result_ty(&wp_ty);
+    f.result_ty(&wf_ty);
     f.result_ty("tensor<i64>");
-    // Thread valid_count as SSA into layer_page. util.global load of the
-    // scalar across outlined private calls has been unreliable (wrong mask /
-    // diluted logits).
     f.op_asm(format!(
-        "  %valid = func.call @{begin}(%tokens, %last, %start_pos) : (tensor<{s}xi64>, tensor<i64>, tensor<i64>) -> (tensor<i64>)\n"
+        r#"  %valid = func.call @{begin}(%tokens, %last, %start_pos) : (tensor<{s}xi64>, tensor<i64>, tensor<i64>) -> (tensor<i64>)
+"#
     ));
-    let mut page_ssas: Vec<String> = (0..num_pages).map(|pi| format!("page{pi}")).collect();
+    let mut pack = String::new();
+    pack.push_str(&format!("  %wf_e = tensor.empty() : {wf_ty}\n"));
+    pack.push_str(&format!("  %wp_e = tensor.empty() : {wp_ty}\n"));
+    let mut wf_ssa = String::from("wf_e");
+    let mut wp_ssa = String::from("wp_e");
+    let mut attn_i = 0u32;
     for layer in 0..layers {
         match layer_kind(c, layer) {
             LayerKind::ShortConv => {
-                // Short-conv layers update the hidden global only; page tensors
-                // pass through unchanged (no KV for this layer index).
                 let short = variant.function(&format!("layer_shortconv_{layer}"));
                 f.op_asm(format!("  func.call @{short}() : () -> ()\n"));
             }
             LayerKind::Attention => {
-                let prepare = variant.function(&format!("layer_prepare_{layer}"));
-                let finish = variant.function(&format!("layer_finish_{layer}"));
-                // Return query+chunk KV as SSA: util.global across outlined private
-                // calls is unreliable for these tensors (same class as attn out/max/sum).
+                let fused = variant.function(&format!("fused_attn_{layer}"));
                 f.op_asm(format!(
-                    r#"  %query{layer}, %chunk_k{layer}, %chunk_v{layer}, %out_l{layer}_0, %max_l{layer}_0, %sum_l{layer}_0 = func.call @{prepare}() : () -> ({qg_ty}, {kv3_ty}, {kv3_ty}, {qg_ty}, {row_ty}, {row_ty})
-  %layer{layer}_i64 = arith.constant {layer} : i64
-  %layer{layer}_e = tensor.empty() : tensor<i64>
-  %layer{layer}_t = tensor.insert %layer{layer}_i64 into %layer{layer}_e[] : tensor<i64>
-"#
+                    "  %wpl{layer}, %wfl{layer} = func.call @{fused}(%kv_pool, %start_pos, %valid) : ({pool_ty}, tensor<i64>, tensor<i64>) -> ({lwp_ty}, {lwf_ty})\n"
                 ));
-                let mut out_ssa = format!("out_l{layer}_0");
-                let mut max_ssa = format!("max_l{layer}_0");
-                let mut sum_ssa = format!("sum_l{layer}_0");
-                let mut next_pages = Vec::with_capacity(num_pages as usize);
-                for pi in 0..num_pages {
-                    let page_in = &page_ssas[pi as usize];
-                    let page_out = format!("page_l{layer}_p{pi}");
-                    let out_next = format!("out_l{layer}_p{pi}");
-                    let max_next = format!("max_l{layer}_p{pi}");
-                    let sum_next = format!("sum_l{layer}_p{pi}");
-                    f.op_asm(format!(
-                        r#"  %pi{layer}_{pi}_i64 = arith.constant {pi} : i64
-  %pi{layer}_{pi}_e = tensor.empty() : tensor<i64>
-  %pi{layer}_{pi}_t = tensor.insert %pi{layer}_{pi}_i64 into %pi{layer}_{pi}_e[] : tensor<i64>
-  %{page_out}, %{out_next}, %{max_next}, %{sum_next} = func.call @{layer_page}(%{page_in}, %pi{layer}_{pi}_t, %start_pos, %layer{layer}_t, %query{layer}, %chunk_k{layer}, %chunk_v{layer}, %valid, %{out_ssa}, %{max_ssa}, %{sum_ssa}) : ({page_ty}, tensor<i64>, tensor<i64>, tensor<i64>, {qg_ty}, {kv3_ty}, {kv3_ty}, tensor<i64>, {qg_ty}, {row_ty}, {row_ty}) -> ({page_ty}, {qg_ty}, {row_ty}, {row_ty})
-"#
-                    ));
-                    next_pages.push(page_out);
-                    out_ssa = out_next;
-                    max_ssa = max_next;
-                    sum_ssa = sum_next;
-                }
-                page_ssas = next_pages;
-                f.op_asm(format!(
-                    r#"  func.call @{finish}(%{out_ssa}, %{sum_ssa}) : ({qg_ty}, {row_ty}) -> ()
-"#
+                let slot = attn_i.saturating_mul(max_writes);
+                let next_wp = format!("wp{attn_i}");
+                let next_wf = format!("wf{attn_i}");
+                pack.push_str(&format!(
+                    "  %{next_wp} = tensor.insert_slice %wpl{layer} into %{wp_ssa}[{slot}, 0, 0, 0, 0] [{max_writes}, 2, {page}, {nkv}, {d}] [1, 1, 1, 1, 1] : {lwp_ty} into {wp_ty}\n\
+                     %{next_wf} = tensor.insert_slice %wfl{layer} into %{wf_ssa}[{slot}] [{max_writes}] [1] : {lwf_ty} into {wf_ty}\n"
                 ));
+                wp_ssa = next_wp;
+                wf_ssa = next_wf;
+                attn_i += 1;
             }
         }
     }
-    let page_rets = page_ssas
-        .iter()
-        .map(|s| format!("%{s}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let page_tys = std::iter::repeat(page_ty.as_str())
-        .take(num_pages as usize)
-        .collect::<Vec<_>>()
-        .join(", ");
-    // Device argmax so the host can D2H a single i64 when repetition penalty is off.
-    // Use a linalg reduction (not scf.for+extract) — the latter serializes the full
-    // vocab on GPU and destroys decode throughput.
+    pack.push_str(&format!(
+        "  %wp_out = linalg.copy ins(%{wp_ssa} : {wp_ty}) outs(%write_pages : {wp_ty}) -> {wp_ty}\n\
+         %wf_out = linalg.copy ins(%{wf_ssa} : {wf_ty}) outs(%write_flats : {wf_ty}) -> {wf_ty}\n"
+    ));
+    let wp_ssa = String::from("wp_out");
+    let wf_ssa = String::from("wf_out");
     f.op_asm(format!(
         r#"  %logits = func.call @{logits_fn}(%last) : (tensor<i64>) -> tensor<{v}xf32>
   %neg_inf = arith.constant 0xFF800000 : f32
@@ -654,7 +812,7 @@ fn emit_paged_fused_chunk(
   %tok = tensor.extract %best_i[] : tensor<i64>
   %tok_e = tensor.empty() : tensor<i64>
   %tok_t = tensor.insert %tok into %tok_e[] : tensor<i64>
-  return %logits, {page_rets}, %tok_t : tensor<{v}xf32>, {page_tys}, tensor<i64>"#
+{pack}  return %logits, %{wp_ssa}, %{wf_ssa}, %tok_t : tensor<{v}xf32>, {wp_ty}, {wf_ty}, tensor<i64>"#
     ));
     f.finish(module)
 }
@@ -872,55 +1030,29 @@ fn emit_paged_layer_prepare(
     f.finish(module)
 }
 
-fn emit_paged_layer_page(
+fn emit_paged_layer_store(
     module: &mut ModuleBuilder,
     c: &DenseDecoderConfig,
     variant: PagedVariant,
 ) -> Result<()> {
-    let (s, nkv, g, d, layers, page) = (
-        c.seq,
-        c.num_kv_heads,
-        c.gqa_group(),
-        c.head_dim,
-        c.num_layers,
-        c.page_size,
-    );
-    let qg_ty = format!("tensor<{nkv}x{g}x{s}x{d}xf32>");
+    let (s, nkv, d, page) = (c.seq, c.num_kv_heads, c.head_dim, c.page_size);
+    let kv_ty = format!("tensor<2x{page}x{nkv}x{d}xf32>");
     let kv3_ty = format!("tensor<{s}x{nkv}x{d}xf32>");
-    let row_ty = format!("tensor<{nkv}x{g}x{s}xf32>");
-    let mask_ty = format!("tensor<{nkv}x{g}x{s}x{page}xf32>");
-    let page_ty = format!("tensor<{layers}x2x{page}x{nkv}x{d}xf32>");
-    let expanded_ty = format!("tensor<1x1x{page}x{nkv}x{d}xf32>");
-    let page_slice_ty = format!("tensor<1x1x{page}x{nkv}x{d}xf32>");
-    let page_seq_ty = format!("tensor<{page}x{nkv}x{d}xf32>");
-    let page_head_ty = format!("tensor<{nkv}x{page}x{d}xf32>");
-    let scale_ty = if c.iree_flash_attention { "f16" } else { "f32" };
-    let mask_helper = variant.helper("paged_causal_mask");
-    let attention_helper = variant.helper("online_attention_page");
-    let mut f = module.func_private(&variant.function("layer_page"));
-    f.arg("page", &page_ty);
-    f.arg("page_index", "tensor<i64>");
-    f.arg("start_pos", "tensor<i64>");
-    f.arg("layer_index", "tensor<i64>");
-    f.arg("query", &qg_ty);
-    f.arg("chunk_k", &kv3_ty);
-    f.arg("chunk_v", &kv3_ty);
-    f.arg("valid_t", "tensor<i64>");
-    f.arg("out", &qg_ty);
-    f.arg("max", &row_ty);
-    f.arg("sum", &row_ty);
-    f.result_ty(&page_ty);
-    f.result_ty(&qg_ty);
-    f.result_ty(&row_ty);
-    f.result_ty(&row_ty);
-    f.op_asm(format!(
-        r#"  %pi64 = tensor.extract %page_index[] : tensor<i64>
+    let seq_m1 = s.saturating_sub(1);
+    let name = variant.function("layer_store");
+    let attrs = " attributes {noinline}".to_string();
+    // Overlay into a fresh empty tensor. Never insert_slice into a page that
+    // originated as an extract from the imported pool (HIP/CPU DMA OOB).
+    module.append_toplevel_asm(&format!(
+        r#"func.func private @{name}(%kv: {kv_ty}, %page_index: tensor<i64>, %start_pos: tensor<i64>, %chunk_k: {kv3_ty}, %chunk_v: {kv3_ty}, %valid_t: tensor<i64>) -> {kv_ty}{attrs} {{
+  %pi64 = tensor.extract %page_index[] : tensor<i64>
   %start64 = tensor.extract %start_pos[] : tensor<i64>
-  %layer64 = tensor.extract %layer_index[] : tensor<i64>
   %pi = arith.index_cast %pi64 : i64 to index
   %start = arith.index_cast %start64 : i64 to index
-  %layer = arith.index_cast %layer64 : i64 to index
   %page_size = arith.constant {page} : index
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %cseq_m1 = arith.constant {seq_m1} : index
   %page_start = arith.muli %pi, %page_size : index
   %page_end = arith.addi %page_start, %page_size : index
   %valid64 = tensor.extract %valid_t[] : tensor<i64>
@@ -929,34 +1061,89 @@ fn emit_paged_layer_page(
   %starts_before_chunk_end = arith.cmpi ult, %page_start, %chunk_end : index
   %ends_after_chunk_start = arith.cmpi ugt, %page_end, %start : index
   %intersects = arith.andi %starts_before_chunk_end, %ends_after_chunk_start : i1
-  %page_updated = scf.if %intersects -> ({page_ty}) {{
-    %old_ks = tensor.extract_slice %page[%layer, 0, 0, 0, 0] [1, 1, {page}, {nkv}, {d}] [1, 1, 1, 1, 1] : {page_ty} to {page_slice_ty}
-    %old_vs = tensor.extract_slice %page[%layer, 1, 0, 0, 0] [1, 1, {page}, {nkv}, {d}] [1, 1, 1, 1, 1] : {page_ty} to {page_slice_ty}
-    %old_k = tensor.collapse_shape %old_ks [[0, 1, 2], [3], [4]] : {page_slice_ty} into {page_seq_ty}
-    %old_v = tensor.collapse_shape %old_vs [[0, 1, 2], [3], [4]] : {page_slice_ty} into {page_seq_ty}
-    // Contiguous overlap write — avoids `linalg.index` → `vector.step` hazards
-    // inside this fused module.
-    %ov_lo = arith.maxui %page_start, %start : index
-    %ov_hi = arith.minui %page_end, %chunk_end : index
-    %ov_len = arith.subi %ov_hi, %ov_lo : index
-    %dst = arith.subi %ov_lo, %page_start : index
-    %src = arith.subi %ov_lo, %start : index
-    %k_src = tensor.extract_slice %chunk_k[%src, 0, 0] [%ov_len, {nkv}, {d}] [1, 1, 1] : {kv3_ty} to tensor<?x{nkv}x{d}xf32>
-    %v_src = tensor.extract_slice %chunk_v[%src, 0, 0] [%ov_len, {nkv}, {d}] [1, 1, 1] : {kv3_ty} to tensor<?x{nkv}x{d}xf32>
-    %new_k = tensor.insert_slice %k_src into %old_k[%dst, 0, 0] [%ov_len, {nkv}, {d}] [1, 1, 1] : tensor<?x{nkv}x{d}xf32> into {page_seq_ty}
-    %new_v = tensor.insert_slice %v_src into %old_v[%dst, 0, 0] [%ov_len, {nkv}, {d}] [1, 1, 1] : tensor<?x{nkv}x{d}xf32> into {page_seq_ty}
-    %ke = tensor.expand_shape %new_k [[0, 1, 2], [3], [4]] output_shape [1, 1, {page}, {nkv}, {d}] : {page_seq_ty} into {expanded_ty}
-    %ve = tensor.expand_shape %new_v [[0, 1, 2], [3], [4]] output_shape [1, 1, {page}, {nkv}, {d}] : {page_seq_ty} into {expanded_ty}
-    %pk = tensor.insert_slice %ke into %page[%layer, 0, 0, 0, 0] [1, 1, {page}, {nkv}, {d}] [1, 1, 1, 1, 1] : {expanded_ty} into {page_ty}
-    %pv = tensor.insert_slice %ve into %pk[%layer, 1, 0, 0, 0] [1, 1, {page}, {nkv}, {d}] [1, 1, 1, 1, 1] : {expanded_ty} into {page_ty}
-    scf.yield %pv : {page_ty}
+  %kv_e = tensor.empty() : {kv_ty}
+  %kv_updated = scf.if %intersects -> ({kv_ty}) {{
+    %new = linalg.generic {{
+        indexing_maps = [affine_map<(pl, p, h, dd) -> (pl, p, h, dd)>, affine_map<(pl, p, h, dd) -> (pl, p, h, dd)>],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]}}
+      ins(%kv : {kv_ty}) outs(%kv_e : {kv_ty}) {{
+      ^bb0(%old: f32, %o: f32):
+        %pl = linalg.index 0 : index
+        %pp = linalg.index 1 : index
+        %hh = linalg.index 2 : index
+        %dd = linalg.index 3 : index
+        %abs = arith.addi %page_start, %pp : index
+        %ge = arith.cmpi uge, %abs, %start : index
+        %lt = arith.cmpi ult, %abs, %chunk_end : index
+        %hit = arith.andi %ge, %lt : i1
+        %si0 = arith.subi %abs, %start : index
+        %si1 = arith.select %hit, %si0, %c0 : index
+        %si = arith.minui %si1, %cseq_m1 : index
+        %tokk = tensor.extract %chunk_k[%si, %hh, %dd] : {kv3_ty}
+        %tokv = tensor.extract %chunk_v[%si, %hh, %dd] : {kv3_ty}
+        %is_v = arith.cmpi eq, %pl, %c1 : index
+        %tok = arith.select %is_v, %tokv, %tokk : f32
+        %val = arith.select %hit, %tok, %old : f32
+        linalg.yield %val : f32
+    }} -> {kv_ty}
+    scf.yield %new : {kv_ty}
   }} else {{
-    scf.yield %page : {page_ty}
+    %keep = linalg.generic {{
+        indexing_maps = [affine_map<(pl, p, h, dd) -> (pl, p, h, dd)>, affine_map<(pl, p, h, dd) -> (pl, p, h, dd)>],
+        iterator_types = ["parallel", "parallel", "parallel", "parallel"]}}
+      ins(%kv : {kv_ty}) outs(%kv_e : {kv_ty}) {{
+      ^bb0(%old: f32, %o: f32):
+        linalg.yield %old : f32
+    }} -> {kv_ty}
+    scf.yield %keep : {kv_ty}
   }}
-  %ks = tensor.extract_slice %page_updated[%layer, 0, 0, 0, 0] [1, 1, {page}, {nkv}, {d}] [1, 1, 1, 1, 1] : {page_ty} to {page_slice_ty}
-  %vs = tensor.extract_slice %page_updated[%layer, 1, 0, 0, 0] [1, 1, {page}, {nkv}, {d}] [1, 1, 1, 1, 1] : {page_ty} to {page_slice_ty}
-  %kseq = tensor.collapse_shape %ks [[0, 1, 2], [3], [4]] : {page_slice_ty} into {page_seq_ty}
-  %vseq = tensor.collapse_shape %vs [[0, 1, 2], [3], [4]] : {page_slice_ty} into {page_seq_ty}
+  return %kv_updated : {kv_ty}
+}}
+"#
+    ))
+}
+
+fn emit_paged_layer_page(
+    module: &mut ModuleBuilder,
+    c: &DenseDecoderConfig,
+    variant: PagedVariant,
+) -> Result<()> {
+    let (s, nkv, g, d, page) = (
+        c.seq,
+        c.num_kv_heads,
+        c.gqa_group(),
+        c.head_dim,
+        c.page_size,
+    );
+    let qg_ty = format!("tensor<{nkv}x{g}x{s}x{d}xf32>");
+    let row_ty = format!("tensor<{nkv}x{g}x{s}xf32>");
+    let mask_ty = format!("tensor<{nkv}x{g}x{s}x{page}xf32>");
+    let kv_ty = format!("tensor<2x{page}x{nkv}x{d}xf32>");
+    let k1_ty = format!("tensor<1x{page}x{nkv}x{d}xf32>");
+    let page_seq_ty = format!("tensor<{page}x{nkv}x{d}xf32>");
+    let page_head_ty = format!("tensor<{nkv}x{page}x{d}xf32>");
+    let scale_ty = if c.iree_flash_attention { "f16" } else { "f32" };
+    let mask_helper = variant.helper("paged_causal_mask");
+    let attention_helper = variant.helper("online_attention_page");
+    let mut f = module.func_private(&variant.function("layer_page"));
+    f.arg("kv", &kv_ty);
+    f.arg("page_index", "tensor<i64>");
+    f.arg("start_pos", "tensor<i64>");
+    f.arg("query", &qg_ty);
+    f.arg("valid_t", "tensor<i64>");
+    f.arg("out", &qg_ty);
+    f.arg("max", &row_ty);
+    f.arg("sum", &row_ty);
+    f.result_ty(&qg_ty);
+    f.result_ty(&row_ty);
+    f.result_ty(&row_ty);
+    f.op_asm(format!(
+        r#"  %pi64 = tensor.extract %page_index[] : tensor<i64>
+  %pi = arith.index_cast %pi64 : i64 to index
+  %ks = tensor.extract_slice %kv[0, 0, 0, 0] [1, {page}, {nkv}, {d}] [1, 1, 1, 1] : {kv_ty} to {k1_ty}
+  %vs = tensor.extract_slice %kv[1, 0, 0, 0] [1, {page}, {nkv}, {d}] [1, 1, 1, 1] : {kv_ty} to {k1_ty}
+  %kseq = tensor.collapse_shape %ks [[0, 1], [2], [3]] : {k1_ty} into {page_seq_ty}
+  %vseq = tensor.collapse_shape %vs [[0, 1], [2], [3]] : {k1_ty} into {page_seq_ty}
   %ke2 = tensor.empty() : {page_head_ty}
   %ve2 = tensor.empty() : {page_head_ty}
   %kh = linalg.transpose ins(%kseq : {page_seq_ty}) outs(%ke2 : {page_head_ty}) permutation = [1, 0, 2]
@@ -964,7 +1151,7 @@ fn emit_paged_layer_page(
   %mask = func.call @{mask_helper}(%start_pos, %pi, %valid_t) : (tensor<i64>, index, tensor<i64>) -> {mask_ty}
   %scale = arith.constant {scale:.8e} : {scale_ty}
   %next:3 = func.call @{attention_helper}(%query, %kh, %vh, %scale, %mask, %out, %max, %sum) : ({qg_ty}, {page_head_ty}, {page_head_ty}, {scale_ty}, {mask_ty}, {qg_ty}, {row_ty}, {row_ty}) -> ({qg_ty}, {row_ty}, {row_ty})
-  return %page_updated, %next#0, %next#1, %next#2 : {page_ty}, {qg_ty}, {row_ty}, {row_ty}"#,
+  return %next#0, %next#1, %next#2 : {qg_ty}, {row_ty}, {row_ty}"#,
         scale = 1.0 / (d as f32).sqrt(),
     ));
     f.finish(module)
@@ -1855,7 +2042,13 @@ fn emit_paged_state_globals(
     c: &DenseDecoderConfig,
     variant: PagedVariant,
 ) -> Result<()> {
-    let (s, h, nkv, g, d) = (c.seq, c.hidden, c.num_kv_heads, c.gqa_group(), c.head_dim);
+    let (s, h, nkv, g, d) = (
+        c.seq,
+        c.hidden,
+        c.num_kv_heads,
+        c.gqa_group(),
+        c.head_dim,
+    );
     builder.util_global_mutable_zero(&variant.global("hidden"), &format!("tensor<{s}x{h}xf32>"))?;
     builder.util_global_mutable_zero(
         &variant.global("query"),
@@ -3456,19 +3649,42 @@ mod tests {
         assert!(c.is_synthetic_fixture());
         c.paged_kv = true;
         c.max_kv = 1024;
-        c.page_size = paged_kv_page_size_for(1024);
+        c.page_size = PAGED_KV_PAGE_SIZE;
         let mlir = emit_dense_decoder_cfg("test.paged", &c).expect("paged MLIR verifies");
         assert!(mlir.contains("@prefill_chunk"));
         assert!(mlir.contains("@decode_chunk"));
         assert!(mlir.contains("func.func private @layer_page"));
+        assert!(mlir.contains("func.func private @layer_store"));
         assert!(!mlir.contains("!util.list<!hal.buffer_view>"));
         assert!(
             mlir.contains("iree.abi.output = 0 : index"),
             "paged chunk should take caller-owned logits via abi.output"
         );
         assert!(
-            mlir.contains("iree.abi.output = 1 : index"),
-            "paged chunk should take caller-owned pages via abi.output"
+            mlir.contains("iree.abi.output = 1 : index")
+                && mlir.contains("iree.abi.output = 2 : index"),
+            "write_pages/write_flats are caller-owned abi.output dests; kv_pool is a read-only input"
+        );
+        assert!(
+            !mlir.contains("iree.abi.output = 3 : index"),
+            "kv_pool must not be abi.output (HIP overlapping clone)"
+        );
+        assert!(
+            mlir.contains("@page_extract") && mlir.contains("@decode_page_extract"),
+            "historical pages must be cloned out of the imported pool"
+        );
+        assert!(
+            mlir.contains("@fused_attn_0") && mlir.contains("@decode_fused_attn_0"),
+            "each attention layer must be a noinline fused_attn so IREE can compile many layers"
+        );
+        assert!(
+            mlir.contains("tensor.insert_slice") && mlir.contains("@decode_layer_store"),
+            "writes pack into caller-owned deltas; decode overlays hist into a fresh page"
+        );
+        // SSA names are rewritten on module round-trip; assert shape/arity instead.
+        assert!(
+            !mlir.contains("%page0:") && !mlir.contains("%page1:"),
+            "ABI v7 must not expose per-page function arguments"
         );
         assert!(
             mlir.contains("linalg.generic")
@@ -3480,6 +3696,20 @@ mod tests {
         assert!(mlir.contains("@paged_attn_max") || mlir.contains("@paged_decode_attn_max"));
         assert!(mlir.contains("@chunk_begin"));
         assert!(!mlir.contains("tensor<4x4096x4096"));
+        // 1024/256 = 4 pages; 1 layer → rank-5 [N*L, 2, page, nkv, d].
+        assert!(
+            mlir.contains("tensor<4x2x256x4x16xf32>"),
+            "kv_pool should be packed as [num_pages*layers, 2, page, nkv, d]"
+        );
+        assert!(
+            mlir.contains("tensor<2x2x256x4x16xf32>")
+                && mlir.contains("tensor<2xi64>"),
+            "paged chunk should return page-sized write deltas for the runtime to scatter"
+        );
+        assert!(
+            !mlir.contains("@pool_seed") && !mlir.contains("@pool_insert"),
+            "must not rewrite the imported packed pool in the compiler"
+        );
         crate::compile_mlir_prefer_inprocess(
             &mlir,
             &dyninfer_core::TargetProfile::llvm_cpu_host(),
@@ -3487,6 +3717,83 @@ mod tests {
             None,
         )
         .expect("paged MLIR compiles through IREE");
+    }
+
+    #[test]
+    fn paged_pool_abi_scales_to_32k_capacity() {
+        // Regression: ABI v6 used N page args (N≈129 at 32k) and thrashed IREE.
+        // v7 packs pages into one kv_pool; arity stays O(1).
+        let c = DenseDecoderConfig {
+            vocab: 32,
+            hidden: 64,
+            conv_dim: 64,
+            conv_kernel: 3,
+            intermediate: 128,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 16,
+            num_layers: 1,
+            seq: PAGED_PREFILL_CHUNK_SIZE.min(512),
+            max_kv: 33_024,
+            page_size: PAGED_KV_PAGE_SIZE,
+            paged_kv: true,
+            iree_flash_attention: false,
+            rms_norm_eps: 1e-5,
+            rope_theta: None,
+            has_qk_norm: false,
+            param_keys: BTreeMap::new(),
+            param_dtypes: BTreeMap::new(),
+            param_compute_dtypes: BTreeMap::new(),
+            param_bindings: BTreeMap::new(),
+            param_lowerings: BTreeMap::new(),
+            resolved_layer_types: BTreeMap::new(),
+        };
+        assert!(c.supports_dense_emit());
+        let num_pages = c.max_kv.div_ceil(PAGED_KV_PAGE_SIZE);
+        assert_eq!(num_pages, 129);
+        let mlir = emit_dense_decoder_cfg("test.paged32k", &c).expect("32k paged MLIR verifies");
+        let pool_ty = format!(
+            "tensor<{}x2x{}x{}x{}xf32>",
+            num_pages * c.num_layers,
+            PAGED_KV_PAGE_SIZE,
+            c.num_kv_heads,
+            c.head_dim
+        );
+        assert!(
+            mlir.contains(&pool_ty),
+            "expected packed pool type {pool_ty}"
+        );
+        assert!(!mlir.contains("%page0:"));
+        assert!(
+            mlir.contains("iree.abi.output = 1 : index")
+                && mlir.contains("iree.abi.output = 2 : index"),
+            "write deltas use abi.output 1/2; kv_pool stays a read-only input"
+        );
+        assert!(
+            !mlir.contains("iree.abi.output = 3 : index"),
+            "must not mark the imported pool as abi.output"
+        );
+        assert!(
+            mlir.contains("scf.for"),
+            "page walk must be an scf.for (not unrolled) for large max_kv"
+        );
+        assert!(
+            mlir.contains("ceildivui") || mlir.contains("page_hi"),
+            "page walk must bound to filled prefix, not full capacity"
+        );
+        let t0 = std::time::Instant::now();
+        crate::compile_mlir_prefer_inprocess(
+            &mlir,
+            &dyninfer_core::TargetProfile::llvm_cpu_host(),
+            false,
+            None,
+        )
+        .expect("32k-capacity packed pool MLIR compiles through IREE");
+        let secs = t0.elapsed().as_secs_f64();
+        assert!(
+            secs < 60.0,
+            "32k packed+looped compile took {secs:.1}s (expected <60s)"
+        );
     }
 
     #[test]
@@ -3729,16 +4036,119 @@ mod tests {
     }
 
     #[test]
-    fn page_size_scales_to_cap_arity() {
-        assert_eq!(paged_kv_page_size_for(1024), PAGED_KV_PAGE_SIZE);
-        assert_eq!(paged_kv_page_size_for(8192), PAGED_KV_PAGE_SIZE);
-        let p32k = paged_kv_page_size_for(33_024);
-        assert!(p32k >= PAGED_PREFILL_CHUNK_SIZE);
-        assert_eq!(p32k % PAGED_PREFILL_CHUNK_SIZE, 0);
-        let pages = 33_024u32.div_ceil(p32k);
-        assert!(
-            pages <= PAGED_KV_MAX_PAGES,
-            "33k context should stay within {PAGED_KV_MAX_PAGES} pages, got {pages} (page={p32k})"
-        );
+    fn paged_eight_layer_prefill_emits() {
+        let c = DenseDecoderConfig {
+            vocab: 32,
+            hidden: 64,
+            conv_dim: 64,
+            conv_kernel: 3,
+            intermediate: 128,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 16,
+            num_layers: 8,
+            seq: PAGED_PREFILL_CHUNK_SIZE,
+            max_kv: 1024,
+            page_size: PAGED_KV_PAGE_SIZE,
+            paged_kv: true,
+            iree_flash_attention: false,
+            rms_norm_eps: 1e-5,
+            rope_theta: None,
+            has_qk_norm: false,
+            param_keys: BTreeMap::new(),
+            param_dtypes: BTreeMap::new(),
+            param_compute_dtypes: BTreeMap::new(),
+            param_bindings: BTreeMap::new(),
+            param_lowerings: BTreeMap::new(),
+            resolved_layer_types: BTreeMap::new(),
+        };
+        emit_dense_decoder_cfg_program("test.paged8", &c, PagedProgram::Prefill)
+            .expect("8-layer paged prefill MLIR verifies");
+        let mut decode = c.clone();
+        decode.seq = 1;
+        emit_dense_decoder_cfg_program("test.paged8d", &decode, PagedProgram::Decode)
+            .expect("8-layer paged decode MLIR verifies");
+        let mlir8 = emit_dense_decoder_cfg_program("test.paged8c", &c, PagedProgram::Prefill)
+            .expect("8-layer emit");
+        crate::compile_mlir_prefer_inprocess(
+            &mlir8,
+            &dyninfer_core::TargetProfile::llvm_cpu_host(),
+            false,
+            None,
+        )
+        .expect("8-layer paged prefill compiles");
+    }
+
+    #[test]
+    fn paged_eight_layer_large_kv_capacities_compile() {
+        let mut c = DenseDecoderConfig {
+            vocab: 32,
+            hidden: 64,
+            conv_dim: 64,
+            conv_kernel: 3,
+            intermediate: 128,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 16,
+            num_layers: 8,
+            seq: PAGED_PREFILL_CHUNK_SIZE,
+            max_kv: 1024,
+            page_size: PAGED_KV_PAGE_SIZE,
+            paged_kv: true,
+            iree_flash_attention: false,
+            rms_norm_eps: 1e-5,
+            rope_theta: None,
+            has_qk_norm: false,
+            param_keys: BTreeMap::new(),
+            param_dtypes: BTreeMap::new(),
+            param_compute_dtypes: BTreeMap::new(),
+            param_bindings: BTreeMap::new(),
+            param_lowerings: BTreeMap::new(),
+            resolved_layer_types: BTreeMap::new(),
+        };
+        for max_kv in [4096u32, 16_384, 32_768] {
+            c.max_kv = max_kv;
+            let pages = max_kv.div_ceil(PAGED_KV_PAGE_SIZE);
+            let mlir = emit_dense_decoder_cfg_program(
+                &format!("test.paged8_{max_kv}"),
+                &c,
+                PagedProgram::Prefill,
+            )
+            .unwrap_or_else(|e| panic!("{max_kv} prefill emit: {e}"));
+            assert!(
+                mlir.contains(&format!("tensor<{}x2x256x4x16xf32>", pages * 8)),
+                "{max_kv}: expected pool rows {}",
+                pages * 8
+            );
+            crate::compile_mlir_prefer_inprocess(
+                &mlir,
+                &dyninfer_core::TargetProfile::llvm_cpu_host(),
+                false,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{max_kv} prefill compile: {e}"));
+            let mut decode = c.clone();
+            decode.seq = 1;
+            let dmlir = emit_dense_decoder_cfg_program(
+                &format!("test.paged8d_{max_kv}"),
+                &decode,
+                PagedProgram::Decode,
+            )
+            .unwrap_or_else(|e| panic!("{max_kv} decode emit: {e}"));
+            crate::compile_mlir_prefer_inprocess(
+                &dmlir,
+                &dyninfer_core::TargetProfile::llvm_cpu_host(),
+                false,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{max_kv} decode compile: {e}"));
+        }
+    }
+
+    #[test]
+    fn packed_pool_keeps_fixed_page_size() {
+        // ABI v7 arity is O(1); page length stays 256 even at 32k capacity.
+        assert_eq!(PAGED_KV_PAGE_SIZE, 256);
+        assert_eq!(33_024u32.div_ceil(PAGED_KV_PAGE_SIZE), 129);
     }
 }
