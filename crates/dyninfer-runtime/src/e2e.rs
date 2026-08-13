@@ -585,7 +585,7 @@ mod tests {
             )
             .unwrap();
         let model = loader.load_bundle(&bundle, &ckpt).unwrap();
-        assert_eq!(model.manifest.version, 7);
+        assert_eq!(model.manifest.version, 8);
         assert!(
             model.manifest.prefill_window == 512 || model.manifest.prefill_window == 64,
             "unexpected prefill_window {}",

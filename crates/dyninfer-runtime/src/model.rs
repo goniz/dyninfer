@@ -36,7 +36,7 @@ fn validate_executable_abi(manifest: &ExecutableManifest, bundle: &Path) -> Resu
                 page_size,
                 chunk_size,
             },
-            6 | 7,
+            6 | 7 | 8,
         ) if *page_size > 0 && *chunk_size > 0 => &["prefill_chunk", "decode_chunk"],
         _ => {
             return Err(DynInferError::Cache(CacheError {
@@ -368,7 +368,7 @@ impl ModelLoader {
         let vmfb_path = bundle.join("executables").join("model.vmfb");
         let manifest: ExecutableManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
         let decode_vmfb_path =
-            (manifest.version == 6 || manifest.version == 7)
+            (manifest.version == 6 || manifest.version == 7 || manifest.version == 8)
                 .then(|| bundle.join("executables").join("decode.vmfb"));
         let decode_vmfb_path = decode_vmfb_path.filter(|path| path.is_file());
         // Hybrid paged (short-conv) ships a single combined VMFB; attention-only

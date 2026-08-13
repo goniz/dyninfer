@@ -475,7 +475,7 @@ mod tests {
             )
             .unwrap();
         let model = loader.load_bundle(&bundle, &ckpt).unwrap();
-        assert_eq!(model.manifest.version, 7);
+        assert_eq!(model.manifest.version, 8);
         let mut session = model
             .create_session(SessionConfig {
                 max_sequence_length: 4224,
@@ -630,7 +630,7 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("compile paged Qwen3 on {target}: {error}"));
         let model = loader.load_bundle(&bundle, &ckpt).unwrap();
-        assert_eq!(model.manifest.version, 7);
+        assert_eq!(model.manifest.version, 8);
         assert!(model.manifest.prefill_window >= 256);
 
         let tokenizer = load_tokenizer(&model_dir).unwrap();
