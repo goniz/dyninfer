@@ -80,11 +80,10 @@ int dyninfer_iree_session_invoke_decode(dyninfer_iree_session_t* session,
                                         const float* attn_bias, size_t bias_len,
                                         float** out_logits, size_t* out_count);
 
-// Paged KV ABI v8: one compact hist per layer
+// Paged KV ABI v9: one compact hist per layer
 // [num_pages, 2, page_size, kv_heads, head_dim]. Prefill/decode chunk
-// entrypoints take caller-owned logits via iree.abi.output. Each layer hist
-// is a read-only input; page writes come back as a small delta tensor that
-// the runtime scatters with D2D copies (HIP clones imported buffers whole).
+// entrypoints take caller-owned logits and each layer hist via
+// iree.abi.output. fused_attn writes pages in-graph (no write-delta scatter).
 int dyninfer_iree_session_configure_paged_kv(
     dyninfer_iree_session_t* session, size_t layer_count, size_t page_size,
     size_t kv_head_count, size_t head_dim, size_t chunk_size,

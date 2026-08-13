@@ -56,8 +56,8 @@ struct dyninfer_iree_session_t {
   size_t paged_write_n;
   float* logits_host;
   size_t logits_capacity;
-  // ABI v8: one compact hist per layer [pages, 2, page, nkv, d]. HIP clones
-  // each imported input whole; a packed pool made decode copy L×pool bytes.
+  // ABI v9: one tied hist per layer [pages, 2, page, nkv, d]. fused_attn
+  // writes pages in-graph; HIP must not snapshot-clone a read-only import.
   iree_hal_buffer_view_t* kv_layers[DYNINFER_MAX_PAGED_LAYERS];
   size_t kv_layer_n;
   size_t kv_page_count;
@@ -69,6 +69,8 @@ struct dyninfer_iree_session_t {
   size_t kv_vocab_size;
   size_t kv_allocated_bytes;
   bool split_modules;
+  uint64_t hist_alias_n;
+  uint64_t hist_clone_n;
 };
 
 static char g_last_error[2048] = {0};
@@ -575,6 +577,12 @@ static iree_status_t invoke_with_cached_call(
 
 void dyninfer_iree_session_destroy(dyninfer_iree_session_t* session) {
   if (!session) return;
+  if (getenv("DYNINFER_PAGED_HIST_DEBUG") &&
+      (session->hist_alias_n != 0 || session->hist_clone_n != 0)) {
+    fprintf(stderr, "paged hist alias=%llu clone=%llu\n",
+            (unsigned long long)session->hist_alias_n,
+            (unsigned long long)session->hist_clone_n);
+  }
   cached_call_release(&session->call_add);
   cached_call_release(&session->call_prefill);
   cached_call_release(&session->call_decode);
@@ -873,63 +881,6 @@ int dyninfer_iree_session_ensure_kv_pages(dyninfer_iree_session_t* session,
   return 0;
 }
 
-static size_t paged_n_writes(const dyninfer_iree_session_t* session, bool is_decode) {
-  const size_t seq = is_decode ? 1u : session->kv_chunk_size;
-  const size_t page = session->kv_page_size;
-  size_t max_writes = 1;
-  if (page > 0) {
-    max_writes = (seq + page - 1) / page + 1;
-    if (max_writes < 1) max_writes = 1;
-  }
-  size_t n = max_writes * session->kv_layer_count;
-  return n < 1 ? 1 : n;
-}
-
-static iree_status_t ensure_paged_write_bufs(dyninfer_iree_session_t* session,
-                                             bool is_decode) {
-  const size_t n = paged_n_writes(session, is_decode);
-  if (session->paged_write_pages && session->paged_write_flats &&
-      session->paged_write_n == n) {
-    return iree_ok_status();
-  }
-  iree_hal_buffer_view_release(session->paged_write_pages);
-  iree_hal_buffer_view_release(session->paged_write_flats);
-  session->paged_write_pages = NULL;
-  session->paged_write_flats = NULL;
-  session->paged_write_n = 0;
-
-  const size_t row_elems = 2 * session->kv_page_size * session->kv_head_count *
-                           session->kv_head_dim;
-  if (row_elems == 0 || n > SIZE_MAX / row_elems) {
-    return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED, "write_pages size");
-  }
-  const size_t page_elems = n * row_elems;
-  iree_hal_dim_t page_shape[5] = {
-      (iree_hal_dim_t)n, 2, (iree_hal_dim_t)session->kv_page_size,
-      (iree_hal_dim_t)session->kv_head_count,
-      (iree_hal_dim_t)session->kv_head_dim};
-  IREE_RETURN_IF_ERROR(allocate_empty_f32_tensor(
-      session->session, 5, page_shape, page_elems, &session->paged_write_pages));
-
-  int64_t* zeros = (int64_t*)calloc(n, sizeof(int64_t));
-  if (!zeros) {
-    iree_hal_buffer_view_release(session->paged_write_pages);
-    session->paged_write_pages = NULL;
-    return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED, "write_flats zeros");
-  }
-  iree_hal_dim_t flat_shape[1] = {(iree_hal_dim_t)n};
-  iree_status_t status = allocate_i64_tensor(
-      session->session, 1, flat_shape, zeros, n, &session->paged_write_flats);
-  free(zeros);
-  if (!iree_status_is_ok(status)) {
-    iree_hal_buffer_view_release(session->paged_write_pages);
-    session->paged_write_pages = NULL;
-    return status;
-  }
-  session->paged_write_n = n;
-  return iree_ok_status();
-}
-
 static iree_status_t ensure_paged_logits(dyninfer_iree_session_t* session) {
   if (session->paged_logits) return iree_ok_status();
   if (session->kv_vocab_size == 0) {
@@ -963,118 +914,18 @@ static iree_status_t copy_i64_scalar_view_to_host(iree_runtime_session_t* sessio
       iree_infinite_timeout());
 }
 
-static char g_paged_detail[256] = {0};
-
-static iree_status_t scatter_kv_writes(dyninfer_iree_session_t* wrapper,
-                                       iree_hal_buffer_view_t* pages_view,
-                                       iree_hal_buffer_view_t* flats_view) {
-  if (wrapper->kv_layer_n == 0) {
-    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
-                            "paged KV hist is not allocated");
-  }
-  if (iree_hal_buffer_view_shape_rank(pages_view) != 5) {
-    snprintf(g_paged_detail, sizeof(g_paged_detail), "scatter rank=%zu",
-             (size_t)iree_hal_buffer_view_shape_rank(pages_view));
-    g_paged_step = g_paged_detail;
-    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                            "write_pages must be rank-5");
-  }
-  const size_t n_writes =
-      (size_t)iree_hal_buffer_view_shape_dim(pages_view, 0);
-  const size_t row_elems = 2 * wrapper->kv_page_size *
-                           wrapper->kv_head_count * wrapper->kv_head_dim;
-  const iree_device_size_t row_bytes =
-      (iree_device_size_t)(row_elems * sizeof(float));
-  const size_t pool_rows = wrapper->kv_page_count * wrapper->kv_layer_count;
-  const iree_device_size_t pages_bytes =
-      iree_hal_buffer_view_byte_length(pages_view);
-  const iree_device_size_t flats_bytes =
-      iree_hal_buffer_view_byte_length(flats_view);
-  if (pages_bytes != row_bytes * (iree_device_size_t)n_writes) {
-    snprintf(g_paged_detail, sizeof(g_paged_detail),
-             "scatter pages_bytes=%zu row=%zu n=%zu", (size_t)pages_bytes,
-             (size_t)row_bytes, n_writes);
-    g_paged_step = g_paged_detail;
-    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                            "write_pages byte length mismatch");
-  }
-  if (flats_bytes != n_writes * sizeof(int64_t)) {
-    snprintf(g_paged_detail, sizeof(g_paged_detail),
-             "scatter flats_bytes=%zu n=%zu", (size_t)flats_bytes, n_writes);
-    g_paged_step = g_paged_detail;
-    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                            "write_flats byte length mismatch");
-  }
-
-  int64_t stack_flats[32];
-  int64_t* flats = stack_flats;
-  int64_t* heap_flats = NULL;
-  if (n_writes > 32) {
-    heap_flats = (int64_t*)malloc(n_writes * sizeof(int64_t));
-    if (!heap_flats) {
-      return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED, "write_flats");
-    }
-    flats = heap_flats;
-  }
-  iree_status_t status = iree_hal_device_transfer_d2h(
-      iree_runtime_session_device(wrapper->session),
-      iree_hal_buffer_view_buffer(flats_view), 0, flats,
-      n_writes * sizeof(int64_t), IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT,
-      iree_infinite_timeout());
-  if (!iree_status_is_ok(status)) {
-    snprintf(g_paged_detail, sizeof(g_paged_detail), "scatter d2h flats n=%zu",
-             n_writes);
-    g_paged_step = g_paged_detail;
-    free(heap_flats);
-    return status;
-  }
-
-  iree_hal_buffer_t* src = iree_hal_buffer_view_buffer(pages_view);
-  iree_hal_device_t* device = iree_runtime_session_device(wrapper->session);
-  const size_t pages = wrapper->kv_page_count;
-  for (size_t w = 0; w < n_writes && iree_status_is_ok(status); ++w) {
-    const int64_t flat = flats[w];
-    if (flat < 0 || (size_t)flat >= pool_rows) {
-      snprintf(g_paged_detail, sizeof(g_paged_detail),
-               "scatter w=%zu flat=%lld pool_rows=%zu n=%zu", w,
-               (long long)flat, pool_rows, n_writes);
-      g_paged_step = g_paged_detail;
-      status = iree_make_status(IREE_STATUS_OUT_OF_RANGE,
-                                "write flat index %lld", (long long)flat);
-      break;
-    }
-    const size_t layer = (size_t)flat / pages;
-    const size_t row = (size_t)flat % pages;
-    iree_hal_buffer_t* dst =
-        iree_hal_buffer_view_buffer(wrapper->kv_layers[layer]);
-    status = iree_hal_device_transfer_d2d(
-        device, src, (iree_device_size_t)w * row_bytes, dst,
-        (iree_device_size_t)row * row_bytes, row_bytes,
-        IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT, iree_infinite_timeout());
-    if (!iree_status_is_ok(status)) {
-      snprintf(g_paged_detail, sizeof(g_paged_detail),
-               "scatter d2d w=%zu flat=%lld layer=%zu row=%zu", w,
-               (long long)flat, layer, row);
-      g_paged_step = g_paged_detail;
-    }
-  }
-  free(heap_flats);
-  return status;
-}
-
 static iree_status_t invoke_paged_chunk_once(
     dyninfer_iree_session_t* wrapper, dyninfer_cached_call_t* cached,
     const char* full_name, iree_hal_buffer_view_t* v_tokens,
     iree_hal_buffer_view_t* v_last, iree_hal_buffer_view_t* v_start,
     float** out_logits, size_t* out_count, int64_t* out_token,
-    bool want_logits, bool is_decode) {
+    bool want_logits) {
   if (wrapper->kv_layer_n == 0) {
     return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
                             "paged KV hist is not allocated");
   }
   IREE_RETURN_IF_ERROR(cached_call_prepare(wrapper, cached, full_name));
   IREE_RETURN_IF_ERROR(ensure_paged_logits(wrapper));
-  IREE_RETURN_IF_ERROR(ensure_paged_write_bufs(wrapper, is_decode));
   iree_runtime_call_t* call = &cached->call;
 
   g_paged_step = "push_inputs";
@@ -1092,14 +943,6 @@ static iree_status_t invoke_paged_chunk_once(
     status = iree_runtime_call_inputs_push_back_buffer_view(call,
                                                             wrapper->paged_logits);
   }
-  if (iree_status_is_ok(status)) {
-    status = iree_runtime_call_inputs_push_back_buffer_view(
-        call, wrapper->paged_write_pages);
-  }
-  if (iree_status_is_ok(status)) {
-    status = iree_runtime_call_inputs_push_back_buffer_view(
-        call, wrapper->paged_write_flats);
-  }
   for (size_t layer = 0; iree_status_is_ok(status) && layer < wrapper->kv_layer_n;
        ++layer) {
     status = iree_runtime_call_inputs_push_back_buffer_view(
@@ -1110,7 +953,7 @@ static iree_status_t invoke_paged_chunk_once(
     status = iree_runtime_call_invoke(call, /*flags=*/0);
   }
 
-  // Results: logits (abi.output alias), write_pages, write_flats, argmax token.
+  // Results: logits (abi.output alias), tied layer hists, argmax token.
   iree_hal_buffer_view_t* logits_view = NULL;
   if (iree_status_is_ok(status)) {
     g_paged_step = "pop_logits";
@@ -1131,24 +974,27 @@ static iree_status_t invoke_paged_chunk_once(
   }
   iree_hal_buffer_view_release(logits_view);
 
-  iree_hal_buffer_view_t* pages_view = NULL;
-  iree_hal_buffer_view_t* flats_view = NULL;
-  if (iree_status_is_ok(status)) {
-    g_paged_step = "pop_pages";
+  for (size_t layer = 0; iree_status_is_ok(status) && layer < wrapper->kv_layer_n;
+       ++layer) {
+    iree_hal_buffer_view_t* hist_out = NULL;
+    g_paged_step = "pop_hist";
     status =
-        iree_runtime_call_outputs_pop_front_buffer_view(call, &pages_view);
+        iree_runtime_call_outputs_pop_front_buffer_view(call, &hist_out);
+    if (!iree_status_is_ok(status)) {
+      break;
+    }
+    iree_hal_buffer_t* in_buf =
+        iree_hal_buffer_view_buffer(wrapper->kv_layers[layer]);
+    iree_hal_buffer_t* out_buf = iree_hal_buffer_view_buffer(hist_out);
+    if (in_buf != out_buf) {
+      wrapper->hist_clone_n++;
+      iree_hal_buffer_view_release(wrapper->kv_layers[layer]);
+      wrapper->kv_layers[layer] = hist_out;
+    } else {
+      wrapper->hist_alias_n++;
+      iree_hal_buffer_view_release(hist_out);
+    }
   }
-  if (iree_status_is_ok(status)) {
-    g_paged_step = "pop_flats";
-    status =
-        iree_runtime_call_outputs_pop_front_buffer_view(call, &flats_view);
-  }
-  if (iree_status_is_ok(status)) {
-    g_paged_step = "scatter";
-    status = scatter_kv_writes(wrapper, pages_view, flats_view);
-  }
-  iree_hal_buffer_view_release(pages_view);
-  iree_hal_buffer_view_release(flats_view);
 
   iree_hal_buffer_view_t* token_view = NULL;
   if (iree_status_is_ok(status)) {
@@ -1207,7 +1053,7 @@ int dyninfer_iree_session_invoke_paged_chunk(
     status = invoke_paged_chunk_once(
         session, cached, function_name, session->paged_tokens,
         session->paged_last, session->paged_start_pos, out_logits, out_count,
-        out_token, want_logits != 0, is_decode);
+        out_token, want_logits != 0);
   }
   if (!iree_status_is_ok(status)) {
     set_error_status(status);
