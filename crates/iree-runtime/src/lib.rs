@@ -442,6 +442,7 @@ impl Context {
         page_size: usize,
         kv_head_count: usize,
         head_dim: usize,
+        kv_element_byte_count: usize,
         chunk_size: usize,
         vocab_size: usize,
     ) -> Result<()> {
@@ -453,6 +454,7 @@ impl Context {
                     page_size,
                     kv_head_count,
                     head_dim,
+                    kv_element_byte_count,
                     chunk_size,
                     vocab_size,
                 )

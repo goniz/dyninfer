@@ -56,7 +56,7 @@ struct dyninfer_iree_session_t {
   size_t paged_write_n;
   float* logits_host;
   size_t logits_capacity;
-  // ABI v10: packed K and V per layer [nkv, kv_len, d], kv_len = pages * page.
+  // ABI v11: typed packed K and V per layer [nkv, kv_len, d].
   // fused_attn insert_slices the written page and attends in-place.
   iree_hal_buffer_view_t* kv_k[DYNINFER_MAX_PAGED_LAYERS];
   iree_hal_buffer_view_t* kv_v[DYNINFER_MAX_PAGED_LAYERS];
@@ -66,6 +66,7 @@ struct dyninfer_iree_session_t {
   size_t kv_page_size;
   size_t kv_head_count;
   size_t kv_head_dim;
+  size_t kv_element_byte_count;
   size_t kv_chunk_size;
   size_t kv_vocab_size;
   size_t kv_allocated_bytes;
@@ -422,6 +423,33 @@ static iree_status_t allocate_f32_tensor(iree_runtime_session_t* session,
       iree_make_const_byte_span(data, element_count * sizeof(float)), out_view);
 }
 
+static iree_status_t allocate_float_tensor(
+    iree_runtime_session_t* session, iree_host_size_t rank,
+    const iree_hal_dim_t* shape, const void* data,
+    iree_host_size_t element_count, size_t element_byte_count,
+    iree_hal_buffer_view_t** out_view) {
+  if (element_byte_count == sizeof(float)) {
+    return allocate_f32_tensor(session, rank, shape, (const float*)data,
+                               element_count, out_view);
+  }
+  const iree_hal_element_type_t element_type = element_byte_count == 2
+      ? IREE_HAL_ELEMENT_TYPE_FLOAT_16
+      : IREE_HAL_ELEMENT_TYPE_FLOAT_32;
+  iree_hal_device_t* device = iree_runtime_session_device(session);
+  iree_hal_allocator_t* device_allocator =
+      iree_runtime_session_device_allocator(session);
+  return iree_hal_buffer_view_allocate_buffer_copy(
+      device, device_allocator, rank, shape, element_type,
+      IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR,
+      (iree_hal_buffer_params_t){
+          .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
+          .access = IREE_HAL_MEMORY_ACCESS_ALL,
+          .usage = IREE_HAL_BUFFER_USAGE_DEFAULT,
+      },
+      iree_make_const_byte_span(data, element_count * element_byte_count),
+      out_view);
+}
+
 // Zero a device buffer. Prefer a GPU fill (no multi-GB host staging); HIP
 // DEVICE_LOCAL buffers are not host-mappable (`map_zero` fails) and a chunked
 // H2D of a packed 32k pool has aborted the HIP semaphore.
@@ -507,6 +535,46 @@ static iree_status_t allocate_empty_f32_tensor(
       IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR,
       iree_runtime_session_host_allocator(session), out_view);
   iree_hal_buffer_release(buffer);  // view retains its own reference
+  return status;
+}
+
+static iree_status_t allocate_empty_float_tensor(
+    iree_runtime_session_t* session, iree_host_size_t rank,
+    const iree_hal_dim_t* shape, iree_host_size_t element_count,
+    size_t element_byte_count, iree_hal_buffer_view_t** out_view) {
+  if (element_byte_count == sizeof(float)) {
+    return allocate_empty_f32_tensor(session, rank, shape, element_count,
+                                     out_view);
+  }
+  const iree_hal_element_type_t element_type = element_byte_count == 2
+      ? IREE_HAL_ELEMENT_TYPE_FLOAT_16
+      : IREE_HAL_ELEMENT_TYPE_FLOAT_32;
+  iree_hal_allocator_t* device_allocator =
+      iree_runtime_session_device_allocator(session);
+  iree_device_size_t byte_length =
+      (iree_device_size_t)element_count * element_byte_count;
+  if (element_count != 0 && byte_length / element_byte_count != element_count) {
+    return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
+                            "float tensor byte length overflow");
+  }
+  iree_hal_buffer_params_t params = {
+      .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
+      .access = IREE_HAL_MEMORY_ACCESS_ALL,
+      .usage = IREE_HAL_BUFFER_USAGE_DEFAULT | IREE_HAL_BUFFER_USAGE_TRANSFER,
+  };
+  iree_hal_buffer_t* buffer = NULL;
+  IREE_RETURN_IF_ERROR(iree_hal_allocator_allocate_buffer(
+      device_allocator, params, byte_length, &buffer));
+  iree_status_t status = zero_device_buffer(
+      iree_runtime_session_device(session), buffer, byte_length);
+  if (!iree_status_is_ok(status)) {
+    iree_hal_buffer_release(buffer);
+    return status;
+  }
+  status = iree_hal_buffer_view_create(
+      buffer, rank, shape, element_type, IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR,
+      iree_runtime_session_host_allocator(session), out_view);
+  iree_hal_buffer_release(buffer);
   return status;
 }
 
@@ -767,10 +835,13 @@ int dyninfer_iree_session_invoke_decode(dyninfer_iree_session_t* session,
 
 int dyninfer_iree_session_configure_paged_kv(
     dyninfer_iree_session_t* session, size_t layer_count, size_t page_size,
-    size_t kv_head_count, size_t head_dim, size_t chunk_size,
+    size_t kv_head_count, size_t head_dim, size_t kv_element_byte_count,
+    size_t chunk_size,
     size_t vocab_size) {
   if (!session || layer_count == 0 || page_size == 0 || kv_head_count == 0 ||
-      head_dim == 0 || chunk_size == 0 || vocab_size == 0 ||
+      head_dim == 0 ||
+      (kv_element_byte_count != 2 && kv_element_byte_count != 4) ||
+      chunk_size == 0 || vocab_size == 0 ||
       (page_size % chunk_size != 0 && chunk_size % page_size != 0)) {
     set_error_msg("invalid paged KV configuration");
     return 1;
@@ -787,6 +858,7 @@ int dyninfer_iree_session_configure_paged_kv(
   session->kv_page_size = page_size;
   session->kv_head_count = kv_head_count;
   session->kv_head_dim = head_dim;
+  session->kv_element_byte_count = kv_element_byte_count;
   session->kv_chunk_size = chunk_size;
   session->kv_vocab_size = vocab_size;
   return 0;
@@ -837,11 +909,11 @@ int dyninfer_iree_session_ensure_kv_pages(dyninfer_iree_session_t* session,
     }
     plane_elems *= factors[i];
   }
-  if (plane_elems > SIZE_MAX / sizeof(float)) {
+  if (plane_elems > SIZE_MAX / session->kv_element_byte_count) {
     set_error_msg("KV packed byte size overflow");
     return 1;
   }
-  const size_t plane_bytes = plane_elems * sizeof(float);
+  const size_t plane_bytes = plane_elems * session->kv_element_byte_count;
   if (session->kv_layer_count > SIZE_MAX / 2 ||
       session->kv_layer_count * 2 > SIZE_MAX / plane_bytes) {
     set_error_msg("KV pool byte size overflow");
@@ -851,24 +923,28 @@ int dyninfer_iree_session_ensure_kv_pages(dyninfer_iree_session_t* session,
       (iree_hal_dim_t)session->kv_head_count,
       (iree_hal_dim_t)kv_len,
       (iree_hal_dim_t)session->kv_head_dim};
-  float* zeros = (float*)calloc(plane_elems, sizeof(float));
+  void* zeros = calloc(plane_elems, session->kv_element_byte_count);
   iree_status_t status = iree_ok_status();
   for (size_t layer = 0; layer < session->kv_layer_count; ++layer) {
     iree_hal_buffer_view_t* k = NULL;
     iree_hal_buffer_view_t* v = NULL;
     if (zeros) {
-      status = allocate_f32_tensor(session->session, 3, shape, zeros,
-                                   plane_elems, &k);
+      status = allocate_float_tensor(
+          session->session, 3, shape, zeros, plane_elems,
+          session->kv_element_byte_count, &k);
       if (iree_status_is_ok(status)) {
-        status = allocate_f32_tensor(session->session, 3, shape, zeros,
-                                     plane_elems, &v);
+        status = allocate_float_tensor(
+            session->session, 3, shape, zeros, plane_elems,
+            session->kv_element_byte_count, &v);
       }
     } else {
-      status = allocate_empty_f32_tensor(session->session, 3, shape,
-                                         plane_elems, &k);
+      status = allocate_empty_float_tensor(
+          session->session, 3, shape, plane_elems,
+          session->kv_element_byte_count, &k);
       if (iree_status_is_ok(status)) {
-        status = allocate_empty_f32_tensor(session->session, 3, shape,
-                                           plane_elems, &v);
+        status = allocate_empty_float_tensor(
+            session->session, 3, shape, plane_elems,
+            session->kv_element_byte_count, &v);
       }
     }
     if (!iree_status_is_ok(status)) {

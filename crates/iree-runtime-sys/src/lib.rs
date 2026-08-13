@@ -108,6 +108,7 @@ pub mod bindings {
             page_size: usize,
             kv_head_count: usize,
             head_dim: usize,
+            kv_element_byte_count: usize,
             chunk_size: usize,
             vocab_size: usize,
         ) -> c_int;

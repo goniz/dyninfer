@@ -9,7 +9,7 @@ mod tests {
     use dyninfer_cache::ArtifactCache;
     use dyninfer_checkpoint_safetensors::{tiny_llama_dense_f32, tiny_llama_mlx_affine_u4};
     use dyninfer_compiler::{CompileOptions, IreeTools, compile_add_smoke};
-    use dyninfer_core::{ArchitectureId, SessionConfig, TargetProfile};
+    use dyninfer_core::{ArchitectureId, ScalarType, SessionConfig, TargetProfile};
     use iree_runtime::{Context, Instance, Module};
     use std::fs;
 
@@ -585,7 +585,8 @@ mod tests {
             )
             .unwrap();
         let model = loader.load_bundle(&bundle, &ckpt).unwrap();
-        assert_eq!(model.manifest.version, 10);
+        assert_eq!(model.manifest.version, 11);
+        assert_eq!(model.manifest.kv_cache.element_type, ScalarType::F32);
         assert!(
             model.manifest.prefill_window == 512 || model.manifest.prefill_window == 64,
             "unexpected prefill_window {}",

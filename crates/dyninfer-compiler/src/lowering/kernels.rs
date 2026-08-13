@@ -227,23 +227,20 @@ pub fn emit_iree_attention(
     let q_flash_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}x{head_dim}xf16>");
     let q_flat_ty = format!("tensor<{kv_heads}x{flash_queries}x{head_dim}xf16>");
     let output_flat_ty = format!("tensor<{kv_heads}x{flash_queries}x{head_dim}xf32>");
-    let kv_ty = format!("tensor<{kv_heads}x{kv_len}x{head_dim}xf32>");
     let kv_flash_ty = format!("tensor<{kv_heads}x{kv_len}x{head_dim}xf16>");
     let mask_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}x{kv_len}xf32>");
     let mask_flash_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}x{kv_len}xf16>");
     let mask_flat_ty = format!("tensor<{kv_heads}x{flash_queries}x{kv_len}xf16>");
     let mut f = module.func_private(name);
     f.arg("q", &q_ty);
-    f.arg("k", &kv_ty);
-    f.arg("v", &kv_ty);
+    f.arg("k", &kv_flash_ty);
+    f.arg("v", &kv_flash_ty);
     f.arg("scale", "f16");
     f.arg("mask", &mask_ty);
     f.arg("output", &q_ty);
     f.result_ty(&q_ty);
     f.op_asm(format!(
         r#"  %q16 = arith.truncf %q : {q_ty} to {q_flash_ty}
-  %k16 = arith.truncf %k : {kv_ty} to {kv_flash_ty}
-  %v16 = arith.truncf %v : {kv_ty} to {kv_flash_ty}
   %mask16 = arith.truncf %mask : {mask_ty} to {mask_flash_ty}
   %q_flat = tensor.collapse_shape %q16 [[0], [1, 2], [3]] : {q_flash_ty} into {q_flat_ty}
   %mask_flat = tensor.collapse_shape %mask16 [[0], [1, 2], [3]] : {mask_flash_ty} into {mask_flat_ty}
@@ -257,7 +254,7 @@ pub fn emit_iree_attention(
         affine_map<(h, q, d, p, n) -> (h, q, p)>,
         affine_map<(h, q, d, p, n) -> (h, q, n)>
       ]
-    }} ins(%q_flat, %k16, %v16, %scale, %mask_flat : {q_flat_ty}, {kv_flash_ty}, {kv_flash_ty}, f16, {mask_flat_ty})
+    }} ins(%q_flat, %k, %v, %scale, %mask_flat : {q_flat_ty}, {kv_flash_ty}, {kv_flash_ty}, f16, {mask_flat_ty})
        outs(%output_flat : {output_flat_ty}) {{
     ^bb0(%score: f32):
       iree_linalg_ext.yield %score : f32
@@ -614,6 +611,8 @@ mod online_attention_tests {
         let attn_text = attn_mod.finish().unwrap().mlir_text;
         assert!(attn_text.contains("iree_linalg_ext.attention"));
         assert!(!attn_text.contains("iree_linalg_ext.online_attention"));
+        assert!(attn_text.contains("tensor<8x1024x128xf16>"));
+        assert!(!attn_text.contains("%k16 = arith.truncf"));
     }
 
     #[test]
@@ -696,7 +695,7 @@ mod online_attention_tests {
         let mut module = ModuleBuilder::new().unwrap();
         emit_iree_attention(&mut module, "attn_impl", 1, 1024, 8, 2, 128).unwrap();
         let q = "tensor<8x2x1x128xf32>";
-        let kv = "tensor<8x1024x128xf32>";
+        let kv = "tensor<8x1024x128xf16>";
         let mask = "tensor<8x2x1x1024xf32>";
         let mut f = module.func("decode_attn");
         f.arg("q", q);

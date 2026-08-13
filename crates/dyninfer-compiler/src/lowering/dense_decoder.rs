@@ -311,6 +311,26 @@ impl DenseDecoderConfig {
         self.iree_flash_attention && self.head_dim >= 64
     }
 
+    /// Storage type for the caller-owned packed KV cache. HIP flash attention
+    /// consumes f16 K/V, so keeping the live cache in f32 only doubles memory
+    /// traffic and inserts a full-capacity truncation on every decode step.
+    /// Portable page-walk attention keeps its conservative f32 cache.
+    pub(crate) fn paged_kv_element_type(&self) -> ScalarType {
+        if self.paged_kv && self.use_iree_attention() {
+            ScalarType::F16
+        } else {
+            ScalarType::F32
+        }
+    }
+
+    fn paged_kv_elem_asm(&self) -> &'static str {
+        match self.paged_kv_element_type() {
+            ScalarType::F16 => "f16",
+            ScalarType::F32 => "f32",
+            _ => unreachable!("paged KV storage is restricted to f16/f32"),
+        }
+    }
+
     /// True for the synthetic Milestone-1 fixture (`tiny_llama_dense_f32`):
     /// vocab=32, hidden=64, 1 layer, seq=4, no RoPE — used by differential e2e.
     pub fn is_synthetic_fixture(&self) -> bool {
@@ -513,17 +533,18 @@ fn emit_paged_page_clone(
     variant: PagedVariant,
 ) -> Result<()> {
     let (page, nkv, d) = (c.page_size, c.num_kv_heads, c.head_dim);
+    let kv_elem = c.paged_kv_elem_asm();
     let num_pages = c.max_kv.div_ceil(page).max(1);
-    let kv1_ty = format!("tensor<1x2x{page}x{nkv}x{d}xf32>");
+    let kv1_ty = format!("tensor<1x2x{page}x{nkv}x{d}x{kv_elem}>");
     let hist_pages = variant.function("hist_pages");
     let packed_extract = variant.function("packed_extract");
     let page_to_kv = variant.function("page_to_kv");
-    let kv_ty = format!("tensor<2x{page}x{nkv}x{d}xf32>");
-    let k1_ty = format!("tensor<1x{page}x{nkv}x{d}xf32>");
-    let seq_ty = format!("tensor<{page}x{nkv}x{d}xf32>");
-    let pkv_ty = format!("tensor<{nkv}x{page}x{d}xf32>");
+    let kv_ty = format!("tensor<2x{page}x{nkv}x{d}x{kv_elem}>");
+    let k1_ty = format!("tensor<1x{page}x{nkv}x{d}x{kv_elem}>");
+    let seq_ty = format!("tensor<{page}x{nkv}x{d}x{kv_elem}>");
+    let pkv_ty = format!("tensor<{nkv}x{page}x{d}x{kv_elem}>");
     let kv_len = num_pages.saturating_mul(page);
-    let k_ty = format!("tensor<{nkv}x{kv_len}x{d}xf32>");
+    let k_ty = format!("tensor<{nkv}x{kv_len}x{d}x{kv_elem}>");
     module.append_toplevel_asm(&format!(
         r#"func.func private @{hist_pages}(%start_pos: tensor<i64>, %valid: tensor<i64>) -> tensor<i64> attributes {{noinline}} {{
   %start64 = tensor.extract %start_pos[] : tensor<i64>
@@ -593,10 +614,11 @@ fn paged_fused_attn_ops(
         c.head_dim,
     );
     let num_pages = c.max_kv.div_ceil(page).max(1);
+    let kv_elem = c.paged_kv_elem_asm();
     let nlast = num_pages.saturating_sub(1);
     let max_writes = paged_max_writes(s, page);
-    let kv1_ty = format!("tensor<1x2x{page}x{nkv}x{d}xf32>");
-    let kv_ty = format!("tensor<2x{page}x{nkv}x{d}xf32>");
+    let kv1_ty = format!("tensor<1x2x{page}x{nkv}x{d}x{kv_elem}>");
+    let kv_ty = format!("tensor<2x{page}x{nkv}x{d}x{kv_elem}>");
     let qg_ty = format!("tensor<{nkv}x{g}x{s}x{d}xf32>");
     let kv3_ty = format!("tensor<{s}x{nkv}x{d}xf32>");
     let row_ty = format!("tensor<{nkv}x{g}x{s}xf32>");
@@ -610,8 +632,8 @@ fn paged_fused_attn_ops(
     let attention = variant.helper("iree_attention");
     let full_mask = variant.helper("full_causal_mask");
     let kv_len = num_pages.saturating_mul(page);
-    let k_ty = format!("tensor<{nkv}x{kv_len}x{d}xf32>");
-    let pkv_ty = format!("tensor<{nkv}x{page}x{d}xf32>");
+    let k_ty = format!("tensor<{nkv}x{kv_len}x{d}x{kv_elem}>");
+    let pkv_ty = format!("tensor<{nkv}x{page}x{d}x{kv_elem}>");
     let mask_full_ty = format!("tensor<{nkv}x{g}x{s}x{kv_len}xf32>");
     let mut write_consts = String::new();
     for w in 0..max_writes {
@@ -750,7 +772,8 @@ fn emit_paged_fused_attn_layer(
     let d = c.head_dim;
     let num_pages = c.max_kv.div_ceil(page).max(1);
     let kv_len = num_pages.saturating_mul(page);
-    let k_ty = format!("tensor<{nkv}x{kv_len}x{d}xf32>");
+    let kv_elem = c.paged_kv_elem_asm();
+    let k_ty = format!("tensor<{nkv}x{kv_len}x{d}x{kv_elem}>");
     let name = variant.function(&format!("fused_attn_{layer}"));
     let (ops, k_out, v_out) = paged_fused_attn_ops(c, variant, layer, "k_0", "v_0", "");
     module.append_toplevel_asm(&format!(
@@ -774,12 +797,13 @@ fn emit_paged_fused_chunk(
         c.num_kv_heads,
         c.head_dim,
     );
-    // ABI v10: packed K and V per layer are tied `iree.abi.output`s.
+    // ABI v11: typed packed K and V per layer are tied `iree.abi.output`s.
     // fused_attn insert_slices the written page into packed K/V and attends
     // in-place — no hist_to_kv gather of the full capacity.
     let num_pages = c.max_kv.div_ceil(page).max(1);
     let kv_len = num_pages.saturating_mul(page);
-    let k_ty = format!("tensor<{nkv}x{kv_len}x{d}xf32>");
+    let kv_elem = c.paged_kv_elem_asm();
+    let k_ty = format!("tensor<{nkv}x{kv_len}x{d}x{kv_elem}>");
     for layer in 0..layers {
         if layer_kind(c, layer) == LayerKind::Attention {
             emit_paged_fused_attn_layer(module, c, variant, layer)?;
@@ -1094,11 +1118,22 @@ fn emit_paged_layer_store(
     variant: PagedVariant,
 ) -> Result<()> {
     let (s, nkv, d, page) = (c.seq, c.num_kv_heads, c.head_dim, c.page_size);
-    let kv_ty = format!("tensor<2x{page}x{nkv}x{d}xf32>");
+    let kv_elem = c.paged_kv_elem_asm();
+    let kv_ty = format!("tensor<2x{page}x{nkv}x{d}x{kv_elem}>");
     let kv3_ty = format!("tensor<{s}x{nkv}x{d}xf32>");
     let seq_m1 = s.saturating_sub(1);
     let name = variant.function("layer_store");
     let attrs = " attributes {noinline}".to_string();
+    let narrow_tok = if kv_elem == "f16" {
+        "        %tok = arith.truncf %tok32 : f32 to f16\n"
+    } else {
+        "        %tok = arith.addf %tok32, %zero : f32\n"
+    };
+    let zero = if kv_elem == "f32" {
+        "  %zero = arith.constant 0.0 : f32\n"
+    } else {
+        ""
+    };
     // Overlay into a fresh empty tensor. Never insert_slice into a page that
     // originated as an extract from the imported pool (HIP/CPU DMA OOB).
     module.append_toplevel_asm(&format!(
@@ -1111,7 +1146,7 @@ fn emit_paged_layer_store(
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %cseq_m1 = arith.constant {seq_m1} : index
-  %page_start = arith.muli %pi, %page_size : index
+{zero}  %page_start = arith.muli %pi, %page_size : index
   %page_end = arith.addi %page_start, %page_size : index
   %valid64 = tensor.extract %valid_t[] : tensor<i64>
   %valid = arith.index_cast %valid64 : i64 to index
@@ -1125,7 +1160,7 @@ fn emit_paged_layer_store(
         indexing_maps = [affine_map<(pl, p, h, dd) -> (pl, p, h, dd)>, affine_map<(pl, p, h, dd) -> (pl, p, h, dd)>],
         iterator_types = ["parallel", "parallel", "parallel", "parallel"]}}
       ins(%kv : {kv_ty}) outs(%kv_e : {kv_ty}) {{
-      ^bb0(%old: f32, %o: f32):
+      ^bb0(%old: {kv_elem}, %o: {kv_elem}):
         %pl = linalg.index 0 : index
         %pp = linalg.index 1 : index
         %hh = linalg.index 2 : index
@@ -1140,9 +1175,9 @@ fn emit_paged_layer_store(
         %tokk = tensor.extract %chunk_k[%si, %hh, %dd] : {kv3_ty}
         %tokv = tensor.extract %chunk_v[%si, %hh, %dd] : {kv3_ty}
         %is_v = arith.cmpi eq, %pl, %c1 : index
-        %tok = arith.select %is_v, %tokv, %tokk : f32
-        %val = arith.select %hit, %tok, %old : f32
-        linalg.yield %val : f32
+        %tok32 = arith.select %is_v, %tokv, %tokk : f32
+{narrow_tok}        %val = arith.select %hit, %tok, %old : {kv_elem}
+        linalg.yield %val : {kv_elem}
     }} -> {kv_ty}
     scf.yield %new : {kv_ty}
   }} else {{
@@ -1150,8 +1185,8 @@ fn emit_paged_layer_store(
         indexing_maps = [affine_map<(pl, p, h, dd) -> (pl, p, h, dd)>, affine_map<(pl, p, h, dd) -> (pl, p, h, dd)>],
         iterator_types = ["parallel", "parallel", "parallel", "parallel"]}}
       ins(%kv : {kv_ty}) outs(%kv_e : {kv_ty}) {{
-      ^bb0(%old: f32, %o: f32):
-        linalg.yield %old : f32
+      ^bb0(%old: {kv_elem}, %o: {kv_elem}):
+        linalg.yield %old : {kv_elem}
     }} -> {kv_ty}
     scf.yield %keep : {kv_ty}
   }}
@@ -3743,7 +3778,7 @@ mod tests {
         );
         assert!(
             !mlir.contains("iree.abi.output = 3 : index"),
-            "ABI v10 one-layer is logits + K + V (outputs 0,1,2)"
+            "ABI v11 one-layer is logits + K + V (outputs 0,1,2)"
         );
         assert!(
             mlir.contains("@packed_extract") && mlir.contains("@hist_pages"),
@@ -3779,7 +3814,7 @@ mod tests {
         );
         assert!(
             !mlir.contains("write_pages") && !mlir.contains("write_flats"),
-            "ABI v10 writes pages in-graph; no write_pages/write_flats deltas"
+            "ABI v11 writes pages in-graph; no write_pages/write_flats deltas"
         );
         assert!(
             !mlir.contains("@pool_seed") && !mlir.contains("@pool_insert"),

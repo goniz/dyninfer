@@ -128,7 +128,7 @@ impl ModelSession for IreeSession {
         self.history.extend_from_slice(tokens);
         let values = if let Some((page_size, chunk_size)) = self.paged_geometry() {
             self.context.reset_paged_kv()?;
-            // ABI v10 packed K/V per layer; capacity is ceil(max_kv / page_size).
+            // ABI v11 typed packed K/V per layer; capacity is ceil(max_kv / page_size).
             let max_pages = (self.max_seq() as usize).div_ceil(page_size).max(1);
             self.context.ensure_kv_pages(max_pages)?;
             if let Ok((_, bytes)) = self.context.paged_kv_metrics() {

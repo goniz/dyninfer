@@ -13,7 +13,7 @@ use dyninfer_compiler::{
 };
 use dyninfer_core::{
     ArchitectureId, BindingPlan, ExecutableManifest, KvCacheStorage, ModelMetadata,
-    PrecisionPolicy, SessionConfig, ShapeProfile, content_digest,
+    PrecisionPolicy, ScalarType, SessionConfig, ShapeProfile, content_digest,
 };
 use dyninfer_error::{CacheError, DynInferError, Result};
 use dyninfer_quantization::{CoverageReport, dry_run_coverage};
@@ -37,7 +37,27 @@ fn validate_executable_abi(manifest: &ExecutableManifest, bundle: &Path) -> Resu
                 chunk_size,
             },
             10,
-        ) if *page_size > 0 && *chunk_size > 0 => &["prefill_chunk", "decode_chunk"],
+        ) if *page_size > 0
+            && *chunk_size > 0
+            && manifest.kv_cache.element_type == ScalarType::F32 =>
+        {
+            &["prefill_chunk", "decode_chunk"]
+        }
+        (
+            KvCacheStorage::Paged {
+                page_size,
+                chunk_size,
+            },
+            11,
+        ) if *page_size > 0
+            && *chunk_size > 0
+            && matches!(
+                manifest.kv_cache.element_type,
+                ScalarType::F16 | ScalarType::F32
+            ) =>
+        {
+            &["prefill_chunk", "decode_chunk"]
+        }
         _ => {
             return Err(DynInferError::Cache(CacheError {
                 message: format!(
@@ -141,6 +161,11 @@ impl CausalLanguageModel for LoadedModel {
                 page_size as usize,
                 self.manifest.kv_cache.kv_head_count as usize,
                 self.manifest.kv_cache.head_dimension as usize,
+                self.manifest
+                    .kv_cache
+                    .element_type
+                    .size_bytes()
+                    .expect("scalar KV element type") as usize,
                 chunk_size as usize,
                 self.metadata.vocabulary_size as usize,
             )?;
@@ -367,9 +392,8 @@ impl ModelLoader {
         let bindings_path = bundle.join("bindings.json");
         let vmfb_path = bundle.join("executables").join("model.vmfb");
         let manifest: ExecutableManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
-        let decode_vmfb_path =
-            (manifest.version == 10)
-                .then(|| bundle.join("executables").join("decode.vmfb"));
+        let decode_vmfb_path = matches!(manifest.version, 10 | 11)
+            .then(|| bundle.join("executables").join("decode.vmfb"));
         let decode_vmfb_path = decode_vmfb_path.filter(|path| path.is_file());
         // Hybrid paged (short-conv) ships a single combined VMFB; attention-only
         // paged keeps the split prefill/decode pair.

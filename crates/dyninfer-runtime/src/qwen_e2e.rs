@@ -8,7 +8,7 @@ mod tests {
     };
     use dyninfer_compiler::LARGE_PREFILL_WINDOW;
     use dyninfer_compiler::{CompileOptions, IreeTools};
-    use dyninfer_core::{ArchitectureId, SessionConfig};
+    use dyninfer_core::{ArchitectureId, ScalarType, SessionConfig};
     use std::path::{Path, PathBuf};
 
     fn iree_available() -> bool {
@@ -475,7 +475,8 @@ mod tests {
             )
             .unwrap();
         let model = loader.load_bundle(&bundle, &ckpt).unwrap();
-        assert_eq!(model.manifest.version, 10);
+        assert_eq!(model.manifest.version, 11);
+        assert_eq!(model.manifest.kv_cache.element_type, ScalarType::F16);
         let mut session = model
             .create_session(SessionConfig {
                 max_sequence_length: 4224,
@@ -630,7 +631,15 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("compile paged Qwen3 on {target}: {error}"));
         let model = loader.load_bundle(&bundle, &ckpt).unwrap();
-        assert_eq!(model.manifest.version, 10);
+        assert_eq!(model.manifest.version, 11);
+        assert_eq!(
+            model.manifest.kv_cache.element_type,
+            if target == "hip" {
+                ScalarType::F16
+            } else {
+                ScalarType::F32
+            }
+        );
         assert!(model.manifest.prefill_window >= 256);
 
         let tokenizer = load_tokenizer(&model_dir).unwrap();
