@@ -228,9 +228,8 @@ pub fn emit_iree_attention(
     let q_flat_ty = format!("tensor<{kv_heads}x{flash_queries}x{head_dim}xf16>");
     let output_flat_ty = format!("tensor<{kv_heads}x{flash_queries}x{head_dim}xf32>");
     let kv_flash_ty = format!("tensor<{kv_heads}x{kv_len}x{head_dim}xf16>");
-    let mask_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}x{kv_len}xf32>");
-    let mask_flash_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}x{kv_len}xf16>");
-    let mask_flat_ty = format!("tensor<{kv_heads}x{flash_queries}x{kv_len}xf16>");
+    let mask_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}x{kv_len}xi1>");
+    let mask_flat_ty = format!("tensor<{kv_heads}x{flash_queries}x{kv_len}xi1>");
     let mut f = module.func_private(name);
     f.arg("q", &q_ty);
     f.arg("k", &kv_flash_ty);
@@ -241,9 +240,8 @@ pub fn emit_iree_attention(
     f.result_ty(&q_ty);
     f.op_asm(format!(
         r#"  %q16 = arith.truncf %q : {q_ty} to {q_flash_ty}
-  %mask16 = arith.truncf %mask : {mask_ty} to {mask_flash_ty}
   %q_flat = tensor.collapse_shape %q16 [[0], [1, 2], [3]] : {q_flash_ty} into {q_flat_ty}
-  %mask_flat = tensor.collapse_shape %mask16 [[0], [1, 2], [3]] : {mask_flash_ty} into {mask_flat_ty}
+  %mask_flat = tensor.collapse_shape %mask [[0], [1, 2], [3]] : {mask_ty} into {mask_flat_ty}
   %output_flat = tensor.collapse_shape %output [[0], [1, 2], [3]] : {q_ty} into {output_flat_ty}
   %next = iree_linalg_ext.attention {{
       indexing_maps = [
@@ -266,7 +264,9 @@ pub fn emit_iree_attention(
     f.finish(module)
 }
 
-/// Causal + written-range mask over a packed KV length (`num_pages * page`).
+/// Boolean causal + written-range mask over a packed KV length
+/// (`num_pages * page`). Attention interprets `true` as visible, avoiding a
+/// full-capacity f32 mask followed by an f16 truncation on every layer.
 pub fn emit_full_causal_mask(
     module: &mut ModuleBuilder,
     name: &str,
@@ -275,7 +275,7 @@ pub fn emit_full_causal_mask(
     kv_heads: u32,
     gqa_group: u32,
 ) -> Result<()> {
-    let mask_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}x{kv_len}xf32>");
+    let mask_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}x{kv_len}xi1>");
     let mut f = module.func_private(name);
     f.arg("start_pos", "tensor<i64>");
     f.arg("valid_count", "tensor<i64>");
@@ -284,14 +284,12 @@ pub fn emit_full_causal_mask(
         r#"  %start64 = tensor.extract %start_pos[] : tensor<i64>
   %valid64 = tensor.extract %valid_count[] : tensor<i64>
   %seq_end = arith.addi %start64, %valid64 : i64
-  %zero = arith.constant 0.0 : f32
-  %neg = arith.constant -3.40282347E+38 : f32
   %empty = tensor.empty() : {mask_ty}
   %mask = linalg.generic {{
       indexing_maps = [affine_map<(kh, g, q, k) -> (kh, g, q, k)>],
       iterator_types = ["parallel", "parallel", "parallel", "parallel"]}}
     outs(%empty : {mask_ty}) {{
-    ^bb0(%o: f32):
+    ^bb0(%o: i1):
       %q = linalg.index 2 : index
       %k = linalg.index 3 : index
       %q64 = arith.index_cast %q : index to i64
@@ -300,8 +298,7 @@ pub fn emit_full_causal_mask(
       %causal = arith.cmpi ule, %k64, %abs_q : i64
       %written = arith.cmpi ult, %k64, %seq_end : i64
       %visible = arith.andi %causal, %written : i1
-      %value = arith.select %visible, %zero, %neg : f32
-      linalg.yield %value : f32
+      linalg.yield %visible : i1
   }} -> {mask_ty}
   return %mask : {mask_ty}"#
     ));
@@ -612,7 +609,9 @@ mod online_attention_tests {
         assert!(attn_text.contains("iree_linalg_ext.attention"));
         assert!(!attn_text.contains("iree_linalg_ext.online_attention"));
         assert!(attn_text.contains("tensor<8x1024x128xf16>"));
+        assert!(attn_text.contains("tensor<8x2x1x1024xi1>"));
         assert!(!attn_text.contains("%k16 = arith.truncf"));
+        assert!(!attn_text.contains("%mask16 = arith.truncf"));
     }
 
     #[test]
@@ -696,7 +695,7 @@ mod online_attention_tests {
         emit_iree_attention(&mut module, "attn_impl", 1, 1024, 8, 2, 128).unwrap();
         let q = "tensor<8x2x1x128xf32>";
         let kv = "tensor<8x1024x128xf16>";
-        let mask = "tensor<8x2x1x1024xf32>";
+        let mask = "tensor<8x2x1x1024xi1>";
         let mut f = module.func("decode_attn");
         f.arg("q", q);
         f.arg("k", kv);

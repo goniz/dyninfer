@@ -634,7 +634,7 @@ fn paged_fused_attn_ops(
     let kv_len = num_pages.saturating_mul(page);
     let k_ty = format!("tensor<{nkv}x{kv_len}x{d}x{kv_elem}>");
     let pkv_ty = format!("tensor<{nkv}x{page}x{d}x{kv_elem}>");
-    let mask_full_ty = format!("tensor<{nkv}x{g}x{s}x{kv_len}xf32>");
+    let mask_full_ty = format!("tensor<{nkv}x{g}x{s}x{kv_len}xi1>");
     let mut write_consts = String::new();
     for w in 0..max_writes {
         write_consts.push_str(&format!("  %{p}c{w}_w = arith.constant {w} : index\n"));
