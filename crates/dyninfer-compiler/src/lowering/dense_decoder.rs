@@ -77,8 +77,9 @@ pub struct DenseDecoderConfig {
     pub page_size: u32,
     /// Runtime-owned paged KV shared by split prefill/decode modules (ABI v7).
     pub paged_kv: bool,
-    /// HIP uses IREE's fused online-attention op with WMMA flash configs;
-    /// CPU keeps the portable page-local linalg fallback.
+    /// HIP uses IREE `attention` (converted to online internally) when
+    /// `head_dim` is large enough for gfx1151 VectorDistribute. TinyLlama's
+    /// `head_dim=16` fails to distribute, so it keeps portable page-walk.
     pub iree_flash_attention: bool,
     pub rms_norm_eps: f32,
     pub rope_theta: Option<f32>,
@@ -304,6 +305,12 @@ impl DenseDecoderConfig {
             .map(String::as_str)
     }
 
+    /// gfx1151 VectorDistribute for `iree_linalg_ext.attention` needs a
+    /// `head_dim` that matches WMMA-R3 16×16 tiles at workgroup N=64.
+    fn use_iree_attention(&self) -> bool {
+        self.iree_flash_attention && self.head_dim >= 64
+    }
+
     /// True for the synthetic Milestone-1 fixture (`tiny_llama_dense_f32`):
     /// vocab=32, hidden=64, 1 layer, seq=4, no RoPE — used by differential e2e.
     pub fn is_synthetic_fixture(&self) -> bool {
@@ -479,7 +486,9 @@ fn emit_paged_decoder(
 ) -> Result<()> {
     emit_paged_chunk_begin(module, c, variant)?;
     emit_paged_layer_store(module, c, variant)?;
-    emit_paged_layer_page(module, c, variant)?;
+    if !c.use_iree_attention() {
+        emit_paged_layer_page(module, c, variant)?;
+    }
     for layer in 0..c.num_layers {
         match layer_kind(c, layer) {
             LayerKind::ShortConv => emit_paged_shortconv_layer(module, c, layer, variant)?,
@@ -515,22 +524,84 @@ fn emit_paged_page_clone(
     let pool_rows = num_pages.saturating_mul(layers).max(1);
     let pool_ty = format!("tensor<{pool_rows}x2x{page}x{nkv}x{d}xf32>");
     let kv1_ty = format!("tensor<1x2x{page}x{nkv}x{d}xf32>");
-    let clone = variant.function("page_clone");
-    let extract = variant.function("page_extract");
+    let layer_ty = format!("tensor<{num_pages}x2x{page}x{nkv}x{d}xf32>");
+    let hist_pages = variant.function("hist_pages");
+    let layer_hist = variant.function("layer_hist");
+    let hist_extract = variant.function("hist_extract");
+    let hist_to_kv = variant.function("hist_to_kv");
+    let page_to_kv = variant.function("page_to_kv");
+    let kv_ty = format!("tensor<2x{page}x{nkv}x{d}xf32>");
+    let k1_ty = format!("tensor<1x{page}x{nkv}x{d}xf32>");
+    let seq_ty = format!("tensor<{page}x{nkv}x{d}xf32>");
+    let pkv_ty = format!("tensor<{nkv}x{page}x{d}xf32>");
+    let kv_len = num_pages.saturating_mul(page);
+    let k_ty = format!("tensor<{nkv}x{kv_len}x{d}xf32>");
+    let k4_ty = format!("tensor<{num_pages}x1x{page}x{nkv}x{d}xf32>");
+    let k3_ty = format!("tensor<{num_pages}x{page}x{nkv}x{d}xf32>");
+    let kvseq_ty = format!("tensor<{kv_len}x{nkv}x{d}xf32>");
     module.append_toplevel_asm(&format!(
-        r#"func.func private @{clone}(%src: {kv1_ty}) -> {kv1_ty} attributes {{noinline}} {{
+        r#"func.func private @{hist_pages}(%start_pos: tensor<i64>, %valid: tensor<i64>) -> tensor<i64> attributes {{noinline}} {{
+  %start64 = tensor.extract %start_pos[] : tensor<i64>
+  %valid64 = tensor.extract %valid[] : tensor<i64>
+  %end64 = arith.addi %start64, %valid64 : i64
+  %ps64 = arith.constant {page} : i64
+  %hi_raw = arith.ceildivui %end64, %ps64 : i64
+  %np64 = arith.constant {num_pages} : i64
+  %hi = arith.minui %hi_raw, %np64 : i64
+  %e = tensor.empty() : tensor<i64>
+  %t = tensor.insert %hi into %e[] : tensor<i64>
+  return %t : tensor<i64>
+}}
+func.func private @{layer_hist}(%pool: {pool_ty}, %layer: index) -> {layer_ty} attributes {{noinline}} {{
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %np = arith.constant {num_pages} : index
+  %clayers = arith.constant {layers} : index
+  %idx_e = tensor.empty() : tensor<{num_pages}xi64>
+  %idx = scf.for %pi = %c0 to %np step %c1 iter_args(%t = %idx_e) -> (tensor<{num_pages}xi64>) {{
+    %flat_m = arith.muli %pi, %clayers : index
+    %flat = arith.addi %flat_m, %layer : index
+    %flat64 = arith.index_cast %flat : index to i64
+    %t2 = tensor.insert %flat64 into %t[%pi] : tensor<{num_pages}xi64>
+    scf.yield %t2 : tensor<{num_pages}xi64>
+  }}
+  %e = tensor.empty() : {layer_ty}
+  %out = iree_linalg_ext.gather dimension_map = [0] ins(%pool, %idx : {pool_ty}, tensor<{num_pages}xi64>) outs(%e : {layer_ty}) -> {layer_ty}
+  return %out : {layer_ty}
+}}
+func.func private @{hist_extract}(%hist: {layer_ty}, %pi: index) -> {kv1_ty} attributes {{noinline}} {{
+  %c0 = arith.constant 0 : index
+  %slice = tensor.extract_slice %hist[%pi, %c0, %c0, %c0, %c0] [1, 2, {page}, {nkv}, {d}] [1, 1, 1, 1, 1] : {layer_ty} to {kv1_ty}
   %e = tensor.empty() : {kv1_ty}
-  %c = linalg.copy ins(%src : {kv1_ty}) outs(%e : {kv1_ty}) -> {kv1_ty}
+  %c = linalg.copy ins(%slice : {kv1_ty}) outs(%e : {kv1_ty}) -> {kv1_ty}
   return %c : {kv1_ty}
 }}
-func.func private @{extract}(%pool: {pool_ty}, %flat: index) -> {kv1_ty} attributes {{noinline}} {{
+func.func private @{page_to_kv}(%kv1: {kv1_ty}) -> ({pkv_ty}, {pkv_ty}) attributes {{noinline}} {{
+  %kv = tensor.collapse_shape %kv1 [[0, 1], [2], [3], [4]] : {kv1_ty} into {kv_ty}
+  %ks = tensor.extract_slice %kv[0, 0, 0, 0] [1, {page}, {nkv}, {d}] [1, 1, 1, 1] : {kv_ty} to {k1_ty}
+  %vs = tensor.extract_slice %kv[1, 0, 0, 0] [1, {page}, {nkv}, {d}] [1, 1, 1, 1] : {kv_ty} to {k1_ty}
+  %kseq = tensor.collapse_shape %ks [[0, 1], [2], [3]] : {k1_ty} into {seq_ty}
+  %vseq = tensor.collapse_shape %vs [[0, 1], [2], [3]] : {k1_ty} into {seq_ty}
+  %ke = tensor.empty() : {pkv_ty}
+  %ve = tensor.empty() : {pkv_ty}
+  %k = linalg.transpose ins(%kseq : {seq_ty}) outs(%ke : {pkv_ty}) permutation = [1, 0, 2]
+  %v = linalg.transpose ins(%vseq : {seq_ty}) outs(%ve : {pkv_ty}) permutation = [1, 0, 2]
+  return %k, %v : {pkv_ty}, {pkv_ty}
+}}
+func.func private @{hist_to_kv}(%hist: {layer_ty}) -> ({k_ty}, {k_ty}) attributes {{noinline}} {{
   %c0 = arith.constant 0 : index
-  %flat64 = arith.index_cast %flat : index to i64
-  %idx_e = tensor.empty() : tensor<1xi64>
-  %idx = tensor.insert %flat64 into %idx_e[%c0] : tensor<1xi64>
-  %e = tensor.empty() : {kv1_ty}
-  %out = iree_linalg_ext.gather dimension_map = [0] ins(%pool, %idx : {pool_ty}, tensor<1xi64>) outs(%e : {kv1_ty}) -> {kv1_ty}
-  return %out : {kv1_ty}
+  %c1 = arith.constant 1 : index
+  %ks = tensor.extract_slice %hist[%c0, %c0, %c0, %c0, %c0] [{num_pages}, 1, {page}, {nkv}, {d}] [1, 1, 1, 1, 1] : {layer_ty} to {k4_ty}
+  %vs = tensor.extract_slice %hist[%c0, %c1, %c0, %c0, %c0] [{num_pages}, 1, {page}, {nkv}, {d}] [1, 1, 1, 1, 1] : {layer_ty} to {k4_ty}
+  %k3 = tensor.collapse_shape %ks [[0], [1, 2], [3], [4]] : {k4_ty} into {k3_ty}
+  %v3 = tensor.collapse_shape %vs [[0], [1, 2], [3], [4]] : {k4_ty} into {k3_ty}
+  %kseq = tensor.collapse_shape %k3 [[0, 1], [2], [3]] : {k3_ty} into {kvseq_ty}
+  %vseq = tensor.collapse_shape %v3 [[0, 1], [2], [3]] : {k3_ty} into {kvseq_ty}
+  %ke = tensor.empty() : {k_ty}
+  %ve = tensor.empty() : {k_ty}
+  %k = linalg.transpose ins(%kseq : {kvseq_ty}) outs(%ke : {k_ty}) permutation = [1, 0, 2]
+  %v = linalg.transpose ins(%vseq : {kvseq_ty}) outs(%ve : {k_ty}) permutation = [1, 0, 2]
+  return %k, %v : {k_ty}, {k_ty}
 }}
 "#
     ))?;
@@ -568,12 +639,26 @@ fn emit_paged_fused_attn_layer(
     let finish = variant.function(&format!("layer_finish_{layer}"));
     let layer_store = variant.function("layer_store");
     let layer_page = variant.function("layer_page");
-    let page_extract = variant.function("page_extract");
+    let layer_hist = variant.function("layer_hist");
+    let hist_extract = variant.function("hist_extract");
+    let hist_pages = variant.function("hist_pages");
+    let hist_to_kv = variant.function("hist_to_kv");
+    let page_to_kv = variant.function("page_to_kv");
+    let attention = variant.helper("iree_attention");
+    let full_mask = variant.helper("full_causal_mask");
+    let kv_len = num_pages.saturating_mul(page);
+    let k_ty = format!("tensor<{nkv}x{kv_len}x{d}xf32>");
+    let pkv_ty = format!("tensor<{nkv}x{page}x{d}xf32>");
+    let mask_full_ty = format!("tensor<{nkv}x{g}x{s}x{kv_len}xf32>");
+    let layer_ty = format!("tensor<{num_pages}x2x{page}x{nkv}x{d}xf32>");
     let mut write_consts = String::new();
     for w in 0..max_writes {
         write_consts.push_str(&format!("  %c{w}_w = arith.constant {w} : index\n"));
     }
     let mut writes = String::new();
+    writes.push_str(&format!(
+        "  %hist_0 = func.call @{layer_hist}(%kv_pool, %clayer) : ({pool_ty}, index) -> {layer_ty}\n"
+    ));
     for w in 0..max_writes {
         writes.push_str(&format!(
             r#"  %pi_w{w} = arith.addi %page_lo, %c{w}_w : index
@@ -583,14 +668,14 @@ fn emit_paged_fused_attn_layer(
   %pi_i64_w{w} = arith.index_cast %pi_w{w}_c : index to i64
   %pi_e_w{w} = tensor.empty() : tensor<i64>
   %pi_t_w{w} = tensor.insert %pi_i64_w{w} into %pi_e_w{w}[] : tensor<i64>
-  %kv1_s_w{w}_0 = func.call @{page_extract}(%kv_pool, %flat_w{w}) : ({pool_ty}, index) -> {kv1_ty}
+  %kv1_s_w{w}_0 = func.call @{hist_extract}(%hist_0, %pi_w{w}_c) : ({layer_ty}, index) -> {kv1_ty}
 "#
         ));
         let mut src_ssa = format!("kv1_s_w{w}_0");
         for prev in 0..w {
             let next_ssa = format!("kv1_s_w{w}_{}", prev + 1);
             writes.push_str(&format!(
-                r#"  %same_w{w}_p{prev} = arith.cmpi eq, %flat_w{w}, %flat_w{prev} : index
+                r#"  %same_w{w}_p{prev} = arith.cmpi eq, %pi_w{w}_c, %pi_w{prev}_c : index
   %{next_ssa} = scf.if %same_w{w}_p{prev} -> ({kv1_ty}) {{
     scf.yield %kv1o_w{prev} : {kv1_ty}
   }} else {{
@@ -650,36 +735,67 @@ fn emit_paged_fused_attn_layer(
         wp_ssa = next_wp;
         wf_ssa = next_wf;
     }
+    let attn_body = if c.use_iree_attention() {
+        let mut overlay = format!(
+            r#"  %k_h, %v_h = func.call @{hist_to_kv}(%hist_0) : ({layer_ty}) -> ({k_ty}, {k_ty})
+"#
+        );
+        let mut k_ssa = String::from("k_h");
+        let mut v_ssa = String::from("v_h");
+        for w in 0..max_writes {
+            let next_k = format!("k_w{w}");
+            let next_v = format!("v_w{w}");
+            overlay.push_str(&format!(
+                r#"  %kp_w{w}, %vp_w{w} = func.call @{page_to_kv}(%kv1o_w{w}) : ({kv1_ty}) -> ({pkv_ty}, {pkv_ty})
+  %off_w{w} = arith.muli %pi_w{w}_c, %page_size_idx : index
+  %{next_k} = tensor.insert_slice %kp_w{w} into %{k_ssa}[0, %off_w{w}, 0] [{nkv}, {page}, {d}] [1, 1, 1] : {pkv_ty} into {k_ty}
+  %{next_v} = tensor.insert_slice %vp_w{w} into %{v_ssa}[0, %off_w{w}, 0] [{nkv}, {page}, {d}] [1, 1, 1] : {pkv_ty} into {k_ty}
+"#
+            ));
+            k_ssa = next_k;
+            v_ssa = next_v;
+        }
+        overlay.push_str(&format!(
+            r#"  %mask_full = func.call @{full_mask}(%start_pos, %valid) : (tensor<i64>, tensor<i64>) -> {mask_full_ty}
+  %scale = arith.constant {scale:.8e} : f16
+  %out_f = func.call @{attention}(%query, %{k_ssa}, %{v_ssa}, %scale, %mask_full, %out_0) : ({qg_ty}, {k_ty}, {k_ty}, f16, {mask_full_ty}, {qg_ty}) -> {qg_ty}
+  %one = arith.constant 1.0 : f32
+  %sum_e = tensor.empty() : {row_ty}
+  %sum_f = linalg.fill ins(%one : f32) outs(%sum_e : {row_ty}) -> {row_ty}
+"#,
+            scale = 1.0 / (d as f32).sqrt(),
+        ));
+        overlay
+    } else {
+        format!(
+            r#"  %out_f, %max_f, %sum_f = scf.for %pi = %c0_page to %page_hi step %c1_page iter_args(%out_i = %out_0, %max_i = %max_0, %sum_i = %sum_0) -> ({qg_ty}, {row_ty}, {row_ty}) {{
+    %pi_i64 = arith.index_cast %pi : index to i64
+    %pi_e = tensor.empty() : tensor<i64>
+    %pi_t = tensor.insert %pi_i64 into %pi_e[] : tensor<i64>
+    %hist = func.call @{hist_extract}(%hist_0, %pi) : ({layer_ty}, index) -> {kv1_ty}
+{select}    %kva = tensor.collapse_shape %{sel_ssa} [[0, 1], [2], [3], [4]] : {kv1_ty} into {kv_ty}
+    %out_n, %max_n, %sum_n = func.call @{layer_page}(%kva, %pi_t, %start_pos, %query, %valid, %out_i, %max_i, %sum_i) : ({kv_ty}, tensor<i64>, tensor<i64>, {qg_ty}, tensor<i64>, {qg_ty}, {row_ty}, {row_ty}) -> ({qg_ty}, {row_ty}, {row_ty})
+    scf.yield %out_n, %max_n, %sum_n : {qg_ty}, {row_ty}, {row_ty}
+  }}
+"#
+        )
+    };
     module.append_toplevel_asm(&format!(
         r#"func.func private @{name}(%kv_pool: {pool_ty}, %start_pos: tensor<i64>, %valid: tensor<i64>) -> ({lwp_ty}, {lwf_ty}) attributes {{noinline}} {{
   %c0_page = arith.constant 0 : index
   %c1_page = arith.constant 1 : index
-  %npages = arith.constant {num_pages} : index
   %nlast = arith.constant {nlast} : index
   %clayers = arith.constant {layers} : index
   %clayer = arith.constant {layer} : index
   %page_size_idx = arith.constant {page} : index
   %start64 = tensor.extract %start_pos[] : tensor<i64>
-  %valid64 = tensor.extract %valid[] : tensor<i64>
-  %chunk_end64 = arith.addi %start64, %valid64 : i64
-  %chunk_end = arith.index_cast %chunk_end64 : i64 to index
-  %page_hi_raw = arith.ceildivui %chunk_end, %page_size_idx : index
-  %page_hi = arith.minui %page_hi_raw, %npages : index
   %start_idx = arith.index_cast %start64 : i64 to index
   %page_lo = arith.divui %start_idx, %page_size_idx : index
+  %hi_t = func.call @{hist_pages}(%start_pos, %valid) : (tensor<i64>, tensor<i64>) -> tensor<i64>
+  %hi64 = tensor.extract %hi_t[] : tensor<i64>
+  %page_hi = arith.index_cast %hi64 : i64 to index
 {write_consts}  %query, %chunk_k, %chunk_v, %out_0, %max_0, %sum_0 = func.call @{prepare}() : () -> ({qg_ty}, {kv3_ty}, {kv3_ty}, {qg_ty}, {row_ty}, {row_ty})
-{writes}  %out_f, %max_f, %sum_f = scf.for %pi = %c0_page to %page_hi step %c1_page iter_args(%out_i = %out_0, %max_i = %max_0, %sum_i = %sum_0) -> ({qg_ty}, {row_ty}, {row_ty}) {{
-    %pi_i64 = arith.index_cast %pi : index to i64
-    %pi_e = tensor.empty() : tensor<i64>
-    %pi_t = tensor.insert %pi_i64 into %pi_e[] : tensor<i64>
-    %flat_h_m = arith.muli %pi, %clayers : index
-    %flat_h = arith.addi %flat_h_m, %clayer : index
-    %hist = func.call @{page_extract}(%kv_pool, %flat_h) : ({pool_ty}, index) -> {kv1_ty}
-{select}    %kva = tensor.collapse_shape %{sel_ssa} [[0, 1], [2], [3], [4]] : {kv1_ty} into {kv_ty}
-    %out_n, %max_n, %sum_n = func.call @{layer_page}(%kva, %pi_t, %start_pos, %query, %valid, %out_i, %max_i, %sum_i) : ({kv_ty}, tensor<i64>, tensor<i64>, {qg_ty}, tensor<i64>, {qg_ty}, {row_ty}, {row_ty}) -> ({qg_ty}, {row_ty}, {row_ty})
-    scf.yield %out_n, %max_n, %sum_n : {qg_ty}, {row_ty}, {row_ty}
-  }}
-  func.call @{finish}(%out_f, %sum_f) : ({qg_ty}, {row_ty}) -> ()
+{writes}{attn_body}  func.call @{finish}(%out_f, %sum_f) : ({qg_ty}, {row_ty}) -> ()
 {pack}  return %{wp_ssa}, %{wf_ssa} : {lwp_ty}, {lwf_ty}
 }}
 "#
@@ -699,13 +815,11 @@ fn emit_paged_fused_chunk(
         c.num_kv_heads,
         c.head_dim,
     );
-    // ABI v7: packed pool is a read-only imported HAL buffer. HIP faults if
-    // we insert/concat/clone that external resource, so:
-    //   * historical pages: noinline extract + copy into a fresh tensor
-    //   * writes: page SSA packed into caller-owned write_pages/write_flats
-    //   * runtime scatters those deltas into kv_pool with D2D copies
-    // Decode must not feed layer_store insert_slice results into attention
-    // (GPU page-fault); overlay into tensor.empty() instead.
+    // ABI v7: packed pool is a read-only imported HAL buffer. Per-page gather
+    // from the full pool clones it on HIP (peak ≈ trip_count × pool) and hangs
+    // at 16k+. Each layer gathers once into a compact N-page hist; the page
+    // walk / flash reshape reads that hist. Loop bound stays opaque in
+    // hist_pages so IREE cannot unroll the portable walk to capacity.
     let num_pages = c.max_kv.div_ceil(page).max(1);
     let pool_rows = num_pages.saturating_mul(layers).max(1);
     let max_writes = paged_max_writes(c.seq, page);
@@ -1122,7 +1236,7 @@ fn emit_paged_layer_page(
     let k1_ty = format!("tensor<1x{page}x{nkv}x{d}xf32>");
     let page_seq_ty = format!("tensor<{page}x{nkv}x{d}xf32>");
     let page_head_ty = format!("tensor<{nkv}x{page}x{d}xf32>");
-    let scale_ty = if c.iree_flash_attention { "f16" } else { "f32" };
+    let scale_ty = if c.use_iree_attention() { "f16" } else { "f32" };
     let mask_helper = variant.helper("paged_causal_mask");
     let attention_helper = variant.helper("online_attention_page");
     let mut f = module.func_private(&variant.function("layer_page"));
@@ -2148,15 +2262,24 @@ fn emit_helpers(
 
     if c.paged_kv {
         if matches!(program, PagedProgram::Combined | PagedProgram::Prefill) {
-            if c.iree_flash_attention {
-                kernels::emit_iree_online_attention_page(
+            if c.use_iree_attention() {
+                let kv_len = c.max_kv.div_ceil(c.page_size).max(1).saturating_mul(c.page_size);
+                kernels::emit_iree_attention(
                     module,
-                    "online_attention_page",
+                    "iree_attention",
                     s,
-                    c.page_size,
+                    kv_len,
                     nkv,
                     g,
                     d,
+                )?;
+                kernels::emit_full_causal_mask(
+                    module,
+                    "full_causal_mask",
+                    s,
+                    kv_len,
+                    nkv,
+                    g,
                 )?;
             } else {
                 kernels::emit_online_attention_page(
@@ -2168,15 +2291,15 @@ fn emit_helpers(
                     g,
                     d,
                 )?;
+                kernels::emit_paged_causal_mask(
+                    module,
+                    "paged_causal_mask",
+                    s,
+                    c.page_size,
+                    nkv,
+                    g,
+                )?;
             }
-            kernels::emit_paged_causal_mask(
-                module,
-                "paged_causal_mask",
-                s,
-                c.page_size,
-                nkv,
-                g,
-            )?;
             if let Some(theta) = c.rope_theta {
                 kernels::emit_rope_chunk(module, "apply_rope_q_chunk", s, nh, d, theta)?;
                 kernels::emit_rope_chunk(module, "apply_rope_kv_chunk", s, nkv, d, theta)?;
@@ -2239,15 +2362,24 @@ fn emit_paged_decode_helpers(module: &mut ModuleBuilder, c: &DenseDecoderConfig)
             )?;
         }
     }
-    if c.iree_flash_attention {
-        kernels::emit_iree_online_attention_page(
+    if c.use_iree_attention() {
+        let kv_len = c.max_kv.div_ceil(c.page_size).max(1).saturating_mul(c.page_size);
+        kernels::emit_iree_attention(
             module,
-            "online_attention_page_tok",
+            "iree_attention_tok",
             s,
-            c.page_size,
+            kv_len,
             nkv,
             g,
             d,
+        )?;
+        kernels::emit_full_causal_mask(
+            module,
+            "full_causal_mask_tok",
+            s,
+            kv_len,
+            nkv,
+            g,
         )?;
     } else {
         kernels::emit_online_attention_page(
@@ -2259,15 +2391,15 @@ fn emit_paged_decode_helpers(module: &mut ModuleBuilder, c: &DenseDecoderConfig)
             g,
             d,
         )?;
+        kernels::emit_paged_causal_mask(
+            module,
+            "paged_causal_mask_tok",
+            s,
+            c.page_size,
+            nkv,
+            g,
+        )?;
     }
-    kernels::emit_paged_causal_mask(
-        module,
-        "paged_causal_mask_tok",
-        s,
-        c.page_size,
-        nkv,
-        g,
-    )?;
     if let Some(theta) = c.rope_theta {
         kernels::emit_rope_chunk(module, "apply_rope_q_chunk_tok", s, nh, d, theta)?;
         kernels::emit_rope_chunk(module, "apply_rope_kv_chunk_tok", s, nkv, d, theta)?;
@@ -3670,8 +3802,11 @@ mod tests {
             "kv_pool must not be abi.output (HIP overlapping clone)"
         );
         assert!(
-            mlir.contains("@page_extract") && mlir.contains("@decode_page_extract"),
-            "historical pages must be cloned out of the imported pool"
+            mlir.contains("@layer_hist")
+                && mlir.contains("@decode_layer_hist")
+                && mlir.contains("@hist_extract")
+                && mlir.contains("@hist_pages"),
+            "each layer gathers compact hist once; page walk bound is opaque"
         );
         assert!(
             mlir.contains("@fused_attn_0") && mlir.contains("@decode_fused_attn_0"),

@@ -3,9 +3,29 @@
 use dyninfer_error::Result;
 use dyninfer_mlir::{FuncBuilder, ModuleBuilder, Value};
 
+/// WMMA-R3 tiles are 16 along N (`head_dim`). The previous hardcoded `64`
+/// failed to distribute on TinyLlama (`head_dim=16`) on gfx1151.
+#[allow(dead_code)]
+fn flash_n_tile(head_dim: u32) -> u32 {
+    let cap = 64.min(head_dim);
+    let mut tile = cap - (cap % 16);
+    if tile == 0 {
+        tile = 16;
+    }
+    while tile > 16 && head_dim % tile != 0 {
+        tile -= 16;
+    }
+    tile
+}
+
 /// One page of numerically stable online attention. The returned accumulator,
 /// row maximum, and row sum can be fed into the next page without materializing
 /// a query-by-context score tensor.
+///
+/// Kept for HIP experiments; gfx1151 KernelConfig does not select
+/// VectorDistribute for `online_attention` (iree#24064). Production HIP uses
+/// [`emit_iree_attention`] instead.
+#[allow(dead_code)]
 pub fn emit_iree_online_attention_page(
     module: &mut ModuleBuilder,
     name: &str,
@@ -32,51 +52,55 @@ pub fn emit_iree_online_attention_page(
     let row_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}xf32>");
     let row_flat_ty = format!("tensor<{kv_heads}x{flash_queries}xf32>");
     let row_kernel_ty = format!("tensor<{kv_heads}x{kernel_queries}xf32>");
+    let n_tile = flash_n_tile(head_dim);
+    // gfx1151 KernelConfig matches `iree_linalg_ext.attention`, not
+    // `online_attention` (iree#24064). These compilation_info attrs force
+    // LLVMGPUVectorDistribute when we must emit the online op for page merge.
     let flash_config = if query_len == 1 {
-        String::from(
+        format!(
             r#"compilation_info = #iree_codegen.compilation_info<
-        lowering_config = #iree_gpu.lowering_config<{
+        lowering_config = #iree_gpu.lowering_config<{{
           promote_operands = [0, 1, 2],
           reduction = [0, 0, 0, 64, 0],
-          workgroup = [1, 16, 0, 0, 64]}>,
+          workgroup = [1, 16, 0, 0, {n_tile}]}}>,
         translation_info = #iree_codegen.translation_info<
           pipeline = LLVMGPUVectorDistribute
           workgroup_size = [32, 1, 1]
           subgroup_size = 32,
-          {iree_codegen.denormal_fp_math_f32 = #iree_codegen.denormal_fp_math<"preserve-sign">}>>,
-      decomposition_config = {
-        pv_attrs = {lowering_config = #iree_gpu.lowering_config<{
+          {{iree_codegen.denormal_fp_math_f32 = #iree_codegen.denormal_fp_math<"preserve-sign">}}>>,
+      decomposition_config = {{
+        pv_attrs = {{lowering_config = #iree_gpu.lowering_config<{{
           mma_kind = #iree_gpu.mma_layout<WMMAR3_F32_16x16x16_F16>,
           promote_operands = [1],
-          subgroup_basis = [[1, 1, 1, 1, 1], [0, 1, 3, 4]]}>},
-        qk_attrs = {lowering_config = #iree_gpu.lowering_config<{
+          subgroup_basis = [[1, 1, 1, 1, 1], [0, 1, 3, 4]]}}>}},
+        qk_attrs = {{lowering_config = #iree_gpu.lowering_config<{{
           mma_kind = #iree_gpu.mma_layout<WMMAR3_F32_16x16x16_F16>,
           promote_operands = [0, 1],
-          subgroup_basis = [[1, 1, 1, 1, 1], [0, 1, 2, 3]]}>}},
-"#,
+          subgroup_basis = [[1, 1, 1, 1, 1], [0, 1, 2, 3]]}}>}}}},
+"#
         )
     } else {
-        String::from(
+        format!(
             r#"compilation_info = #iree_codegen.compilation_info<
-        lowering_config = #iree_gpu.lowering_config<{
+        lowering_config = #iree_gpu.lowering_config<{{
           promote_operands = [0, 1, 2],
           reduction = [0, 0, 0, 64, 0],
-          workgroup = [1, 64, 0, 0, 64]}>,
+          workgroup = [1, 64, 0, 0, {n_tile}]}}>,
         translation_info = #iree_codegen.translation_info<
           pipeline = LLVMGPUVectorDistribute
           workgroup_size = [128, 1, 1]
           subgroup_size = 32,
-          {iree_codegen.denormal_fp_math_f32 = #iree_codegen.denormal_fp_math<"preserve-sign">}>>,
-      decomposition_config = {
-        pv_attrs = {lowering_config = #iree_gpu.lowering_config<{
+          {{iree_codegen.denormal_fp_math_f32 = #iree_codegen.denormal_fp_math<"preserve-sign">}}>>,
+      decomposition_config = {{
+        pv_attrs = {{lowering_config = #iree_gpu.lowering_config<{{
           mma_kind = #iree_gpu.mma_layout<WMMAR3_F32_16x16x16_F16>,
           promote_operands = [1],
-          subgroup_basis = [[1, 4, 1, 1, 1], [0, 1, 3, 4]]}>},
-        qk_attrs = {lowering_config = #iree_gpu.lowering_config<{
+          subgroup_basis = [[1, 4, 1, 1, 1], [0, 1, 3, 4]]}}>}},
+        qk_attrs = {{lowering_config = #iree_gpu.lowering_config<{{
           mma_kind = #iree_gpu.mma_layout<WMMAR3_F32_16x16x16_F16>,
           promote_operands = [0, 1],
-          subgroup_basis = [[1, 4, 1, 1, 1], [0, 1, 2, 3]]}>}},
-"#,
+          subgroup_basis = [[1, 4, 1, 1, 1], [0, 1, 2, 3]]}}>}}}},
+"#
         )
     };
 
@@ -182,6 +206,107 @@ pub fn emit_iree_online_attention_page(
   %sum_next = tensor.expand_shape %{sum_result} [[0], [1, 2]] output_shape [{kv_heads}, {gqa_group}, {query_len}] : {row_flat_ty} into {row_ty}
   return %output_next, %max_next, %sum_next : {q_ty}, {row_ty}, {row_ty}
 "#,
+    ));
+    f.finish(module)
+}
+
+/// Full-context `iree_linalg_ext.attention`. gfx1151 KernelConfig selects
+/// VectorDistribute for AttentionOp and then converts it to online attention
+/// internally (iree#24064). Prefer this over emitting `online_attention`.
+pub fn emit_iree_attention(
+    module: &mut ModuleBuilder,
+    name: &str,
+    query_len: u32,
+    kv_len: u32,
+    kv_heads: u32,
+    gqa_group: u32,
+    head_dim: u32,
+) -> Result<()> {
+    let flash_queries = gqa_group * query_len;
+    let q_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}x{head_dim}xf32>");
+    let q_flash_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}x{head_dim}xf16>");
+    let q_flat_ty = format!("tensor<{kv_heads}x{flash_queries}x{head_dim}xf16>");
+    let output_flat_ty = format!("tensor<{kv_heads}x{flash_queries}x{head_dim}xf32>");
+    let kv_ty = format!("tensor<{kv_heads}x{kv_len}x{head_dim}xf32>");
+    let kv_flash_ty = format!("tensor<{kv_heads}x{kv_len}x{head_dim}xf16>");
+    let mask_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}x{kv_len}xf32>");
+    let mask_flash_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}x{kv_len}xf16>");
+    let mask_flat_ty = format!("tensor<{kv_heads}x{flash_queries}x{kv_len}xf16>");
+    let mut f = module.func_private(name);
+    f.arg("q", &q_ty);
+    f.arg("k", &kv_ty);
+    f.arg("v", &kv_ty);
+    f.arg("scale", "f16");
+    f.arg("mask", &mask_ty);
+    f.arg("output", &q_ty);
+    f.result_ty(&q_ty);
+    f.op_asm(format!(
+        r#"  %q16 = arith.truncf %q : {q_ty} to {q_flash_ty}
+  %k16 = arith.truncf %k : {kv_ty} to {kv_flash_ty}
+  %v16 = arith.truncf %v : {kv_ty} to {kv_flash_ty}
+  %mask16 = arith.truncf %mask : {mask_ty} to {mask_flash_ty}
+  %q_flat = tensor.collapse_shape %q16 [[0], [1, 2], [3]] : {q_flash_ty} into {q_flat_ty}
+  %mask_flat = tensor.collapse_shape %mask16 [[0], [1, 2], [3]] : {mask_flash_ty} into {mask_flat_ty}
+  %output_flat = tensor.collapse_shape %output [[0], [1, 2], [3]] : {q_ty} into {output_flat_ty}
+  %next = iree_linalg_ext.attention {{
+      indexing_maps = [
+        affine_map<(h, q, d, p, n) -> (h, q, d)>,
+        affine_map<(h, q, d, p, n) -> (h, p, d)>,
+        affine_map<(h, q, d, p, n) -> (h, p, n)>,
+        affine_map<(h, q, d, p, n) -> ()>,
+        affine_map<(h, q, d, p, n) -> (h, q, p)>,
+        affine_map<(h, q, d, p, n) -> (h, q, n)>
+      ]
+    }} ins(%q_flat, %k16, %v16, %scale, %mask_flat : {q_flat_ty}, {kv_flash_ty}, {kv_flash_ty}, f16, {mask_flat_ty})
+       outs(%output_flat : {output_flat_ty}) {{
+    ^bb0(%score: f32):
+      iree_linalg_ext.yield %score : f32
+  }} -> {output_flat_ty}
+  %output_next = tensor.expand_shape %next [[0], [1, 2], [3]] output_shape [{kv_heads}, {gqa_group}, {query_len}, {head_dim}] : {output_flat_ty} into {q_ty}
+  return %output_next : {q_ty}
+"#
+    ));
+    f.finish(module)
+}
+
+/// Causal + written-range mask over a packed KV length (`num_pages * page`).
+pub fn emit_full_causal_mask(
+    module: &mut ModuleBuilder,
+    name: &str,
+    query_len: u32,
+    kv_len: u32,
+    kv_heads: u32,
+    gqa_group: u32,
+) -> Result<()> {
+    let mask_ty = format!("tensor<{kv_heads}x{gqa_group}x{query_len}x{kv_len}xf32>");
+    let mut f = module.func_private(name);
+    f.arg("start_pos", "tensor<i64>");
+    f.arg("valid_count", "tensor<i64>");
+    f.result_ty(&mask_ty);
+    f.op_asm(format!(
+        r#"  %start64 = tensor.extract %start_pos[] : tensor<i64>
+  %valid64 = tensor.extract %valid_count[] : tensor<i64>
+  %seq_end = arith.addi %start64, %valid64 : i64
+  %zero = arith.constant 0.0 : f32
+  %neg = arith.constant -3.40282347E+38 : f32
+  %empty = tensor.empty() : {mask_ty}
+  %mask = linalg.generic {{
+      indexing_maps = [affine_map<(kh, g, q, k) -> (kh, g, q, k)>],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel"]}}
+    outs(%empty : {mask_ty}) {{
+    ^bb0(%o: f32):
+      %q = linalg.index 2 : index
+      %k = linalg.index 3 : index
+      %q64 = arith.index_cast %q : index to i64
+      %k64 = arith.index_cast %k : index to i64
+      %abs_q = arith.addi %start64, %q64 : i64
+      %causal = arith.cmpi ule, %k64, %abs_q : i64
+      %written = arith.cmpi ult, %k64, %seq_end : i64
+      %visible = arith.andi %causal, %written : i1
+      %value = arith.select %visible, %zero, %neg : f32
+      linalg.yield %value : f32
+  }} -> {mask_ty}
+  return %mask : {mask_ty}"#
     ));
     f.finish(module)
 }
@@ -483,6 +608,23 @@ mod online_attention_tests {
         assert!(text.contains("iree_linalg_ext.online_attention"));
         assert!(text.contains("math.powf"));
         assert!(!text.contains("tensor<8x4096x4096"));
+        let mut attn_mod = ModuleBuilder::new().unwrap();
+        emit_iree_attention(&mut attn_mod, "iree_attn", 1, 1024, 8, 2, 128).unwrap();
+        emit_full_causal_mask(&mut attn_mod, "full_mask", 1, 1024, 8, 2).unwrap();
+        let attn_text = attn_mod.finish().unwrap().mlir_text;
+        assert!(attn_text.contains("iree_linalg_ext.attention"));
+        assert!(!attn_text.contains("iree_linalg_ext.online_attention"));
+    }
+
+    #[test]
+    fn tiny_head_dim_flash_uses_matching_n_tile() {
+        let mut module = ModuleBuilder::new().unwrap();
+        emit_iree_online_attention_page(&mut module, "tiny_flash", 32, 256, 4, 1, 16).unwrap();
+        let text = module.finish().unwrap().mlir_text;
+        assert!(
+            text.contains("workgroup = [1, 64, 0, 0, 16]"),
+            "head_dim=16 must not request an N tile of 64"
+        );
     }
 
     #[test]
@@ -544,6 +686,41 @@ mod online_attention_tests {
         }
         iree_compiler_sys::compile_mlir_to_vmfb(&mlir, &flags)
             .expect("one-token HIP Flash Attention must compile");
+    }
+
+    #[test]
+    fn hip_iree_attention_compiles_when_requested() {
+        if std::env::var_os("DYNINFER_HIP_FLASH_DECODE").is_none() {
+            return;
+        }
+        let mut module = ModuleBuilder::new().unwrap();
+        emit_iree_attention(&mut module, "attn_impl", 1, 1024, 8, 2, 128).unwrap();
+        let q = "tensor<8x2x1x128xf32>";
+        let kv = "tensor<8x1024x128xf32>";
+        let mask = "tensor<8x2x1x1024xf32>";
+        let mut f = module.func("decode_attn");
+        f.arg("q", q);
+        f.arg("k", kv);
+        f.arg("v", kv);
+        f.arg("scale", "f16");
+        f.arg("mask", mask);
+        f.arg("output", q);
+        f.result_ty(q);
+        f.op_asm(format!(
+            "  %next = func.call @attn_impl(%q, %k, %v, %scale, %mask, %output) : ({q}, {kv}, {kv}, f16, {mask}, {q}) -> {q}\n  return %next : {q}"
+        ));
+        f.finish(&mut module).unwrap();
+        let mlir = module.finish().unwrap().mlir_text;
+        let arch = std::env::var("DYNINFER_HIP_ARCH").unwrap_or_else(|_| "gfx1151".into());
+        let mut flags = vec![
+            "--iree-hal-target-device=hip".into(),
+            format!("--iree-rocm-target={arch}"),
+        ];
+        if let Some(path) = iree_compiler_sys::discover_rocm_bc_dir() {
+            flags.push(format!("--iree-rocm-bc-dir={}", path.display()));
+        }
+        iree_compiler_sys::compile_mlir_to_vmfb(&mlir, &flags)
+            .expect("HIP iree_linalg_ext.attention must compile on gfx1151");
     }
 
     #[test]
