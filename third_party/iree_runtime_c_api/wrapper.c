@@ -56,9 +56,10 @@ struct dyninfer_iree_session_t {
   size_t paged_write_n;
   float* logits_host;
   size_t logits_capacity;
-  // ABI v9: one tied hist per layer [pages, 2, page, nkv, d]. fused_attn
-  // writes pages in-graph; HIP must not snapshot-clone a read-only import.
-  iree_hal_buffer_view_t* kv_layers[DYNINFER_MAX_PAGED_LAYERS];
+  // ABI v10: packed K and V per layer [nkv, kv_len, d], kv_len = pages * page.
+  // fused_attn insert_slices the written page and attends in-place.
+  iree_hal_buffer_view_t* kv_k[DYNINFER_MAX_PAGED_LAYERS];
+  iree_hal_buffer_view_t* kv_v[DYNINFER_MAX_PAGED_LAYERS];
   size_t kv_layer_n;
   size_t kv_page_count;
   size_t kv_layer_count;
@@ -600,7 +601,8 @@ void dyninfer_iree_session_destroy(dyninfer_iree_session_t* session) {
   iree_hal_buffer_view_release(session->paged_write_pages);
   iree_hal_buffer_view_release(session->paged_write_flats);
   for (size_t i = 0; i < session->kv_layer_n; ++i) {
-    iree_hal_buffer_view_release(session->kv_layers[i]);
+    iree_hal_buffer_view_release(session->kv_k[i]);
+    iree_hal_buffer_view_release(session->kv_v[i]);
   }
   free(session->logits_host);
   iree_runtime_session_release(session->session);
@@ -806,8 +808,10 @@ int dyninfer_iree_session_ensure_kv_pages(dyninfer_iree_session_t* session,
     return 0;
   }
   for (size_t i = 0; i < session->kv_layer_n; ++i) {
-    iree_hal_buffer_view_release(session->kv_layers[i]);
-    session->kv_layers[i] = NULL;
+    iree_hal_buffer_view_release(session->kv_k[i]);
+    session->kv_k[i] = NULL;
+    iree_hal_buffer_view_release(session->kv_v[i]);
+    session->kv_v[i] = NULL;
   }
   session->kv_layer_n = 0;
   session->kv_page_count = 0;
@@ -818,66 +822,83 @@ int dyninfer_iree_session_ensure_kv_pages(dyninfer_iree_session_t* session,
     set_error_msg("KV layer count overflow");
     return 1;
   }
-  size_t layer_elems = page_count;
-  const size_t factors[4] = {2, session->kv_page_size, session->kv_head_count,
-                             session->kv_head_dim};
-  for (size_t i = 0; i < 4; ++i) {
-    if (factors[i] == 0 || layer_elems > SIZE_MAX / factors[i]) {
-      set_error_msg("KV hist size overflow");
-      return 1;
-    }
-    layer_elems *= factors[i];
-  }
-  if (layer_elems > SIZE_MAX / sizeof(float)) {
-    set_error_msg("KV hist byte size overflow");
+  if (session->kv_page_size == 0 ||
+      page_count > SIZE_MAX / session->kv_page_size) {
+    set_error_msg("KV packed length overflow");
     return 1;
   }
-  const size_t layer_bytes = layer_elems * sizeof(float);
-  if (session->kv_layer_count > SIZE_MAX / layer_bytes) {
+  const size_t kv_len = page_count * session->kv_page_size;
+  size_t plane_elems = session->kv_head_count;
+  const size_t factors[2] = {kv_len, session->kv_head_dim};
+  for (size_t i = 0; i < 2; ++i) {
+    if (factors[i] == 0 || plane_elems > SIZE_MAX / factors[i]) {
+      set_error_msg("KV packed size overflow");
+      return 1;
+    }
+    plane_elems *= factors[i];
+  }
+  if (plane_elems > SIZE_MAX / sizeof(float)) {
+    set_error_msg("KV packed byte size overflow");
+    return 1;
+  }
+  const size_t plane_bytes = plane_elems * sizeof(float);
+  if (session->kv_layer_count > SIZE_MAX / 2 ||
+      session->kv_layer_count * 2 > SIZE_MAX / plane_bytes) {
     set_error_msg("KV pool byte size overflow");
     return 1;
   }
-  iree_hal_dim_t shape[5] = {
-      (iree_hal_dim_t)page_count,
-      2,
-      (iree_hal_dim_t)session->kv_page_size,
+  iree_hal_dim_t shape[3] = {
       (iree_hal_dim_t)session->kv_head_count,
+      (iree_hal_dim_t)kv_len,
       (iree_hal_dim_t)session->kv_head_dim};
-  // Host-zero + H2D when possible. Fall back to device fill for large hists.
-  float* zeros = (float*)calloc(layer_elems, sizeof(float));
+  float* zeros = (float*)calloc(plane_elems, sizeof(float));
   iree_status_t status = iree_ok_status();
   for (size_t layer = 0; layer < session->kv_layer_count; ++layer) {
-    iree_hal_buffer_view_t* hist = NULL;
+    iree_hal_buffer_view_t* k = NULL;
+    iree_hal_buffer_view_t* v = NULL;
     if (zeros) {
-      status = allocate_f32_tensor(session->session, 5, shape, zeros,
-                                   layer_elems, &hist);
+      status = allocate_f32_tensor(session->session, 3, shape, zeros,
+                                   plane_elems, &k);
+      if (iree_status_is_ok(status)) {
+        status = allocate_f32_tensor(session->session, 3, shape, zeros,
+                                     plane_elems, &v);
+      }
     } else {
-      status = allocate_empty_f32_tensor(session->session, 5, shape,
-                                         layer_elems, &hist);
+      status = allocate_empty_f32_tensor(session->session, 3, shape,
+                                         plane_elems, &k);
+      if (iree_status_is_ok(status)) {
+        status = allocate_empty_f32_tensor(session->session, 3, shape,
+                                           plane_elems, &v);
+      }
     }
     if (!iree_status_is_ok(status)) {
+      iree_hal_buffer_view_release(k);
+      iree_hal_buffer_view_release(v);
       for (size_t i = 0; i < layer; ++i) {
-        iree_hal_buffer_view_release(session->kv_layers[i]);
-        session->kv_layers[i] = NULL;
+        iree_hal_buffer_view_release(session->kv_k[i]);
+        session->kv_k[i] = NULL;
+        iree_hal_buffer_view_release(session->kv_v[i]);
+        session->kv_v[i] = NULL;
       }
       free(zeros);
       char msg[256];
       snprintf(msg, sizeof(msg),
-               "allocating KV hist layer %zu (%zu pages, %.2f MiB): see IREE status",
-               layer, page_count,
-               (double)layer_bytes / (1024.0 * 1024.0));
+               "allocating packed KV layer %zu (%zu tok, %.2f MiB): see IREE status",
+               layer, kv_len,
+               (double)(plane_bytes * 2) / (1024.0 * 1024.0));
       set_error_status(status);
       if (g_last_error[0] == '\0') {
         set_error_msg(msg);
       }
       return 1;
     }
-    session->kv_layers[layer] = hist;
+    session->kv_k[layer] = k;
+    session->kv_v[layer] = v;
   }
   free(zeros);
   session->kv_layer_n = session->kv_layer_count;
   session->kv_page_count = page_count;
-  session->kv_allocated_bytes = layer_bytes * session->kv_layer_count;
+  session->kv_allocated_bytes = plane_bytes * 2 * session->kv_layer_count;
   return 0;
 }
 
@@ -914,6 +935,21 @@ static iree_status_t copy_i64_scalar_view_to_host(iree_runtime_session_t* sessio
       iree_infinite_timeout());
 }
 
+static void adopt_tied_kv_view(iree_hal_buffer_view_t** stored,
+                               iree_hal_buffer_view_t* out,
+                               uint64_t* alias_n, uint64_t* clone_n) {
+  iree_hal_buffer_t* in_buf = iree_hal_buffer_view_buffer(*stored);
+  iree_hal_buffer_t* out_buf = iree_hal_buffer_view_buffer(out);
+  if (in_buf != out_buf) {
+    (*clone_n)++;
+    iree_hal_buffer_view_release(*stored);
+    *stored = out;
+  } else {
+    (*alias_n)++;
+    iree_hal_buffer_view_release(out);
+  }
+}
+
 static iree_status_t invoke_paged_chunk_once(
     dyninfer_iree_session_t* wrapper, dyninfer_cached_call_t* cached,
     const char* full_name, iree_hal_buffer_view_t* v_tokens,
@@ -946,14 +982,18 @@ static iree_status_t invoke_paged_chunk_once(
   for (size_t layer = 0; iree_status_is_ok(status) && layer < wrapper->kv_layer_n;
        ++layer) {
     status = iree_runtime_call_inputs_push_back_buffer_view(
-        call, wrapper->kv_layers[layer]);
+        call, wrapper->kv_k[layer]);
+    if (iree_status_is_ok(status)) {
+      status = iree_runtime_call_inputs_push_back_buffer_view(
+          call, wrapper->kv_v[layer]);
+    }
   }
   if (iree_status_is_ok(status)) {
     g_paged_step = "invoke";
     status = iree_runtime_call_invoke(call, /*flags=*/0);
   }
 
-  // Results: logits (abi.output alias), tied layer hists, argmax token.
+  // Results: logits (abi.output alias), tied packed K/V per layer, argmax token.
   iree_hal_buffer_view_t* logits_view = NULL;
   if (iree_status_is_ok(status)) {
     g_paged_step = "pop_logits";
@@ -976,24 +1016,23 @@ static iree_status_t invoke_paged_chunk_once(
 
   for (size_t layer = 0; iree_status_is_ok(status) && layer < wrapper->kv_layer_n;
        ++layer) {
-    iree_hal_buffer_view_t* hist_out = NULL;
-    g_paged_step = "pop_hist";
-    status =
-        iree_runtime_call_outputs_pop_front_buffer_view(call, &hist_out);
+    iree_hal_buffer_view_t* k_out = NULL;
+    iree_hal_buffer_view_t* v_out = NULL;
+    g_paged_step = "pop_k";
+    status = iree_runtime_call_outputs_pop_front_buffer_view(call, &k_out);
+    if (iree_status_is_ok(status)) {
+      g_paged_step = "pop_v";
+      status = iree_runtime_call_outputs_pop_front_buffer_view(call, &v_out);
+    }
     if (!iree_status_is_ok(status)) {
+      iree_hal_buffer_view_release(k_out);
+      iree_hal_buffer_view_release(v_out);
       break;
     }
-    iree_hal_buffer_t* in_buf =
-        iree_hal_buffer_view_buffer(wrapper->kv_layers[layer]);
-    iree_hal_buffer_t* out_buf = iree_hal_buffer_view_buffer(hist_out);
-    if (in_buf != out_buf) {
-      wrapper->hist_clone_n++;
-      iree_hal_buffer_view_release(wrapper->kv_layers[layer]);
-      wrapper->kv_layers[layer] = hist_out;
-    } else {
-      wrapper->hist_alias_n++;
-      iree_hal_buffer_view_release(hist_out);
-    }
+    adopt_tied_kv_view(&wrapper->kv_k[layer], k_out, &wrapper->hist_alias_n,
+                       &wrapper->hist_clone_n);
+    adopt_tied_kv_view(&wrapper->kv_v[layer], v_out, &wrapper->hist_alias_n,
+                       &wrapper->hist_clone_n);
   }
 
   iree_hal_buffer_view_t* token_view = NULL;
@@ -1071,21 +1110,24 @@ int dyninfer_iree_session_reset_paged_kv(dyninfer_iree_session_t* session) {
   }
   // Zero in place — avoid free/realloc of multi-GB hists between iters.
   for (size_t i = 0; i < session->kv_layer_n; ++i) {
-    iree_hal_buffer_t* buffer =
-        iree_hal_buffer_view_buffer(session->kv_layers[i]);
-    iree_device_size_t bytes =
-        iree_hal_buffer_view_byte_length(session->kv_layers[i]);
-    iree_status_t status = zero_device_buffer(session->device, buffer, bytes);
-    if (!iree_status_is_ok(status)) {
-      for (size_t j = 0; j < session->kv_layer_n; ++j) {
-        iree_hal_buffer_view_release(session->kv_layers[j]);
-        session->kv_layers[j] = NULL;
+    iree_hal_buffer_view_t* views[2] = {session->kv_k[i], session->kv_v[i]};
+    for (int p = 0; p < 2; ++p) {
+      iree_hal_buffer_t* buffer = iree_hal_buffer_view_buffer(views[p]);
+      iree_device_size_t bytes = iree_hal_buffer_view_byte_length(views[p]);
+      iree_status_t status = zero_device_buffer(session->device, buffer, bytes);
+      if (!iree_status_is_ok(status)) {
+        for (size_t j = 0; j < session->kv_layer_n; ++j) {
+          iree_hal_buffer_view_release(session->kv_k[j]);
+          session->kv_k[j] = NULL;
+          iree_hal_buffer_view_release(session->kv_v[j]);
+          session->kv_v[j] = NULL;
+        }
+        session->kv_layer_n = 0;
+        session->kv_page_count = 0;
+        session->kv_allocated_bytes = 0;
+        set_error_status(status);
+        return 1;
       }
-      session->kv_layer_n = 0;
-      session->kv_page_count = 0;
-      session->kv_allocated_bytes = 0;
-      set_error_status(status);
-      return 1;
     }
   }
   return 0;
