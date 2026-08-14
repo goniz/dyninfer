@@ -147,6 +147,10 @@ impl CausalLanguageModel for LoadedModel {
         &self.metadata
     }
 
+    fn target_profile(&self) -> Option<&dyninfer_core::TargetProfile> {
+        Some(&self.manifest.target)
+    }
+
     fn create_session(&self, config: SessionConfig) -> Result<Box<dyn ModelSession>> {
         // Each session must own its own context: the VMFB keeps mutable KV in
         // util.global state inside a single native IREE session.

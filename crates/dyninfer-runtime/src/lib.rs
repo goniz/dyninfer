@@ -38,11 +38,15 @@ pub use reference::{
 pub use session::{IreeSession, Logits};
 pub use tokenizer_bpe::BpeTokenizer;
 
-use dyninfer_core::{ModelMetadata, ScalarType, SessionConfig, TokenId};
+use dyninfer_core::{ModelMetadata, ScalarType, SessionConfig, TargetProfile, TokenId};
 use dyninfer_error::Result;
 
 pub trait CausalLanguageModel: Send + Sync {
     fn metadata(&self) -> &ModelMetadata;
+    /// Exact execution target selected when this model was compiled and loaded.
+    fn target_profile(&self) -> Option<&TargetProfile> {
+        None
+    }
     fn create_session(&self, config: SessionConfig) -> Result<Box<dyn ModelSession>>;
 }
 

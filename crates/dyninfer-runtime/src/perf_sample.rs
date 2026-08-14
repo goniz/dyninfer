@@ -1,5 +1,6 @@
 //! Host/GPU resource sampling during prefill/decode phases.
 
+use dyninfer_core::TargetProfile;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,15 +51,17 @@ pub struct PhaseSampler {
     handle: Option<JoinHandle<()>>,
     started: Instant,
     start_cpu_ticks: Option<u64>,
+    gpu: Option<GpuPaths>,
 }
 
 impl PhaseSampler {
-    pub fn start() -> Self {
+    pub fn start(target: Option<&TargetProfile>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let samples = Arc::new(Mutex::new(Vec::new()));
         let stop_t = Arc::clone(&stop);
         let samples_t = Arc::clone(&samples);
-        let gpu = discover_gpu_paths();
+        let gpu = discover_gpu_paths(target);
+        let worker_gpu = gpu.clone();
         let start_cpu_ticks = read_process_cpu_ticks();
         let started = Instant::now();
         let handle = thread::spawn(move || {
@@ -67,7 +70,7 @@ impl PhaseSampler {
             // Seed with an immediate sample so short phases still report RSS.
             {
                 let mut guard = samples_t.lock().unwrap_or_else(|e| e.into_inner());
-                guard.push(take_sample(&gpu, None));
+                guard.push(take_sample(&worker_gpu, None));
             }
             while !stop_t.load(Ordering::Relaxed) {
                 thread::sleep(SAMPLE_INTERVAL);
@@ -84,7 +87,7 @@ impl PhaseSampler {
                 };
                 prev_cpu = cpu_now;
                 prev_wall = Instant::now();
-                let sample = take_sample(&gpu, cpu_pct);
+                let sample = take_sample(&worker_gpu, cpu_pct);
                 if let Ok(mut guard) = samples_t.lock() {
                     guard.push(sample);
                 }
@@ -96,6 +99,7 @@ impl PhaseSampler {
             handle: Some(handle),
             started,
             start_cpu_ticks,
+            gpu,
         }
     }
 
@@ -125,8 +129,7 @@ impl PhaseSampler {
             }
         }
         // Final RSS/GPU snapshot at stop.
-        let gpu = discover_gpu_paths();
-        samples.push(take_sample(&gpu, None));
+        samples.push(take_sample(&self.gpu, None));
         aggregate_samples(&samples)
     }
 
@@ -231,8 +234,16 @@ struct GpuPaths {
     gtt_used: PathBuf,
 }
 
-fn discover_gpu_paths() -> Option<GpuPaths> {
-    let drm = Path::new("/sys/class/drm");
+fn discover_gpu_paths(target: Option<&TargetProfile>) -> Option<GpuPaths> {
+    discover_gpu_paths_at(Path::new("/sys/class/drm"), target?)
+}
+
+fn discover_gpu_paths_at(drm: &Path, target: &TargetProfile) -> Option<GpuPaths> {
+    let expected_driver = match target.driver.as_str() {
+        "hip" | "rocm" => "amdgpu",
+        "cuda" => "nvidia",
+        _ => return None,
+    };
     let entries = fs::read_dir(drm).ok()?;
     let mut cards: Vec<PathBuf> = entries
         .flatten()
@@ -243,24 +254,92 @@ fn discover_gpu_paths() -> Option<GpuPaths> {
                 .is_some_and(|n| n.starts_with("card") && !n.contains('-'))
         })
         .collect();
-    cards.sort();
-    for card in cards {
-        let device = card.join("device");
-        let gpu_busy = device.join("gpu_busy_percent");
-        let mem_busy = device.join("mem_busy_percent");
-        let vram_used = device.join("mem_info_vram_used");
-        let gtt_used = device.join("mem_info_gtt_used");
-        // Prefer cards that expose at least busy% or memory accounting.
-        if gpu_busy.is_file() || vram_used.is_file() || gtt_used.is_file() {
-            return Some(GpuPaths {
-                gpu_busy,
-                mem_busy,
-                vram_used,
-                gtt_used,
-            });
-        }
+    cards.sort_by_key(|card| card_index(card).unwrap_or(u32::MAX));
+    let candidates: Vec<(PathBuf, GpuPaths)> = cards
+        .into_iter()
+        .filter_map(|card| {
+            let device = card.join("device");
+            if read_uevent_value(&device.join("uevent"), "DRIVER").as_deref()
+                != Some(expected_driver)
+            {
+                return None;
+            }
+            let gpu_busy = device.join("gpu_busy_percent");
+            let mem_busy = device.join("mem_busy_percent");
+            let vram_used = device.join("mem_info_vram_used");
+            let gtt_used = device.join("mem_info_gtt_used");
+            Some((
+                device,
+                GpuPaths {
+                    gpu_busy,
+                    mem_busy,
+                    vram_used,
+                    gtt_used,
+                },
+            ))
+        })
+        .collect();
+
+    // HIP/CUDA URIs use stable GPU UUIDs. Prefer an exact sysfs UUID match so
+    // visibility masks and differing enumeration order cannot select another
+    // card's counters.
+    if let Some(uri_id) = target.device_uri.as_deref().and_then(normalize_gpu_id)
+        && let Some((_, paths)) = candidates.iter().find(|(device, paths)| {
+            has_gpu_metrics(paths)
+                && fs::read_to_string(device.join("unique_id"))
+                    .ok()
+                    .and_then(|id| normalize_gpu_id(&id))
+                    .as_ref()
+                    == Some(&uri_id)
+        })
+    {
+        return Some(paths.clone());
     }
-    None
+
+    // IREE assigns device_id within each driver. This is the fallback for
+    // drivers/kernels that do not expose a UUID in DRM sysfs.
+    target
+        .device_id
+        .and_then(|id| candidates.get(id as usize))
+        .map(|(_, paths)| paths.clone())
+        .filter(has_gpu_metrics)
+}
+
+fn has_gpu_metrics(paths: &GpuPaths) -> bool {
+    paths.gpu_busy.is_file() || paths.vram_used.is_file() || paths.gtt_used.is_file()
+}
+
+fn card_index(path: &Path) -> Option<u32> {
+    path.file_name()?
+        .to_str()?
+        .strip_prefix("card")?
+        .parse()
+        .ok()
+}
+
+fn read_uevent_value(path: &Path, key: &str) -> Option<String> {
+    fs::read_to_string(path).ok()?.lines().find_map(|line| {
+        line.strip_prefix(key)
+            .and_then(|rest| rest.strip_prefix('='))
+            .map(str::to_owned)
+    })
+}
+
+fn normalize_gpu_id(value: &str) -> Option<String> {
+    let device = value
+        .trim()
+        .rsplit_once("://")
+        .map_or(value.trim(), |(_, id)| id);
+    let hex: String = device
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    if hex.is_empty() {
+        return None;
+    }
+    let trimmed = hex.trim_start_matches('0');
+    Some(if trimmed.is_empty() { "0" } else { trimmed }.to_string())
 }
 
 fn read_vm_rss_bytes() -> Option<u64> {
@@ -344,7 +423,7 @@ mod tests {
 
     #[test]
     fn sampler_reports_rss() {
-        let sampler = PhaseSampler::start();
+        let sampler = PhaseSampler::start(None);
         thread::sleep(Duration::from_millis(80));
         let stats = sampler.stop();
         assert!(stats.sample_count >= 1);
@@ -353,7 +432,47 @@ mod tests {
 
     #[test]
     fn sampler_drop_joins_worker() {
-        let sampler = PhaseSampler::start();
+        let sampler = PhaseSampler::start(None);
         drop(sampler);
+    }
+
+    #[test]
+    fn gpu_discovery_uses_selected_device_id() {
+        let dir = tempfile::tempdir().unwrap();
+        make_fake_card(dir.path(), 0, "amdgpu", None);
+        make_fake_card(dir.path(), 1, "amdgpu", None);
+        let target = TargetProfile::hip_rocm("gfx1151").with_device_identity(
+            1,
+            "hip://GPU-unmatched",
+            "selected",
+        );
+
+        let paths = discover_gpu_paths_at(dir.path(), &target).unwrap();
+        assert!(paths.gpu_busy.ends_with("card1/device/gpu_busy_percent"));
+    }
+
+    #[test]
+    fn gpu_discovery_prefers_selected_uuid() {
+        let dir = tempfile::tempdir().unwrap();
+        make_fake_card(dir.path(), 0, "amdgpu", Some("0xaa"));
+        make_fake_card(dir.path(), 1, "amdgpu", Some("0xbb"));
+        let target = TargetProfile::hip_rocm("gfx1151").with_device_identity(
+            0,
+            "hip://GPU-00000000-0000-0000-0000-0000000000bb",
+            "selected",
+        );
+
+        let paths = discover_gpu_paths_at(dir.path(), &target).unwrap();
+        assert!(paths.gpu_busy.ends_with("card1/device/gpu_busy_percent"));
+    }
+
+    fn make_fake_card(root: &Path, index: u32, driver: &str, unique_id: Option<&str>) {
+        let device = root.join(format!("card{index}/device"));
+        fs::create_dir_all(&device).unwrap();
+        fs::write(device.join("uevent"), format!("DRIVER={driver}\n")).unwrap();
+        fs::write(device.join("gpu_busy_percent"), "0\n").unwrap();
+        if let Some(unique_id) = unique_id {
+            fs::write(device.join("unique_id"), unique_id).unwrap();
+        }
     }
 }

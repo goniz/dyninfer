@@ -18,7 +18,9 @@
 
 // hipDeviceScheduleBlockingSync — sleep instead of spinning on GPU waits.
 #define DYNINFER_HIP_DEVICE_SCHEDULE_BLOCKING_SYNC 0x04u
-#define DYNINFER_MAX_PAGED_LAYERS 32
+// Small planes can use the simpler buffer-copy allocation path. Larger planes
+// are allocated and zero-filled on device to keep host staging bounded.
+#define DYNINFER_MAX_KV_HOST_STAGING_BYTES (4u * 1024u * 1024u)
 
 typedef struct dyninfer_cached_call_t {
   iree_runtime_call_t call;
@@ -58,8 +60,8 @@ struct dyninfer_iree_session_t {
   size_t logits_capacity;
   // ABI v11: typed packed K and V per layer [nkv, kv_len, d].
   // fused_attn insert_slices the written page and attends in-place.
-  iree_hal_buffer_view_t* kv_k[DYNINFER_MAX_PAGED_LAYERS];
-  iree_hal_buffer_view_t* kv_v[DYNINFER_MAX_PAGED_LAYERS];
+  iree_hal_buffer_view_t** kv_k;
+  iree_hal_buffer_view_t** kv_v;
   size_t kv_layer_n;
   size_t kv_page_count;
   size_t kv_layer_count;
@@ -75,9 +77,11 @@ struct dyninfer_iree_session_t {
   uint64_t hist_clone_n;
 };
 
-static char g_last_error[2048] = {0};
-
-static const char* g_paged_step = "";
+// Errors are consumed immediately by the calling Rust thread. Keep both the
+// formatted error and its paged-invoke context thread-local so independent
+// sessions invoking concurrently cannot race or overwrite each other.
+static _Thread_local char g_last_error[2048] = {0};
+static _Thread_local const char* g_paged_step = "";
 
 static void set_error_status(iree_status_t status) {
   if (iree_status_is_ok(status)) {
@@ -672,6 +676,8 @@ void dyninfer_iree_session_destroy(dyninfer_iree_session_t* session) {
     iree_hal_buffer_view_release(session->kv_k[i]);
     iree_hal_buffer_view_release(session->kv_v[i]);
   }
+  free(session->kv_k);
+  free(session->kv_v);
   free(session->logits_host);
   iree_runtime_session_release(session->session);
   iree_hal_device_release(session->device);
@@ -850,10 +856,24 @@ int dyninfer_iree_session_configure_paged_kv(
     set_error_msg("cannot reconfigure paged KV after allocation");
     return 1;
   }
-  if (layer_count > DYNINFER_MAX_PAGED_LAYERS) {
-    set_error_msg("paged KV layer_count exceeds DYNINFER_MAX_PAGED_LAYERS");
+  if (layer_count > SIZE_MAX / sizeof(*session->kv_k)) {
+    set_error_msg("paged KV layer array size overflow");
     return 1;
   }
+  iree_hal_buffer_view_t** kv_k =
+      (iree_hal_buffer_view_t**)calloc(layer_count, sizeof(*kv_k));
+  iree_hal_buffer_view_t** kv_v =
+      (iree_hal_buffer_view_t**)calloc(layer_count, sizeof(*kv_v));
+  if (!kv_k || !kv_v) {
+    free(kv_k);
+    free(kv_v);
+    set_error_msg("allocating paged KV layer arrays");
+    return 1;
+  }
+  free(session->kv_k);
+  free(session->kv_v);
+  session->kv_k = kv_k;
+  session->kv_v = kv_v;
   session->kv_layer_count = layer_count;
   session->kv_page_size = page_size;
   session->kv_head_count = kv_head_count;
@@ -889,9 +909,8 @@ int dyninfer_iree_session_ensure_kv_pages(dyninfer_iree_session_t* session,
   session->kv_page_count = 0;
   session->kv_allocated_bytes = 0;
 
-  if (session->kv_layer_count == 0 ||
-      session->kv_layer_count > DYNINFER_MAX_PAGED_LAYERS) {
-    set_error_msg("KV layer count overflow");
+  if (session->kv_layer_count == 0 || !session->kv_k || !session->kv_v) {
+    set_error_msg("KV layer arrays are not configured");
     return 1;
   }
   if (session->kv_page_size == 0 ||
@@ -923,7 +942,9 @@ int dyninfer_iree_session_ensure_kv_pages(dyninfer_iree_session_t* session,
       (iree_hal_dim_t)session->kv_head_count,
       (iree_hal_dim_t)kv_len,
       (iree_hal_dim_t)session->kv_head_dim};
-  void* zeros = calloc(plane_elems, session->kv_element_byte_count);
+  void* zeros = plane_bytes <= DYNINFER_MAX_KV_HOST_STAGING_BYTES
+                    ? calloc(1, plane_bytes)
+                    : NULL;
   iree_status_t status = iree_ok_status();
   for (size_t layer = 0; layer < session->kv_layer_count; ++layer) {
     iree_hal_buffer_view_t* k = NULL;

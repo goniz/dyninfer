@@ -2,7 +2,7 @@
 
 use crate::perf_sample::{PhaseSampleStats, PhaseSampler, percentile_summary};
 use crate::{AllocatorMetrics, CausalLanguageModel, KvCacheMetrics};
-use dyninfer_core::{SessionConfig, TokenId};
+use dyninfer_core::{SessionConfig, TargetProfile, TokenId};
 use dyninfer_error::{DynInferError, Result};
 use serde::Serialize;
 use std::time::Instant;
@@ -102,6 +102,7 @@ pub fn run_perf(
     }
 
     let prompt: Vec<TokenId> = vec![config.fill_token; config.prefill_tokens];
+    let target = model.target_profile();
     let mut session = model.create_session(session_cfg)?;
 
     for _ in 0..config.warmup {
@@ -118,7 +119,7 @@ pub fn run_perf(
     for _ in 0..config.iters {
         session.reset()?;
 
-        let prefill = measure_phase(|| {
+        let prefill = measure_phase(target, || {
             let next = session.prefill_argmax(&prompt)?;
             Ok(next)
         })?;
@@ -139,7 +140,7 @@ pub fn run_perf(
             weight_bytes: config.weight_bytes,
         });
 
-        let decode = measure_phase(|| {
+        let decode = measure_phase(target, || {
             let mut tok = next;
             for _ in 0..config.tg {
                 tok = session.decode_argmax(tok)?;
@@ -176,11 +177,11 @@ struct Timed<T> {
     samples: PhaseSampleStats,
 }
 
-fn measure_phase<T, F>(f: F) -> Result<Timed<T>>
+fn measure_phase<T, F>(target: Option<&TargetProfile>, f: F) -> Result<Timed<T>>
 where
     F: FnOnce() -> Result<T>,
 {
-    let sampler = PhaseSampler::start();
+    let sampler = PhaseSampler::start(target);
     let t0 = Instant::now();
     let result = f();
     let secs = t0.elapsed().as_secs_f64();
