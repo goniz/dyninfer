@@ -55,6 +55,18 @@ crate.from_cargo(
 )
 use_repo(crate, "crates")
 
+# Development-only system llama.cpp installation. The corresponding companion
+# target is tagged manual and is never pulled into ordinary dyninfer builds.
+new_local_repository = use_repo_rule(
+    "@bazel_tools//tools/build_defs/repo:local.bzl",
+    "new_local_repository",
+)
+new_local_repository(
+    name = "local_llama",
+    build_file = "//bazel/llama:local_llama.BUILD",
+    path = "/usr",
+)
+
 # ---------------------------------------------------------------------------
 # IREE source module (`iree_core`) — runtime (and optionally compiler) built
 # from the pinned git commit via bzlmod. Submodules are fetched recursively.

@@ -1,5 +1,6 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
 
 rust_binary(
     name = "dyninfer",
@@ -12,4 +13,11 @@ rust_binary(
     ],
     deps = all_crate_deps(normal = True),
     visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "dyninfer-cli_tests",
+    crate = ":dyninfer",
+    data = ["//bazel/iree:tools"],
+    deps = all_crate_deps(normal_dev = True),
 )

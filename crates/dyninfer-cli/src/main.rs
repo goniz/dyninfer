@@ -2,6 +2,10 @@
 
 #![forbid(unsafe_code)]
 
+mod drift;
+mod logit_trace;
+mod logits;
+
 use clap::{Parser, Subcommand};
 use dyninfer_cache::ArtifactCache;
 use dyninfer_compiler::{CompileOptions, compile_add_smoke};
@@ -28,6 +32,11 @@ enum Commands {
     Checkpoint {
         #[command(subcommand)]
         command: CheckpointCommands,
+    },
+    /// Raw vocabulary-logit diagnostics.
+    Logits {
+        #[command(subcommand)]
+        command: LogitsCommands,
     },
     /// Bind an architecture to a checkpoint.
     Bind {
@@ -199,6 +208,12 @@ enum Commands {
 }
 
 #[derive(Subcommand, Debug)]
+enum LogitsCommands {
+    /// Compare dyninfer logits with a forced llama.cpp reference trajectory.
+    Drift(logits::DriftArgs),
+}
+
+#[derive(Subcommand, Debug)]
 enum CheckpointCommands {
     Inspect {
         path: PathBuf,
@@ -279,6 +294,9 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Commands::Logits { command } => match command {
+            LogitsCommands::Drift(args) => logits::run(args)?,
+        },
         Commands::Checkpoint { command } => match command {
             CheckpointCommands::Inspect { path, json } => {
                 let loader = ModelLoader::default();

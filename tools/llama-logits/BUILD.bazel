@@ -1,0 +1,14 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+# Development-only system libllama companion. This target is deliberately
+# manual and is not a dependency of the normal dyninfer CLI.
+cc_binary(
+    name = "dyninfer-llama-logits",
+    srcs = ["main.cc"],
+    copts = ["-std=c++17"],
+    deps = ["@local_llama//:llama"],
+    linkopts = ["-ldl"],
+    tags = ["manual"],
+)
