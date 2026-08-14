@@ -1,0 +1,4 @@
+# Vendored IREE source code — consumed as @iree_core module dependency,
+# not as a local package. Its BUILD files have compatibility issues when
+# queried/built directly, so exclude from //... patterns.
+third_party/iree/

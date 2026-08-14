@@ -127,4 +127,64 @@ mod tests {
             out.text
         );
     }
+
+    #[test]
+    fn maykeye_tinyllama_perf_smoke() {
+        if !iree_available() {
+            eprintln!("skipping: IREE not available");
+            return;
+        }
+        let Some(model_dir) = maykeye_dir() else {
+            eprintln!(
+                "skipping: Maykeye/TinyLLama-v0 not in HF cache (hf download Maykeye/TinyLLama-v0)"
+            );
+            return;
+        };
+        let ckpt = find_safetensors_checkpoint(&model_dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("model.bundle");
+        let loader = ModelLoader::default();
+        let id = ArchitectureId::new("llama.decoder");
+        let mut overrides = dyninfer_core::MetadataMap::new();
+        overrides.insert("max_kv".into(), serde_json::json!(48));
+        loader
+            .compile_to_bundle_with_overrides(
+                &id,
+                &ckpt,
+                "cpu",
+                &bundle,
+                &CompileOptions {
+                    mode: "local-jit".into(),
+                    ..Default::default()
+                },
+                &overrides,
+            )
+            .expect("compile Maykeye TinyLLama for perf");
+        let model = loader.load_bundle(&bundle, &ckpt).unwrap();
+        let report = crate::run_perf(
+            &model,
+            &crate::PerfConfig {
+                prefill_tokens: 16,
+                tg: 4,
+                warmup: 0,
+                iters: 1,
+                weight_bytes: model.catalog.schema_fingerprint.total_bytes,
+                fill_token: 1,
+            },
+            SessionConfig {
+                max_sequence_length: 48,
+                ..SessionConfig::default()
+            },
+        )
+        .expect("run_perf");
+        assert_eq!(report.prefill.tokens, 16);
+        assert_eq!(report.decode.tokens, 4);
+        assert!(report.prefill.secs > 0.0);
+        assert!(report.decode.secs > 0.0);
+        assert!(report.prefill.peak_rss_bytes > 0);
+        let text = crate::format_perf_report(&report);
+        assert!(text.contains("prefill"));
+        assert!(text.contains("decode"));
+        println!("{text}");
+    }
 }

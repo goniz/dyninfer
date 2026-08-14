@@ -7,8 +7,9 @@ use dyninfer_cache::ArtifactCache;
 use dyninfer_compiler::{CompileOptions, compile_add_smoke};
 use dyninfer_core::SessionConfig;
 use dyninfer_runtime::{
-    CausalLanguageModel, GenerateConfig, GenerateOutput, ModelLoader, find_checkpoint,
-    generate_greedy, load_tokenizer, resolve_hf_snapshot,
+    CausalLanguageModel, GenerateConfig, GenerateOutput, ModelLoader, PerfConfig, find_checkpoint,
+    format_perf_report, generate_greedy, load_tokenizer, parse_token_count, resolve_hf_snapshot,
+    run_perf,
 };
 use dyninfer_target::TargetDiscovery;
 use iree_runtime::{Context, Instance, Module};
@@ -128,9 +129,56 @@ enum Commands {
         #[arg(long)]
         prefill_window: Option<u32>,
         /// Session/model context limit. Defaults to prompt tokens + --max-new-tokens.
-        /// Values above 512 select paged KV ABI v6.
+        /// Values above 512 select paged KV ABI v7 (packed pool).
         #[arg(long)]
         max_kv: Option<u32>,
+    },
+    /// Benchmark synthetic-token prefill + decode with per-phase metrics.
+    Perf {
+        /// Architecture id, or `auto` to detect from config.json.
+        #[arg(long, default_value = "auto")]
+        architecture: String,
+        /// Local model directory (config.json + weights).
+        #[arg(long, conflicts_with = "hf")]
+        model_dir: Option<PathBuf>,
+        /// Hugging Face repo id resolved against the local Hub cache.
+        #[arg(long, value_name = "ORG/NAME")]
+        hf: Option<String>,
+        /// Hub revision / branch / snapshot hash (default: main).
+        #[arg(long, default_value = "main")]
+        revision: String,
+        /// Explicit checkpoint path (`.safetensors` or `.gguf`). Overrides discovery.
+        #[arg(long)]
+        checkpoint: Option<PathBuf>,
+        /// Execution target: `auto` (probe IREE HAL), `cpu`, `rocm`/`hip`/`cuda`, or `rocm:gfxXXXX` / `cuda:sm_XX`.
+        #[arg(long, default_value = "auto")]
+        target: String,
+        /// Synthetic prompt length in tokens (`128`, `4k`, `4K`, `1m`).
+        #[arg(long, default_value = "128")]
+        prefill: String,
+        /// Tokens to generate / decode steps (`32`, `1k`, …).
+        #[arg(long, default_value = "32")]
+        tg: String,
+        /// Discarded iterations before measurement.
+        #[arg(long, default_value_t = 1)]
+        warmup: usize,
+        /// Measured iterations (latency averaged).
+        #[arg(long, default_value_t = 1)]
+        iters: usize,
+        #[arg(long)]
+        output_bundle: Option<PathBuf>,
+        /// Compiled dense prefill window. Defaults to --prefill (paged chunking uses up to 512).
+        #[arg(long)]
+        prefill_window: Option<u32>,
+        /// Session/model context limit. Defaults to --prefill + --tg.
+        #[arg(long)]
+        max_kv: Option<u32>,
+        /// Config override, e.g. `--set num_layers=1`.
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+        /// Emit JSON report instead of human text.
+        #[arg(long)]
+        json: bool,
     },
     /// Compile and run the trivial `@add` smoke module through real IREE.
     Smoke {
@@ -512,6 +560,157 @@ fn main() -> anyhow::Result<()> {
             )?;
             print_generate_result(&out);
         }
+        Commands::Perf {
+            architecture,
+            model_dir,
+            hf,
+            revision,
+            checkpoint,
+            target,
+            prefill,
+            tg,
+            warmup,
+            iters,
+            output_bundle,
+            prefill_window,
+            max_kv,
+            set,
+            json,
+        } => {
+            let prefill_tokens = parse_token_count(&prefill)
+                .map_err(|e| anyhow::anyhow!("--prefill: {e}"))?;
+            let tg_tokens =
+                parse_token_count(&tg).map_err(|e| anyhow::anyhow!("--tg: {e}"))?;
+            let model_dir = match (hf, model_dir) {
+                (Some(repo), None) => {
+                    let snap = resolve_hf_snapshot(&repo, Some(&revision))?;
+                    eprintln!("using HF cache snapshot {}", snap.display());
+                    snap
+                }
+                (None, Some(dir)) => dir,
+                (None, None) => anyhow::bail!("provide --hf ORG/NAME or --model-dir PATH"),
+                (Some(_), Some(_)) => unreachable!("clap conflicts_with"),
+            };
+            let ckpt = match checkpoint {
+                Some(p) => p,
+                None => find_checkpoint(&model_dir)?,
+            };
+            eprintln!("checkpoint {}", ckpt.display());
+            let needed_kv = (prefill_tokens + tg_tokens)
+                .try_into()
+                .unwrap_or(u32::MAX)
+                .max(1);
+            let effective_max_kv = match max_kv {
+                Some(k) if k < needed_kv => anyhow::bail!(
+                    "--max-kv {k} cannot fit --prefill ({prefill_tokens}) + --tg ({tg_tokens}) (need >= {needed_kv})"
+                ),
+                Some(k) => k,
+                None => needed_kv,
+            };
+            if max_kv.is_none() {
+                eprintln!(
+                    "max_kv={effective_max_kv} (prefill={prefill_tokens} + tg={tg_tokens})"
+                );
+            }
+            let default_bundle = std::env::temp_dir().join(format!(
+                "dyninfer-perf-{}/model.bundle",
+                std::process::id()
+            ));
+            let bundle = output_bundle.unwrap_or(default_bundle);
+            let loader = ModelLoader::default();
+            let id = loader.resolve_architecture(Some(&architecture), &ckpt)?;
+            eprintln!("architecture {}", id);
+            let mut overrides = parse_sets(&set)?;
+            // Dense executables reject prompts longer than the compiled window.
+            // Prefer --prefill-window, then --set, else size the window to --prefill.
+            let prefill_from_set = overrides
+                .get("prefill_window")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            let (effective_prefill_window, prefill_window_source) = match prefill_window {
+                Some(w) => (w, "--prefill-window"),
+                None => match prefill_from_set {
+                    Some(w) => (w, "--set prefill_window"),
+                    None => {
+                        // Paged path (max_kv > 512) compiles a 512-token chunk;
+                        // dense path needs a window that fits --prefill.
+                        if effective_max_kv > 512 {
+                            (512u32, "paged chunk default")
+                        } else {
+                            (
+                                prefill_tokens.try_into().map_err(|_| {
+                                    anyhow::anyhow!("--prefill {prefill_tokens} exceeds u32")
+                                })?,
+                                "--prefill",
+                            )
+                        }
+                    }
+                },
+            };
+            if effective_max_kv <= 512 && (effective_prefill_window as usize) < prefill_tokens {
+                anyhow::bail!(
+                    "prefill_window {effective_prefill_window} ({prefill_window_source}) cannot fit --prefill ({prefill_tokens})"
+                );
+            }
+            if prefill_window.is_none() && prefill_from_set.is_none() {
+                if effective_max_kv > 512 {
+                    eprintln!(
+                        "paged: prefill_chunk=512 max_kv={effective_max_kv} (page size scales with max_kv)"
+                    );
+                } else {
+                    eprintln!("prefill_window={effective_prefill_window} (from --prefill)");
+                }
+            }
+            overrides.insert(
+                "prefill_window".into(),
+                serde_json::json!(effective_prefill_window),
+            );
+            overrides.insert("max_kv".into(), serde_json::json!(effective_max_kv));
+            let paths = loader.compile_to_bundle_with_overrides(
+                &id,
+                &ckpt,
+                &target,
+                &bundle,
+                &CompileOptions {
+                    mode: "local-jit".into(),
+                    ..Default::default()
+                },
+                &overrides,
+            )?;
+            let model = loader.load_bundle(&paths.root, &ckpt)?;
+            let fill_token = model
+                .metadata()
+                .extra
+                .get("bos_token_id")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .filter(|&t| t != 0)
+                .unwrap_or(1);
+            let weight_bytes = model.catalog.schema_fingerprint.total_bytes;
+            eprintln!(
+                "perf prefill={prefill_tokens} tg={tg_tokens} warmup={warmup} iters={iters} fill_token={fill_token}"
+            );
+            let report = run_perf(
+                &model,
+                &PerfConfig {
+                    prefill_tokens,
+                    tg: tg_tokens,
+                    warmup,
+                    iters,
+                    weight_bytes,
+                    fill_token,
+                },
+                SessionConfig {
+                    max_sequence_length: effective_max_kv,
+                    ..SessionConfig::default()
+                },
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", format_perf_report(&report));
+            }
+        }
         Commands::Smoke { target } => {
             let profile = TargetDiscovery::resolve(&target)?;
             eprintln!(
@@ -608,14 +807,25 @@ fn print_generate_result(out: &GenerateOutput) {
     println!("{}", out.text);
     let s = &out.stats;
     eprintln!(
-        "prefill: {} tok in {:.3}s ({:.1} tok/s)  decode: {} tok in {:.3}s ({:.1} tok/s)  KV: {} pages ({:.1} MiB)",
+        "prefill: {} tok in {:.3}s ({:.1} tok/s)  decode: {} tok in {:.3}s ({:.1} tok/s)",
         s.prompt_tokens,
         s.prefill_secs,
         s.prefill_tps(),
         s.generated_tokens,
         s.decode_secs,
         s.decode_tps(),
-        s.kv_page_count,
-        s.kv_allocated_bytes as f64 / (1024.0 * 1024.0),
+    );
+    let storage = if s.kv_paged { "paged" } else { "static" };
+    eprintln!(
+        "KV cache: capacity {:.2} MiB  used {:.2} MiB  K={} V={}  [{storage}{}]",
+        s.kv_capacity_bytes as f64 / (1024.0 * 1024.0),
+        s.kv_used_bytes as f64 / (1024.0 * 1024.0),
+        s.kv_key_dtype,
+        s.kv_value_dtype,
+        if s.kv_paged {
+            format!(", {} pages", s.kv_page_count)
+        } else {
+            String::new()
+        }
     );
 }

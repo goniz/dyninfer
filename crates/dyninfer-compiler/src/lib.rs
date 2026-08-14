@@ -25,7 +25,7 @@ use dyninfer_error::{CompilationError, Diagnostic, DynInferError, Result, Severi
 use serde::{Deserialize, Serialize};
 use tracing::{info, info_span};
 
-pub const COMPILER_VERSION: &str = "0.3.0-iree-3.11.0-paged-kv-v6";
+pub const COMPILER_VERSION: &str = "0.3.0-iree-3.11.0-paged-kv-v11.01-bool-mask";
 /// Pinned IREE pip / source revision identity for executable cache keys (spec §19.1).
 pub const IREE_REVISION: &str = "3.11.0+e4a3b0405d7d";
 /// Kernel registry policy version included in executable cache keys.
@@ -72,8 +72,10 @@ pub struct LoweringOutput {
     pub decode_mlir_text: Option<String>,
     pub prefill_window: u32,
     pub max_kv: u32,
+    pub page_size: u32,
     pub paged_kv: bool,
     pub num_layers: u32,
+    pub kv_element_type: ScalarType,
 }
 
 /// Resolve the bounded static shapes used by the initial prefill/decode ABI.
@@ -244,8 +246,10 @@ pub fn lower_bound_model(bound: &BoundModel) -> Result<LoweringOutput> {
         decode_mlir_text,
         prefill_window: config.seq,
         max_kv: config.max_kv,
+        page_size: config.page_size,
         paged_kv: config.paged_kv,
         num_layers: config.num_layers,
+        kv_element_type: config.paged_kv_element_type(),
     })
 }
 
@@ -444,8 +448,10 @@ impl ModelCompiler for LocalCompiler {
                 decode_mlir_text: None,
                 prefill_window: 4,
                 max_kv: 4,
+                page_size: lowering::PAGED_KV_PAGE_SIZE,
                 paged_kv: false,
                 num_layers: 0,
+                kv_element_type: ScalarType::F32,
             }
         } else {
             lower_bound_model(request.bound_model)?
@@ -525,7 +531,7 @@ impl ModelCompiler for LocalCompiler {
         validate_binding_for_compile(&request.bound_model.binding)?;
         let manifest = ExecutableManifest {
             format: "dyninfer.bundle".into(),
-            version: if paged_kv { 6 } else { 2 },
+            version: if paged_kv { 11 } else { 2 },
             architecture_id: request.bound_model.architecture.architecture_id.clone(),
             architecture_revision: request.architecture_revision.into(),
             checkpoint_schema: request.checkpoint_schema.clone(),
@@ -573,12 +579,12 @@ impl ModelCompiler for LocalCompiler {
                     .and_then(|value| value.as_u64())
                     .map(|value| value as u32)
                     .unwrap_or(64),
-                element_type: ScalarType::F32,
+                element_type: lowering.kv_element_type,
                 layout: KvCacheLayout::LayersHeadsSeqDim,
                 alignment: 64,
                 storage: if paged_kv {
                     KvCacheStorage::Paged {
-                        page_size: lowering::PAGED_KV_PAGE_SIZE,
+                        page_size: lowering.page_size,
                         chunk_size: lowering::PAGED_PREFILL_CHUNK_SIZE,
                     }
                 } else {
