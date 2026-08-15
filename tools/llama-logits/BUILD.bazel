@@ -1,4 +1,5 @@
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -10,5 +11,17 @@ cc_binary(
     copts = ["-std=c++17"],
     deps = ["@local_llama//:llama"],
     linkopts = ["-ldl"],
+    tags = ["manual"],
+)
+
+# Short validation entrypoint that keeps the production CLI independent of
+# libllama while making the development-only comparison easy to invoke.
+sh_binary(
+    name = "drift",
+    srcs = ["drift.sh"],
+    data = [
+        ":dyninfer-llama-logits",
+        "//crates/dyninfer-cli:dyninfer",
+    ],
     tags = ["manual"],
 )
