@@ -1,0 +1,27 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+# Development-only pinned libllama companion. This target is deliberately
+# manual and is not a dependency of the normal dyninfer CLI.
+cc_binary(
+    name = "dyninfer-llama-logits",
+    srcs = ["main.cc"],
+    copts = ["-std=c++17"],
+    deps = ["@llama_cpp//:llama"],
+    linkopts = ["-ldl"],
+    tags = ["manual"],
+)
+
+# Short validation entrypoint that keeps the production CLI independent of
+# libllama while making the development-only comparison easy to invoke.
+sh_binary(
+    name = "drift",
+    srcs = ["drift.sh"],
+    data = [
+        ":dyninfer-llama-logits",
+        "//crates/dyninfer-cli:dyninfer",
+    ],
+    tags = ["manual"],
+)

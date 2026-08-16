@@ -55,6 +55,21 @@ crate.from_cargo(
 )
 use_repo(crate, "crates")
 
+# Development-only pinned llama.cpp release. The corresponding companion
+# target is tagged manual and is never pulled into ordinary dyninfer builds.
+llama_release_repository = use_repo_rule(
+    "//bazel/llama:repository.bzl",
+    "llama_release_repository",
+)
+llama_release_repository(
+    name = "llama_cpp",
+    arm64_sha256 = "d91755c9e503379ab976efae476e81e44288c4e0b83087526f350febd461e217",
+    build_file = "//bazel/llama:llama_release.BUILD",
+    source_sha256 = "aea6c87dc23fb83bdbcef00d16af2b4f1b945d0e0874a23ebaf328bed90b238e",
+    version = "b10216",
+    x86_64_sha256 = "43793a565c0cfe1fdec430050950d6eed3e87aa7d14ebba8517125d78da15d79",
+)
+
 # ---------------------------------------------------------------------------
 # IREE source module (`iree_core`) — runtime (and optionally compiler) built
 # from the pinned git commit via bzlmod. Submodules are fetched recursively.

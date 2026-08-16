@@ -452,6 +452,7 @@ impl Context {
         page_size: usize,
         kv_head_count: usize,
         head_dim: usize,
+        kv_element_byte_count: usize,
         chunk_size: usize,
         vocab_size: usize,
     ) -> Result<()> {
@@ -463,6 +464,7 @@ impl Context {
                     page_size,
                     kv_head_count,
                     head_dim,
+                    kv_element_byte_count,
                     chunk_size,
                     vocab_size,
                 )
@@ -551,6 +553,41 @@ impl Context {
             })
         })
     }
+
+    /// Snapshot IREE HAL allocator statistics (host/device peak + live bytes).
+    pub fn allocator_statistics(&self) -> Result<AllocatorStatistics> {
+        self.with_session(|session| {
+            let mut raw = unsafe {
+                std::mem::MaybeUninit::<sys::dyninfer_iree_allocator_statistics_t>::zeroed()
+                    .assume_init()
+            };
+            let rc = unsafe {
+                sys::dyninfer_iree_session_allocator_statistics(session, &mut raw)
+            };
+            if rc != 0 {
+                return Err(native_error(rc));
+            }
+            Ok(AllocatorStatistics {
+                host_bytes_peak: raw.host_bytes_peak,
+                host_bytes_allocated: raw.host_bytes_allocated,
+                host_bytes_freed: raw.host_bytes_freed,
+                device_bytes_peak: raw.device_bytes_peak,
+                device_bytes_allocated: raw.device_bytes_allocated,
+                device_bytes_freed: raw.device_bytes_freed,
+            })
+        })
+    }
+}
+
+/// IREE HAL allocator statistics snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AllocatorStatistics {
+    pub host_bytes_peak: u64,
+    pub host_bytes_allocated: u64,
+    pub host_bytes_freed: u64,
+    pub device_bytes_peak: u64,
+    pub device_bytes_allocated: u64,
+    pub device_bytes_freed: u64,
 }
 
 /// Fill `bias` in-place: `0` for `j <= pos`, else `-1e7`. Reuses capacity.

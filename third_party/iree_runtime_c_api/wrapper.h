@@ -50,7 +50,7 @@ int dyninfer_iree_session_create_with_file_params(
     dyninfer_iree_session_t** out_session);
 
 // ABI v7: appends independently compiled prefill and decode modules to one
-// session so both share the same device and runtime-owned KV pages.
+// session so both share the same device and runtime-owned packed KV pool.
 int dyninfer_iree_session_create_modules_with_file_params(
     const char* device_uri, const char* rocm_root, const char* prefill_vmfb_path,
     const char* decode_vmfb_path, const dyninfer_iree_parameter_file_t* files,
@@ -83,12 +83,14 @@ int dyninfer_iree_session_invoke_decode(dyninfer_iree_session_t* session,
                                         const float* attn_bias, size_t bias_len,
                                         float** out_logits, size_t* out_count);
 
-// Paged KV. Pages are independent device-local tensors with shape
-// [layers, 2, page_size, kv_heads, head_dim]. Prefill/decode chunk entrypoints
-// take caller-owned logits + page buffers via iree.abi.output (in-place write).
+// Paged KV ABI v11: typed packed K and V per layer [kv_heads, kv_len, head_dim]
+// with kv_len = num_pages * page_size. Prefill/decode take caller-owned
+// logits and each packed K/V via iree.abi.output. fused_attn writes the
+// current page into packed K/V (no hist_to_kv gather).
 int dyninfer_iree_session_configure_paged_kv(
     dyninfer_iree_session_t* session, size_t layer_count, size_t page_size,
-    size_t kv_head_count, size_t head_dim, size_t chunk_size,
+    size_t kv_head_count, size_t head_dim, size_t kv_element_byte_count,
+    size_t chunk_size,
     size_t vocab_size);
 int dyninfer_iree_session_ensure_kv_pages(dyninfer_iree_session_t* session,
                                           size_t page_count);
@@ -101,6 +103,23 @@ size_t dyninfer_iree_session_kv_page_count(
     const dyninfer_iree_session_t* session);
 size_t dyninfer_iree_session_kv_allocated_bytes(
     const dyninfer_iree_session_t* session);
+
+// Snapshot of IREE HAL allocator statistics (IREE_STATISTICS_ENABLE).
+// When statistics are compiled out, all fields are zeroed.
+typedef struct dyninfer_iree_allocator_statistics_t {
+  uint64_t host_bytes_peak;
+  uint64_t host_bytes_allocated;
+  uint64_t host_bytes_freed;
+  uint64_t device_bytes_peak;
+  uint64_t device_bytes_allocated;
+  uint64_t device_bytes_freed;
+} dyninfer_iree_allocator_statistics_t;
+
+// Query aggregate HAL allocator statistics for the session device.
+// Returns 0 on success; non-zero if session is null or has no allocator.
+int dyninfer_iree_session_allocator_statistics(
+    const dyninfer_iree_session_t* session,
+    dyninfer_iree_allocator_statistics_t* out_stats);
 
 #ifdef __cplusplus
 }  // extern "C"

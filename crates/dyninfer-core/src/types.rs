@@ -559,8 +559,8 @@ pub enum KvCacheStorage {
     /// Legacy ABI: cache tensors are hidden mutable VM globals.
     #[default]
     StaticGlobals,
-    /// ABI v6: the runtime owns device pages shared by separately compiled
-    /// prefill/decode modules; each chunk is one fused host invoke.
+    /// ABI v7: the runtime owns a packed device KV pool shared by separately
+    /// compiled prefill/decode modules; each chunk is one fused host invoke.
     Paged { page_size: u32, chunk_size: u32 },
 }
 
@@ -591,6 +591,29 @@ impl KvCacheDescriptor {
             KvCacheStorage::StaticGlobals => None,
             KvCacheStorage::Paged { chunk_size, .. } => Some(chunk_size),
         }
+    }
+
+    /// Bytes for one token of K **or** V across all layers.
+    pub fn bytes_per_token_component(&self) -> u64 {
+        let elem = u64::from(self.element_type.size_bytes().unwrap_or(4));
+        u64::from(self.layer_count)
+            .saturating_mul(u64::from(self.kv_head_count))
+            .saturating_mul(u64::from(self.head_dimension))
+            .saturating_mul(elem)
+    }
+
+    /// Full K+V capacity at [`Self::max_sequence_length`] (preallocated for static globals).
+    pub fn capacity_bytes(&self) -> u64 {
+        self.bytes_for_tokens(u64::from(self.max_sequence_length))
+    }
+
+    /// K+V bytes covering `tokens` positions (clamped to max sequence length).
+    pub fn bytes_for_tokens(&self, tokens: u64) -> u64 {
+        let t = tokens.min(u64::from(self.max_sequence_length));
+        // Key and value tensors share the same element type today.
+        self.bytes_per_token_component()
+            .saturating_mul(t)
+            .saturating_mul(2)
     }
 }
 
