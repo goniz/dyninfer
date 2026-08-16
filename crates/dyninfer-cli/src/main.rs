@@ -2,9 +2,13 @@
 
 #![forbid(unsafe_code)]
 
+mod drift;
+mod logit_trace;
+mod logits;
+
 use clap::{Parser, Subcommand};
 use dyninfer_cache::ArtifactCache;
-use dyninfer_compiler::{CompileOptions, compile_add_smoke};
+use dyninfer_compiler::{CompileOptions, PAGED_PREFILL_CHUNK_SIZE, compile_add_smoke};
 use dyninfer_core::SessionConfig;
 use dyninfer_runtime::{
     CausalLanguageModel, GenerateConfig, GenerateOutput, ModelLoader, PerfConfig, find_checkpoint,
@@ -28,6 +32,11 @@ enum Commands {
     Checkpoint {
         #[command(subcommand)]
         command: CheckpointCommands,
+    },
+    /// Raw vocabulary-logit diagnostics.
+    Logits {
+        #[command(subcommand)]
+        command: LogitsCommands,
     },
     /// Bind an architecture to a checkpoint.
     Bind {
@@ -199,6 +208,12 @@ enum Commands {
 }
 
 #[derive(Subcommand, Debug)]
+enum LogitsCommands {
+    /// Compare dyninfer logits with a forced llama.cpp reference trajectory.
+    Drift(logits::DriftArgs),
+}
+
+#[derive(Subcommand, Debug)]
 enum CheckpointCommands {
     Inspect {
         path: PathBuf,
@@ -279,6 +294,9 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Commands::Logits { command } => match command {
+            LogitsCommands::Drift(args) => logits::run(args)?,
+        },
         Commands::Checkpoint { command } => match command {
             CheckpointCommands::Inspect { path, json } => {
                 let loader = ModelLoader::default();
@@ -634,8 +652,8 @@ fn main() -> anyhow::Result<()> {
                     None => {
                         // Paged path (max_kv > 512) compiles a 512-token chunk;
                         // dense path needs a window that fits --prefill.
-                        if effective_max_kv > 512 {
-                            (512u32, "paged chunk default")
+                        if effective_max_kv > PAGED_PREFILL_CHUNK_SIZE {
+                            (PAGED_PREFILL_CHUNK_SIZE, "paged chunk default")
                         } else {
                             (
                                 prefill_tokens.try_into().map_err(|_| {
@@ -647,13 +665,15 @@ fn main() -> anyhow::Result<()> {
                     }
                 },
             };
-            if effective_max_kv <= 512 && (effective_prefill_window as usize) < prefill_tokens {
+            if effective_max_kv <= PAGED_PREFILL_CHUNK_SIZE
+                && (effective_prefill_window as usize) < prefill_tokens
+            {
                 anyhow::bail!(
                     "prefill_window {effective_prefill_window} ({prefill_window_source}) cannot fit --prefill ({prefill_tokens})"
                 );
             }
             if prefill_window.is_none() && prefill_from_set.is_none() {
-                if effective_max_kv > 512 {
+                if effective_max_kv > PAGED_PREFILL_CHUNK_SIZE {
                     eprintln!(
                         "paged: prefill_chunk=512 max_kv={effective_max_kv} (page size scales with max_kv)"
                     );
