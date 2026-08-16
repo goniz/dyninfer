@@ -1,0 +1,11 @@
+package(default_visibility = ["//visibility:public"])
+
+alias(
+    name = "sdk",
+    actual = "@therock_rocm_gfx1151//:sdk",
+)
+
+alias(
+    name = "runtime",
+    actual = "@therock_rocm_gfx1151//:runtime",
+)

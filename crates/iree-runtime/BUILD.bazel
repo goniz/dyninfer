@@ -9,7 +9,10 @@ rust_library(
     edition = "2024",
     aliases = aliases(),
     # dump_devices still shells out to the prebuilt tool.
-    data = ["//bazel/iree:tools"],
+    data = [
+        "//bazel/iree:tools",
+        "//bazel/therock:runtime",
+    ],
     deps = all_crate_deps(normal = True),
     visibility = ["//visibility:public"],
 )
@@ -17,6 +20,9 @@ rust_library(
 rust_test(
     name = "iree-runtime_tests",
     crate = ":iree-runtime",
-    data = ["//bazel/iree:tools"],
+    data = [
+        "//bazel/iree:tools",
+        "//bazel/therock:runtime",
+    ],
     deps = all_crate_deps(normal_dev = True),
 )

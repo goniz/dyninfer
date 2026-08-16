@@ -2,9 +2,9 @@
 #
 # dyninfer — Bazel build + CPU & HIP/ROCm inference container.
 #
-# Base image ships ROCm userspace matching the host driver (Strix Halo,
-# Radeon 8060S / gfx1151 needs ROCm >= 7.0). Ubuntu 24.04 provides Python
-# 3.12, matching the pinned cp312 IREE wheels in MODULE.bazel.
+# Bazel fetches the pinned TheRock ROCm userspace for Strix Halo (gfx1151).
+# Ubuntu 24.04 provides Python 3.12, matching the pinned cp312 IREE wheels in
+# MODULE.bazel; the host supplies only the Linux amdgpu kernel driver/devices.
 #
 # Build:
 #   docker build -t dyninfer .
@@ -25,8 +25,7 @@
 #   bazel run //crates/dyninfer-cli:dyninfer -- generate \
 #     --hf Qwen/Qwen3-0.6B --prompt "Hello" --max-new-tokens 16 --target rocm
 
-ARG ROCM_VERSION=7.2.4
-FROM rocm/dev-ubuntu-24.04:${ROCM_VERSION}
+FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -34,11 +33,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 # - git: MODULE.bazel git_override of iree_core (recursive submodules)
 # - xz/zlib/zstd/tinfo: LLVM toolchain + Rust toolchain tarballs
 # - build-essential: cc autoconfiguration and native linking
-# - lld: in-process libIREECompiler links llvm-cpu executables with the
-#   embedded linker tool found on PATH (the wheel's iree-lld is only found
-#   relative to the iree-compile executable, not the dyninfer binary)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      bash build-essential ca-certificates curl git lld patch pkg-config \
+      bash build-essential ca-certificates curl git patch pkg-config \
       unzip zip xz-utils \
       python3 libtinfo6 zlib1g libzstd1 \
     && rm -rf /var/lib/apt/lists/*
@@ -61,11 +57,11 @@ COPY . .
 
 # Build the CLI. This compiles the in-process IREE runtime from @iree_core
 # (HIP + local-task/local-sync drivers, see .bazelrc) and stages the pinned
-# prebuilt iree-compile / iree-run-module wheels into runfiles.
+# prebuilt iree-compile / iree-run-module wheels and TheRock SDK into runfiles.
 #
 # CPU `generate` works as-is; HIP `generate` additionally needs the ROCm
-# devices at runtime (see docker run flags above) — libamdhip64.so is
-# dlopened by IREE's HIP HAL driver and by iree-run-module discovery.
+# devices at runtime (see docker run flags above). `libamdhip64.so` and its
+# dependencies are loaded from the Bazel-pinned TheRock SDK.
 RUN bazel build //crates/dyninfer-cli:dyninfer \
     && bazel test //bazel/iree:iree_tools_smoke \
     && bazel run //crates/dyninfer-cli:dyninfer -- --help >/dev/null

@@ -32,7 +32,10 @@ rust_library(
     },
     # Avoid cargo build.rs under Bazel; bindings come from rust_bindgen.
     rustc_flags = ["--cfg=bazel"],
-    data = ["//bazel/iree:compiler_libs"],
+    data = [
+        "//bazel/iree:compiler_libs",
+        "//bazel/therock:runtime",
+    ],
     deps = all_crate_deps(normal = True) + [
         "//bazel/iree:libIREECompiler",
     ],
@@ -42,9 +45,18 @@ rust_test(
     name = "iree-compiler-sys_tests",
     crate = ":iree-compiler-sys",
     compile_data = [":iree_compiler_bindings"],
+    # IREE's HIP backend shells out to `iree-lld`. The wrapper resolves the
+    # pinned wheel binary from runfiles, where its $ORIGIN RPATH is intact.
+    env = {
+        "PATH": "bazel/iree:/bin:/usr/bin:/usr/local/bin",
+    },
     rustc_env = {
         "IREE_COMPILER_BINDINGS": "$(execpath :iree_compiler_bindings)",
     },
-    data = ["//bazel/iree:compiler_libs"],
+    data = [
+        "//bazel/iree:compiler_libs",
+        "//bazel/iree:iree-lld",
+        "//bazel/therock:runtime",
+    ],
     deps = all_crate_deps(normal_dev = True),
 )

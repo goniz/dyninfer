@@ -1,0 +1,8 @@
+[package]
+name = "dyninfer-rocm"
+description = "Discovery and process configuration for Bazel-pinned TheRock ROCm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+

@@ -21,6 +21,7 @@ members = [
   "crates/iree-runtime-sys",
   "crates/iree-runtime",
   "crates/dyninfer-runtime",
+  "crates/dyninfer-rocm",
   "crates/dyninfer-cli",
 ]
 
@@ -73,3 +74,4 @@ iree-compiler-sys = { path = "crates/iree-compiler-sys" }
 iree-runtime-sys = { path = "crates/iree-runtime-sys" }
 iree-runtime = { path = "crates/iree-runtime" }
 dyninfer-runtime = { path = "crates/dyninfer-runtime" }
+dyninfer-rocm = { path = "crates/dyninfer-rocm" }

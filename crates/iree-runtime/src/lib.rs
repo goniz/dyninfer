@@ -300,6 +300,13 @@ impl Context {
                         status_code: None,
                     })
                 })?;
+            let rocm_root_c = dyninfer_rocm::RocmSdk::discover()
+                .map(|sdk| path_cstring(sdk.root()))
+                .transpose()?;
+            let rocm_root = rocm_root_c
+                .as_ref()
+                .map(|c| c.as_ptr())
+                .unwrap_or(ptr::null());
 
             let mut ptr = ptr::null_mut();
             let rc = if let Some(files) = self.file_parameters.as_ref() {
@@ -326,6 +333,7 @@ impl Context {
                     if let Some(decode_vmfb) = decode_vmfb_c.as_ref() {
                         sys::dyninfer_iree_session_create_modules_with_file_params(
                             device_c.as_ref().map(|c| c.as_ptr()).unwrap_or(ptr::null()),
+                            rocm_root,
                             vmfb_c.as_ptr(),
                             decode_vmfb.as_ptr(),
                             c_files.as_ptr(),
@@ -337,6 +345,7 @@ impl Context {
                     } else {
                         sys::dyninfer_iree_session_create_with_file_params(
                             device_c.as_ref().map(|c| c.as_ptr()).unwrap_or(ptr::null()),
+                            rocm_root,
                             vmfb_c.as_ptr(),
                             c_files.as_ptr(),
                             c_files.len(),
@@ -350,6 +359,7 @@ impl Context {
                 unsafe {
                     sys::dyninfer_iree_session_create(
                         device_c.as_ref().map(|c| c.as_ptr()).unwrap_or(ptr::null()),
+                        rocm_root,
                         vmfb_c.as_ptr(),
                         &mut ptr,
                     )

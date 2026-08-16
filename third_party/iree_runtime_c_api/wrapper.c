@@ -1,6 +1,7 @@
 #include "wrapper.h"
 
 #include <dlfcn.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,6 +9,7 @@
 
 #include "iree/base/api.h"
 #include "iree/hal/api.h"
+#include "iree/hal/drivers/hip/api.h"
 #include "iree/io/file_handle.h"
 #include "iree/io/parameter_index.h"
 #include "iree/io/parameter_index_provider.h"
@@ -109,19 +111,35 @@ static void set_error_msg(const char* msg) {
 // Prefer BlockingSync so HIP/HSA sleeps on GPU waits instead of spinning a
 // host core (~100% CPU). Must run before IREE creates the HIP primary context.
 // Opt out: DYNINFER_HIP_ALLOW_BUSY_WAIT=1.
-static void configure_hip_blocking_sync(const char* device_uri) {
-  if (!device_uri || device_uri[0] == '\0') return;
+static bool configure_hip_blocking_sync(const char* device_uri,
+                                        const char* rocm_root) {
+  if (!device_uri || device_uri[0] == '\0') return true;
   if (strncmp(device_uri, "hip", 3) != 0 && strncmp(device_uri, "rocm", 4) != 0) {
-    return;
+    return true;
   }
   const char* allow_busy = getenv("DYNINFER_HIP_ALLOW_BUSY_WAIT");
-  if (allow_busy && allow_busy[0] == '1') return;
-
-  void* lib = dlopen("libamdhip64.so", RTLD_NOW | RTLD_NOLOAD);
-  if (!lib) {
-    lib = dlopen("libamdhip64.so", RTLD_LAZY | RTLD_LOCAL);
+  if (!rocm_root || rocm_root[0] == '\0') {
+    set_error_msg("HIP requested but the Bazel-pinned TheRock SDK was not found");
+    return false;
   }
-  if (!lib) return;
+
+  char hip_path[PATH_MAX];
+  int path_length = snprintf(hip_path, sizeof(hip_path), "%s/lib/libamdhip64.so",
+                             rocm_root);
+  if (path_length < 0 || (size_t)path_length >= sizeof(hip_path)) {
+    set_error_msg("TheRock SDK path is too long");
+    return false;
+  }
+  void* lib = dlopen(hip_path, RTLD_NOW | RTLD_GLOBAL);
+  if (!lib) {
+    const char* error = dlerror();
+    snprintf(g_last_error, sizeof(g_last_error),
+             "failed to load TheRock HIP runtime %s: %s", hip_path,
+             error ? error : "unknown dlopen error");
+    return false;
+  }
+
+  if (allow_busy && allow_busy[0] == '1') return true;
 
   typedef int (*hip_init_fn)(unsigned int);
   typedef int (*hip_get_device_count_fn)(int*);
@@ -136,7 +154,7 @@ static void configure_hip_blocking_sync(const char* device_uri) {
       (hip_set_device_fn)dlsym(lib, "hipSetDevice");
   hip_set_device_flags_fn hipSetDeviceFlags =
       (hip_set_device_flags_fn)dlsym(lib, "hipSetDeviceFlags");
-  if (!hipSetDeviceFlags) return;
+  if (!hipSetDeviceFlags) return true;
 
   if (hipInit) (void)hipInit(0);
   int count = 1;
@@ -147,6 +165,48 @@ static void configure_hip_blocking_sync(const char* device_uri) {
     if (hipSetDevice) (void)hipSetDevice(i);
     (void)hipSetDeviceFlags(DYNINFER_HIP_DEVICE_SCHEDULE_BLOCKING_SYNC);
   }
+  return true;
+}
+
+// Creates a HIP device with an explicit TheRock runtime path. Preloading the
+// library above is not enough when its SONAME differs from the unversioned name
+// requested by IREE, so pass the absolute file to the HIP driver itself.
+static iree_status_t create_hip_device(const char* device_uri,
+                                       const char* rocm_root,
+                                       iree_allocator_t host_allocator,
+                                       iree_hal_device_t** out_device) {
+  char hip_path[PATH_MAX];
+  int path_length = snprintf(hip_path, sizeof(hip_path),
+                             "file:%s/lib/libamdhip64.so", rocm_root);
+  if (path_length < 0 || (size_t)path_length >= sizeof(hip_path)) {
+    return iree_make_status(IREE_STATUS_OUT_OF_RANGE,
+                            "TheRock SDK path is too long");
+  }
+
+  iree_string_view_t search_path = iree_make_cstring_view(hip_path);
+  iree_hal_hip_driver_options_t driver_options;
+  iree_hal_hip_driver_options_initialize(&driver_options);
+  driver_options.hip_lib_search_paths = &search_path;
+  driver_options.hip_lib_search_path_count = 1;
+
+  iree_hal_hip_device_params_t device_params;
+  iree_hal_hip_device_params_initialize(&device_params);
+  iree_hal_driver_t* driver = NULL;
+  iree_status_t status = iree_hal_hip_driver_create(
+      iree_make_cstring_view("hip"), &driver_options, &device_params,
+      host_allocator, &driver);
+  if (iree_status_is_ok(status)) {
+    if (strstr(device_uri, "://") != NULL) {
+      status = iree_hal_driver_create_device_by_uri(
+          driver, iree_make_cstring_view(device_uri), host_allocator,
+          out_device);
+    } else {
+      status = iree_hal_driver_create_default_device(driver, host_allocator,
+                                                     out_device);
+    }
+  }
+  if (driver) iree_hal_driver_release(driver);
+  return status;
 }
 
 static iree_status_t cached_call_prepare(dyninfer_iree_session_t* session,
@@ -277,7 +337,8 @@ static iree_status_t append_file_parameters_module(
   return status;
 }
 
-static int session_create_common(const char* device_uri, const char* vmfb_path,
+static int session_create_common(const char* device_uri, const char* rocm_root,
+                                 const char* vmfb_path,
                                  const char* decode_vmfb_path,
                                  const dyninfer_iree_parameter_file_t* files,
                                  size_t file_count,
@@ -301,6 +362,11 @@ static int session_create_common(const char* device_uri, const char* vmfb_path,
     return 1;
   }
 
+  if (!configure_hip_blocking_sync(driver_or_uri, rocm_root)) {
+    free(s);
+    return 1;
+  }
+
   iree_runtime_instance_options_t instance_options;
   iree_runtime_instance_options_initialize(&instance_options);
   iree_runtime_instance_options_use_all_available_drivers(&instance_options);
@@ -308,11 +374,14 @@ static int session_create_common(const char* device_uri, const char* vmfb_path,
       &instance_options, iree_allocator_system(), &s->instance);
 
   if (iree_status_is_ok(status)) {
-    // Sleep on GPU completion instead of busy-waiting a host core.
-    configure_hip_blocking_sync(driver_or_uri);
-    // Full HAL URIs (contain "://") select a specific device; bare driver
-    // names fall back to the driver's default device.
-    if (strstr(driver_or_uri, "://") != NULL) {
+    if (strncmp(driver_or_uri, "hip", 3) == 0 ||
+        strncmp(driver_or_uri, "rocm", 4) == 0) {
+      status = create_hip_device(
+          driver_or_uri, rocm_root,
+          iree_runtime_instance_host_allocator(s->instance), &s->device);
+      // Full non-HIP HAL URIs select a specific device; bare driver names fall
+      // back to the registered driver's default device.
+    } else if (strstr(driver_or_uri, "://") != NULL) {
       iree_hal_driver_registry_t* registry =
           iree_runtime_instance_driver_registry(s->instance);
       status = iree_hal_create_device(
@@ -358,32 +427,35 @@ static int session_create_common(const char* device_uri, const char* vmfb_path,
   return 0;
 }
 
-int dyninfer_iree_session_create(const char* device_uri, const char* vmfb_path,
+int dyninfer_iree_session_create(const char* device_uri, const char* rocm_root,
+                                 const char* vmfb_path,
                                  dyninfer_iree_session_t** out_session) {
-  return session_create_common(device_uri, vmfb_path, /*decode_vmfb_path=*/NULL,
+  return session_create_common(device_uri, rocm_root, vmfb_path,
+                               /*decode_vmfb_path=*/NULL,
                                /*files=*/NULL, /*file_count=*/0,
                                /*file_params=*/NULL, /*file_param_count=*/0,
                                out_session);
 }
 
 int dyninfer_iree_session_create_with_file_params(
-    const char* device_uri, const char* vmfb_path,
+    const char* device_uri, const char* rocm_root, const char* vmfb_path,
     const dyninfer_iree_parameter_file_t* files, size_t file_count,
     const dyninfer_iree_file_param_t* params, size_t param_count,
     dyninfer_iree_session_t** out_session) {
-  return session_create_common(device_uri, vmfb_path, /*decode_vmfb_path=*/NULL,
+  return session_create_common(device_uri, rocm_root, vmfb_path,
+                               /*decode_vmfb_path=*/NULL,
                                files, file_count, params, param_count,
                                out_session);
 }
 
 int dyninfer_iree_session_create_modules_with_file_params(
-    const char* device_uri, const char* prefill_vmfb_path,
+    const char* device_uri, const char* rocm_root, const char* prefill_vmfb_path,
     const char* decode_vmfb_path, const dyninfer_iree_parameter_file_t* files,
     size_t file_count, const dyninfer_iree_file_param_t* params,
     size_t param_count, dyninfer_iree_session_t** out_session) {
-  return session_create_common(device_uri, prefill_vmfb_path, decode_vmfb_path,
-                               files, file_count, params, param_count,
-                               out_session);
+  return session_create_common(device_uri, rocm_root, prefill_vmfb_path,
+                               decode_vmfb_path, files, file_count, params,
+                               param_count, out_session);
 }
 
 static iree_status_t allocate_i64_tensor(iree_runtime_session_t* session,

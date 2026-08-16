@@ -114,6 +114,18 @@ archive_override(
 # ---------------------------------------------------------------------------
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
+# TheRock 7.14 SDK for the project's initial Strix Halo (gfx1151) target.
+# The release is pinned by URL and digest so ROCm compiler/runtime inputs do
+# not depend on packages installed on the host. See bazel/therock/README.md.
+http_archive(
+    name = "therock_rocm_gfx1151",
+    urls = [
+        "https://rocm.nightlies.amd.com/tarball-multi-arch/therock-dist-linux-gfx1151-7.14.0a20260624.tar.gz",
+    ],
+    sha256 = "2c2720860f1e2f6caa8d926a6b6abc8d041d0f0f255bbf1de2a1b405eb68fe29",
+    build_file = "//bazel/therock:therock.BUILD.bazel",
+)
+
 http_archive(
     name = "iree_compiler_linux_x86_64",
     urls = [

@@ -87,6 +87,16 @@ sh_binary(
     target_compatible_with = ["@platforms//os:linux"],
 )
 
+# The in-process compiler finds this tool through PATH when producing HIP
+# code objects. Keep the wheel's tool next to its shared library by resolving
+# it from runfiles at execution time.
+sh_binary(
+    name = "iree-lld",
+    srcs = ["iree_lld_wrapper.sh"],
+    data = [":compiler_libs"],
+    target_compatible_with = ["@platforms//os:linux"],
+)
+
 sh_test(
     name = "iree_tools_smoke",
     srcs = ["iree_tools_smoke.sh"],

@@ -336,6 +336,7 @@ dependencies = [
  "dyninfer-kernel-registry",
  "dyninfer-mlir",
  "dyninfer-quantization",
+ "dyninfer-rocm",
  "iree-compiler-sys",
  "serde",
  "serde_json",
@@ -406,6 +407,10 @@ dependencies = [
  "dyninfer-mlir",
  "serde",
 ]
+
+[[package]]
+name = "dyninfer-rocm"
+version = "0.1.0"
 
 [[package]]
 name = "dyninfer-runtime"
@@ -554,6 +559,7 @@ name = "iree-compiler-sys"
 version = "0.1.0"
 dependencies = [
  "bindgen",
+ "dyninfer-rocm",
  "tracing",
 ]
 
@@ -562,6 +568,7 @@ name = "iree-runtime"
 version = "0.1.0"
 dependencies = [
  "dyninfer-error",
+ "dyninfer-rocm",
  "iree-runtime-sys",
  "tempfile",
  "tracing",
