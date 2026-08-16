@@ -1,1 +1,4 @@
-exports_files(["local_llama.BUILD"])
+exports_files([
+    "llama_release.BUILD",
+    "repository.bzl",
+])

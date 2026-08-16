@@ -4,7 +4,7 @@ use crate::drift::{RowMetrics, compare};
 use crate::logit_trace::{AtomicTraceWriter, TokenizedPrompt, TracePhase, TraceReader};
 use anyhow::{Context, Result, bail, ensure};
 use clap::{ArgGroup, Args, ValueEnum};
-use dyninfer_compiler::CompileOptions;
+use dyninfer_compiler::{CompileOptions, PAGED_PREFILL_CHUNK_SIZE};
 use dyninfer_core::{
     ExecutableManifest, KvCacheStorage, ScalarType, SchemaFingerprint, SessionConfig,
 };
@@ -464,6 +464,8 @@ pub fn run(args: DriftArgs) -> Result<()> {
     let required_context_u32 = u32::try_from(required_context)
         .context("prompt + decode steps exceed the u32 context limit")?
         .max(1);
+    let compilation_prefill_window =
+        compilation_prefill_window(prompt_tokens.len(), required_context_u32)?;
 
     let (bundle_path, reused_bundle) = if let Some(bundle) = &args.bundle {
         (bundle.clone(), true)
@@ -473,6 +475,7 @@ pub fn run(args: DriftArgs) -> Result<()> {
         eprintln!("architecture {architecture}");
         let mut overrides = dyninfer_core::MetadataMap::new();
         overrides.insert("max_kv".into(), json!(required_context_u32));
+        overrides.insert("prefill_window".into(), json!(compilation_prefill_window));
         let paths = loader.compile_to_bundle_with_overrides(
             &architecture,
             &checkpoint,
@@ -854,6 +857,14 @@ fn llama_kv_type(element_type: ScalarType) -> Result<&'static str> {
     }
 }
 
+fn compilation_prefill_window(prompt_tokens: usize, required_context: u32) -> Result<u32> {
+    if required_context > PAGED_PREFILL_CHUNK_SIZE {
+        Ok(PAGED_PREFILL_CHUNK_SIZE)
+    } else {
+        u32::try_from(prompt_tokens).context("prompt length exceeds the u32 limit")
+    }
+}
+
 fn parse_comma_tokens(input: &str, option: &str) -> Result<Vec<u32>> {
     let input = input.trim();
     ensure!(!input.is_empty(), "{option} is empty");
@@ -1076,5 +1087,12 @@ mod tests {
         let path = temporary.path().join("tokens.json");
         fs::write(&path, "[4, 5, 6]").unwrap();
         assert_eq!(parse_token_file(&path).unwrap(), vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn sizes_compiled_prefill_window_for_prompt_or_paged_geometry() {
+        assert_eq!(compilation_prefill_window(33, 37).unwrap(), 33);
+        assert_eq!(compilation_prefill_window(512, 512).unwrap(), 512);
+        assert_eq!(compilation_prefill_window(513, 517).unwrap(), 512);
     }
 }

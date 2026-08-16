@@ -296,8 +296,17 @@ std::vector<llama_token> ParseTokens(const std::string &value,
   return tokens;
 }
 
+std::string LoadedLibraryPath();
+
 struct BackendGuard {
-  BackendGuard() { llama_backend_init(); }
+  BackendGuard() {
+    const std::string library_path = LoadedLibraryPath();
+    if (library_path != "unavailable") {
+      const std::string backend_dir = fs::path(library_path).parent_path();
+      ggml_backend_load_all_from_path(backend_dir.c_str());
+    }
+    llama_backend_init();
+  }
   ~BackendGuard() { llama_backend_free(); }
 };
 

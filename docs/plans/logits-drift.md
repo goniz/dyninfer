@@ -332,8 +332,9 @@ logit unless traces are explicitly retained.
 
 ## 9. llama.cpp companion implementation
 
-`tools/llama-logits/main.cc` should use public installed headers only. Do not
-depend on llama.cpp's `common` library or internal graph classes.
+`tools/llama-logits/main.cc` should use only the public headers from the pinned
+llama.cpp release. Do not depend on llama.cpp's `common` library or internal
+graph classes.
 
 The evaluation loop is deliberately small:
 
@@ -355,10 +356,11 @@ command uses this first when `--prompt` was supplied, so it can size dyninfer's
 KV/session before the full llama.cpp evaluation. Exact token inputs skip this
 extra process.
 
-Provide a manual Bazel `cc_binary` target linked to a declared local llama.cpp
-installation. The target is not a dependency of `//crates/dyninfer-cli` and is
-excluded from ordinary wildcard builds on hosts without libllama. CI that runs
-real differential tests must provision and record a pinned llama.cpp build.
+Provide a manual Bazel `cc_binary` target linked to pinned official llama.cpp
+release archives. The binary archive supplies libllama and its CPU/Vulkan
+plugins; because release binaries omit headers, the matching tagged source
+archive supplies public headers only. The target is not a dependency of
+`//crates/dyninfer-cli` and is excluded from ordinary wildcard builds.
 
 ## 10. dyninfer implementation placement
 
@@ -372,7 +374,7 @@ crates/dyninfer-cli/src/logits.rs       command orchestration and report output
 crates/dyninfer-cli/src/logit_trace.rs trace reader/writer and validation
 crates/dyninfer-cli/src/drift.rs       streaming metric calculations
 tools/llama-logits/main.cc             public-libllama companion
-tools/llama-logits/BUILD.bazel         manual local-libllama target
+tools/llama-logits/BUILD.bazel         manual pinned-libllama target
 ```
 
 The dyninfer side uses only existing public APIs:
@@ -450,7 +452,7 @@ Use Bazel for all dyninfer builds and tests.
 ### Phase 1: final logits
 
 - Add trace types, metrics, and fake-runner tests.
-- Add the public-libllama companion and system/pinned-package Bazel target.
+- Add the public-libllama companion and pinned-release Bazel target.
 - Implement prompt-final plus forced decode comparison and JSON report.
 - Qualify on the existing Qwen3 BF16 GGUF, then one supported quantized GGUF.
 

@@ -11,7 +11,10 @@ mod lowering;
 mod mlir_emit;
 
 pub use iree_tools::IreeTools;
-pub use lowering::{DenseDecoderConfig, LARGE_PREFILL_WINDOW, PREFILL_WINDOW, TINY_PREFILL_WINDOW};
+pub use lowering::{
+    DenseDecoderConfig, LARGE_PREFILL_WINDOW, PAGED_PREFILL_CHUNK_SIZE, PREFILL_WINDOW,
+    TINY_PREFILL_WINDOW,
+};
 pub use mlir_emit::{emit_add_smoke_module, emit_bridge_module};
 
 use dyninfer_architecture::ArchitecturePackage;
@@ -136,7 +139,7 @@ pub fn build_bound_model(
         .unwrap_or(1)
         .max(1);
     let max_kv = shape_profile.max_sequence_length.max(requested_prefill);
-    let paged = max_kv > 512;
+    let paged = max_kv > PAGED_PREFILL_CHUNK_SIZE;
     let prefill = if paged {
         lowering::PAGED_PREFILL_CHUNK_SIZE
     } else {
